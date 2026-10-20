@@ -1,6 +1,6 @@
 # F-133 (M2): Query on the plan IR, lowered to the native CPU kernel. Every result is checked against a plain loop
 # over the same random table (an independent oracle: no kernel, no program).
-from mxframe import Table, SharedTable, Expr, INT, DECIMAL, TEXT, Query, col, lit, least, greatest, sum, count, mean, min_of, max_of
+from omxcore import Table, SharedTable, Expr, INT, DECIMAL, TEXT, Query, col, lit, least, greatest, sum, count, mean, min_of, max_of
 
 
 struct Rng(Movable):

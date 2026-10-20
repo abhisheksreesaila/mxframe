@@ -6,8 +6,8 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-import mxframe as mx
-from mxframe import gpu_stream
+import omxcore as mx
+from omxcore import gpu_stream
 
 
 def _t():
@@ -103,7 +103,7 @@ def test_hidden_sort_key_on_gpu(q):
 
 def _post_op_types(q, monkeypatch, **tables):
     """The Sort / Limit nodes the compiler peeled off the top of the plan, per call."""
-    from mxframe.compiler import GraphCompiler
+    from omxcore.compiler import GraphCompiler
     seen = []
     orig = GraphCompiler._extract_post_ops.__func__
 

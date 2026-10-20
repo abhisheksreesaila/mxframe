@@ -13,13 +13,13 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-import mxframe as mx
-from mxframe import LazyFrame, auto_mode as am, calibration as cal, col, lit
-from mxframe import coproc_fused as cf
-from mxframe import native_exec as nx
-from mxframe import pipeline_exec as pe
-from mxframe import pipeline_kernels as pk
-from mxframe.lazy_frame import Aggregate
+import omxcore as mx
+from omxcore import LazyFrame, auto_mode as am, calibration as cal, col, lit
+from omxcore import coproc_fused as cf
+from omxcore import native_exec as nx
+from omxcore import pipeline_exec as pe
+from omxcore import pipeline_kernels as pk
+from omxcore.lazy_frame import Aggregate
 
 needs_gpu = pytest.mark.skipif(not pk.gpu_available() or not pk.cpu_available(),
                                reason="needs both pipeline libraries and a GPU")
@@ -159,7 +159,7 @@ def test_different_filters_pushed_into_the_read_are_different_sources(tmp_path):
         return (mx.scan_parquet(path).filter(col("i") < lit(limit)).groupby("k")
                 .agg(col("v").sum().alias("s"), col("w").max().alias("mx")).sort("k"))
 
-    from mxframe.io_parquet import resolve_plan, table_source
+    from omxcore.io_parquet import resolve_plan, table_source
     tokens = {limit: table_source(_scan_table(resolve_plan(frame(limit).plan))) for limit in (300, 700)}
     assert tokens[300] != tokens[700] and all(tokens.values())
     with cf.policy(min_upload_bytes=0, gpu_fraction=0.5):
@@ -171,7 +171,7 @@ def test_different_filters_pushed_into_the_read_are_different_sources(tmp_path):
 
 
 def _scan_table(plan):
-    from mxframe.lazy_frame import Scan
+    from omxcore.lazy_frame import Scan
     while not isinstance(plan, Scan):
         plan = plan.input
     return plan.table
@@ -228,7 +228,7 @@ def test_the_prepared_registry_is_bounded_and_cleared(monkeypatch):
 
 
 def test_a_file_read_carries_a_source_token_and_a_derived_table_does_not(parquet_file):
-    from mxframe.io_parquet import read_parquet_table, table_source
+    from omxcore.io_parquet import read_parquet_table, table_source
     path, t = parquet_file
     a, b = read_parquet_table(path), read_parquet_table(path)
     assert a is not b and table_source(a) == table_source(b) and table_source(a)[0] == "parquet"
@@ -262,8 +262,8 @@ def _gids(compiler_cls, got):
 def test_native_range_partials_merge_to_the_pipeline_kernels_partials(grouped, nan):
     """The executor's partials for two row ranges merge to what the pipeline kernel gives for all rows:
     every aggregate kind (sum, mean, min / max with and without NaN, count) and the NaN counts behind them."""
-    from mxframe.custom_ops import CustomOpsCompiler
-    from mxframe.pipeline_program import finalize, merge_partials
+    from omxcore.custom_ops import CustomOpsCompiler
+    from omxcore.pipeline_program import finalize, merge_partials
     t = data(200_000, groups=300, nan=nan)
     if nan == "group" and not grouped:
         pytest.skip("an all-NaN group needs keys")
@@ -289,7 +289,7 @@ def test_native_range_partials_merge_to_the_pipeline_kernels_partials(grouped, n
 
 @needs_native
 def test_native_range_over_an_empty_or_filtered_out_range_is_the_identity():
-    from mxframe.custom_ops import CustomOpsCompiler
+    from omxcore.custom_ops import CustomOpsCompiler
     t = data(50_000, groups=5)
     plan, got = _inputs(t, grouped=False)
     comp = CustomOpsCompiler(device="cpu")
@@ -385,7 +385,7 @@ def _shapes():
 def test_split_predicate_matches_what_the_split_path_takes(name):
     """`split_check` accepts a plan exactly when `try_fused_aggregate` runs it AND the split can key its
     columns (stable group ids, buffers a device copy can be tied to): both answer the same question."""
-    from mxframe.custom_ops import CustomOpsCompiler
+    from omxcore.custom_ops import CustomOpsCompiler
     lf, accepted = _shapes()[name]
     verdict = pe.split_check(lf.plan)
     assert (not isinstance(verdict, str)) == accepted, verdict
@@ -515,13 +515,13 @@ def test_a_non_resident_auto_decision_reads_no_column(monkeypatch):
     """Deciding a query whose columns are not resident compiles the program and asks residency: no pass over
     int64 columns or integer sums (they cost as much as a native query, on every decision, possibly forever)."""
     scans = []
-    import mxframe.join_engine as je
-    import mxframe.pipeline_program as pp
+    import omxcore.join_engine as je
+    import omxcore.pipeline_program as pp
     real_mm = je._minmax
     monkeypatch.setattr(je, "_minmax", lambda *a: scans.append("minmax") or real_mm(*a))
-    real_col, real_sum = pe._column_past_2_53, __import__("mxframe.pipeline_program", fromlist=["x"]).int_sum_inexact
+    real_col, real_sum = pe._column_past_2_53, __import__("omxcore.pipeline_program", fromlist=["x"]).int_sum_inexact
     monkeypatch.setattr(pe, "_column_past_2_53", lambda *a: scans.append("int64") or real_col(*a))
-    import mxframe.custom_ops as co
+    import omxcore.custom_ops as co
     real_reason = co.CustomOpsCompiler._arrow_aggregate_reason
     monkeypatch.setattr(co.CustomOpsCompiler, "_arrow_aggregate_reason",
                         staticmethod(lambda *a, **k: scans.append("arrow") or real_reason(*a, **k)))
@@ -541,7 +541,7 @@ def test_a_string_filter_in_a_non_resident_decision_does_no_row_work(monkeypatch
     """A scan_parquet read of several row groups holds a multi-chunk dictionary column; building its program's
     dictionary unifies and rewrites every row's code (and a plain string column is hash-encoded). The decision
     only names columns: none of that runs for it, while the full check (the run) still does it."""
-    import mxframe.pipeline_program as pp
+    import omxcore.pipeline_program as pp
     n = 400_000
     rng = np.random.default_rng(4)
     words = np.array(["A", "N", "R"])[rng.integers(0, 3, n)]
@@ -571,7 +571,7 @@ def test_a_string_filter_in_a_non_resident_decision_does_no_row_work(monkeypatch
 
 
 def test_the_light_compile_names_the_same_columns_as_the_real_one():
-    from mxframe.pipeline_program import compile_pipeline
+    from omxcore.pipeline_program import compile_pipeline
     t = data(50_000)
     t = t.append_column("day", pa.array(np.arange(50_000, dtype=np.int32) % 4000))
     aggs = [col("i").sum().alias("s"), (col("i") * col("j")).sum().alias("p"), col("v").sum().alias("v")]
@@ -594,7 +594,7 @@ def test_a_cpu_decision_with_a_queued_upload_runs_native_then_starts_the_upload(
     monkeypatch.setattr(am, "gpu_warmup_started", lambda: True)
     monkeypatch.setattr(cf, "IDLE_BEFORE_BACKGROUND_S", 0.0)
     policies = []
-    import mxframe.lazy_frame as lfm
+    import omxcore.lazy_frame as lfm
     real = lfm._run_on_device
     monkeypatch.setattr(lfm, "_run_on_device", lambda plan, device, **kw: policies.append(cf.current_policy()) or real(plan, device, **kw))
     lf = agg_query(LazyFrame(t))

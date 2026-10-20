@@ -8,10 +8,10 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-import mxframe as mx
-import mxframe.native_exec as nx
-from mxframe import LazyFrame, col
-from mxframe.np_arrow import array as A
+import omxcore as mx
+import omxcore.native_exec as nx
+from omxcore import LazyFrame, col
+from omxcore.np_arrow import array as A
 
 pytestmark = pytest.mark.skipif(not nx.available(), reason="libmxexec_cpu.so not built")
 
@@ -194,7 +194,7 @@ def test_parquet_scan(tmp_path):
 
 def _gpu_usable():
     try:
-        import mxframe.custom_ops as co
+        import omxcore.custom_ops as co
         return co._max_accelerator() is not None
     except Exception:
         return False
@@ -202,7 +202,7 @@ def _gpu_usable():
 
 @pytest.mark.skipif(not _gpu_usable(), reason="no usable GPU")
 def test_ranks_past_the_gpu_float32_limit_stay_off_the_gpu(monkeypatch):
-    import mxframe.custom_ops as co
+    import omxcore.custom_ops as co
     t = _table()
     sql = "SELECT k, MIN(s) lo, MAX(s) hi FROM t GROUP BY k"
     lf = mx.sql(sql, t=t)
@@ -216,7 +216,7 @@ def test_ranks_past_the_gpu_float32_limit_stay_off_the_gpu(monkeypatch):
 
 
 def test_numeric_min_max_over_a_join_runs_no_dry_run(monkeypatch):
-    from mxframe.lazy_frame import LazyFrame as LF
+    from omxcore.lazy_frame import LazyFrame as LF
     runs = []
     real = LF.schema.fget
     monkeypatch.setattr(LF, "schema", property(lambda self: (runs.append(1), real(self))[1]))
@@ -239,7 +239,7 @@ def test_a_user_column_named_like_the_rank_column():
 
 @pytest.mark.parametrize("string_side", ["right", "left"])
 def test_a_clashing_name_is_ranked_only_when_the_copy_it_names_is_a_string(monkeypatch, string_side):
-    import mxframe.custom_ops as co
+    import omxcore.custom_ops as co
     calls = []
     real = co._rank_strings
     monkeypatch.setattr(co, "_rank_strings", lambda c: (calls.append(str(c.type)), real(c))[1])

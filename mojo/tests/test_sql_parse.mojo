@@ -1,6 +1,6 @@
 # F-150: the SQL lexer and parser. A parse that works gives back the text of the statement as the tree renders it;
 # one that does not raises the whole message (position included).
-from mxframe.sql import parse_sql, SqlStatement
+from omxcore.sql import parse_sql, SqlStatement
 
 
 
@@ -87,10 +87,10 @@ def main() raises:
     fails("select a from (select 1) x", "SQL error at line 1, column 15: a subquery in FROM is not supported yet (F-159)")
     fails("with x as (select 1) select * from x", "SQL error at line 1, column 1: `WITH` (common table expressions) is not supported yet (F-159)")
     fails("select a from t where b glob 'x*'", "SQL error at line 1, column 25: `GLOB` is not supported yet")
-    fails("select timestamp '2024-01-01 10:00:00' from t", "SQL error at line 1, column 8: `TIMESTAMP` literals is not supported yet (MX frame has no timestamp kind)")
+    fails("select timestamp '2024-01-01 10:00:00' from t", "SQL error at line 1, column 8: `TIMESTAMP` literals is not supported yet (omxcore has no timestamp kind)")
     fails("select a from t where b like 'x%' escape", "SQL error at line 1, column 41: expected an expression, found the end of the statement")
     fails("select cast(a as hugeint) from t", "SQL error at line 1, column 18: the type `hugeint` in a cast (the casts are INTEGER, BIGINT, SMALLINT, TINYINT, DECIMAL(p, s), DOUBLE, REAL, VARCHAR, DATE and BOOLEAN) is not supported yet")
-    fails("select a + interval '3' hour from t", "SQL error at line 1, column 12: an interval in hours is not supported yet (MX frame has no timestamp kind: days, weeks, months and years only)")
+    fails("select a + interval '3' hour from t", "SQL error at line 1, column 12: an interval in hours is not supported yet (omxcore has no timestamp kind: days, weeks, months and years only)")
     fails("select case when a then 1 from t", "SQL error at line 1, column 27: expected END, found `from` (did you mean FROM?)")
     fails("select a from t where b in (select 1)", "SQL error at line 1, column 37: expected FROM, found `)`")
     renders("select 1e3, 2.5E-3, 7e+2 from t", "1e3, 2.5E-3, 7e+2 FROM t")                       # (F-157: a number with an exponent is a DOUBLE literal)

@@ -1,5 +1,5 @@
 """F-035: `import pyarrow.compute` costs ~20-25 ms per process, and a plan that runs natively never
-calls it. mxframe defers it to first use (mxframe/_lazy_pc.py): importing mxframe, reading Parquet
+calls it. omxcore defers it to first use (omxcore/_lazy_pc.py): importing omxcore, reading Parquet
 and a natively executed query must not load it. The tests turn the background warm-up off so
 they see what the query itself imports."""
 import importlib
@@ -24,9 +24,9 @@ def tpch_tiny_dir(tmp_path_factory):
 
 _RUN = """
 import json, sys
-import mxframe
-from mxframe import native_exec
-mxframe._warm_thread and mxframe._warm_thread.join()
+import omxcore
+from omxcore import native_exec
+omxcore._warm_thread and omxcore._warm_thread.join()
 out = {"after_import": "pyarrow.compute" in sys.modules, "core_loaded": "pyarrow._compute" in sys.modules,
        "lib_loaded": native_exec._lib is not None}
 from tpch_user import q_mx
@@ -114,12 +114,12 @@ def _parity_cases():
 @pytest.mark.parametrize("name,args,kwargs", _parity_cases(), ids=lambda v: v if isinstance(v, str) else "")
 def test_fast_shim_matches_pyarrow_compute(name, args, kwargs, monkeypatch):
     import pyarrow.compute as real
-    from mxframe import _lazy_pc
+    from omxcore import _lazy_pc
     want = getattr(real, name)(*args, **kwargs)
     # once pyarrow.compute is loaded the shim hands every name to it: unload it so the fast path runs
     monkeypatch.delitem(sys.modules, "pyarrow.compute")
     f = _lazy_pc._wrapper(name)
-    assert f is not None and getattr(f, "__module__", None) == "mxframe._lazy_pc"
+    assert f is not None and getattr(f, "__module__", None) == "omxcore._lazy_pc"
     got = f(*args, **kwargs)
     assert "pyarrow.compute" not in sys.modules
     assert got.equals(want)
@@ -133,7 +133,7 @@ class _NoPandas:   # pyarrow imports pandas (which imports pyarrow.compute) when
             raise ImportError(name)
 sys.meta_path.insert(0, _NoPandas())
 import pyarrow as pa
-from mxframe._lazy_pc import pc
+from omxcore._lazy_pc import pc
 out = {}
 a = pa.array([3, 1, 2])
 pc.add(a, 1); pc.and_kleene(pa.array([True]), True); pc.sort_indices(pa.table({"x": a}), sort_keys=[("x", "ascending")])
@@ -157,7 +157,7 @@ def test_generated_functions_do_not_import_pyarrow_compute():
 
 def test_shim_errors_like_pyarrow_compute(monkeypatch):
     import pyarrow as pa
-    from mxframe._lazy_pc import _LazyCompute
+    from omxcore._lazy_pc import _LazyCompute
     monkeypatch.delitem(sys.modules, "pyarrow.compute", raising=False)
     with pytest.raises(AttributeError):
         _LazyCompute().no_such_function

@@ -1,4 +1,4 @@
-"""Range aggregates and block reads over a row order (F-176; docs/mxframe-mojo-api.md "Ranges and blocks").
+"""Range aggregates and block reads over a row order (F-176; docs/omxcore-mojo-api.md "Ranges and blocks").
 
 A grid shows a window of a sorted view and a status bar totals a selection of it. Both are "positions a..b of an order": the order is a
 list of row numbers (`Frame.permutation`, the row numbers of a `sql ... ORDER BY`, any row list) or, with no list, the rows themselves.

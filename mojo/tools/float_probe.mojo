@@ -8,7 +8,7 @@
 # Output: {"counts": [...], "aggs": [{"float": 0|1, "present": [...], "vals": [...]}]}: a float aggregate's values are the float64 bits as
 # "0x....", the others are numbers; top_k's lists are in "top".
 from std.sys import argv
-from mxframe import (Query, QueryResult, Frame, Table, SharedTable, col, lit, lit_float, lit_f32, sum, count, mean, min_of, max_of,
+from omxcore import (Query, QueryResult, Frame, Table, SharedTable, col, lit, lit_float, lit_f32, sum, count, mean, min_of, max_of,
                      count_distinct, percentile, median, top_k, read_parquet, scan_parquet, write_parquet, ZSTD, AUTO, CPU,
                      MORSELS_ON, MORSELS_OFF)
 

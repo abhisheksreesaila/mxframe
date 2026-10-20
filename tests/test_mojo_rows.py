@@ -264,7 +264,7 @@ class _RowGen(_Gen):
 
     def typed(self, depth=0):
         """Like the aggregate generator's, but `%` only between integers: DuckDB widens a product of decimals past 18 digits and takes the
-        remainder in doubles, where MX frame keeps the exact int64 decimal (the documented difference of decimal arithmetic past int64)."""
+        remainder in doubles, where omxcore keeps the exact int64 decimal (the documented difference of decimal arithmetic past int64)."""
         r = self.rng
         if depth > 2 or r.random() < 0.35:
             c = r.choice(self.INTS + self.DECS + [str(r.randint(-5, 9)), f"{r.randint(-300, 300) / 100:.2f}"])
@@ -317,7 +317,7 @@ def test_random_row_queries_equal_duckdb(mx, probe, data, mode, seed):
         try:
             check_query(mode, data["g10k"] if seed % 2 else data["g8"], mx, probe, q)
         except AssertionError as e:
-            if "passed the int64 range" in str(e):                     # a product of decimals past int64: MX frame raises where DuckDB widens
+            if "passed the int64 range" in str(e):                     # a product of decimals past int64: omxcore raises where DuckDB widens
                 continue
             raise
         compared += 1

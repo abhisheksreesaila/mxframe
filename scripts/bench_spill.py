@@ -1,9 +1,9 @@
 """Out-of-memory benchmark (F-056 / F-058): SF10 queries forced to stream, spill and Grace-join.
 
-Each (query, engine, budget) runs in a fresh process. MXFrame reads with `scan_parquet` under
+Each (query, engine, budget) runs in a fresh process. omxcore reads with `scan_parquet` under
 `MXFRAME_HOST_MEM_BUDGET`; the clock covers read + query + result (a streamed query cannot stage its data,
 that is the point). DuckDB is the reference, run once without a limit and once with `memory_limit` set to the
-same budget. Every MXFrame result is checked against DuckDB's. Peak RSS is the child's ru_maxrss.
+same budget. Every omxcore result is checked against DuckDB's. Peak RSS is the child's ru_maxrss.
 
     pixi run python scripts/bench_spill.py --budgets 2G,none --devices cpu,gpu,auto --gpu 0
 """
@@ -108,8 +108,8 @@ def worker(args):
         if args.budget != "none":
             os.environ["MXFRAME_HOST_MEM_BUDGET"] = args.budget
         import warnings
-        import mxframe as mx
-        from mxframe.io_parquet import scan_parquet
+        import omxcore as mx
+        from omxcore.io_parquet import scan_parquet
         lf = mx.sql(q[2], **{t: scan_parquet(str(DATA / (t + ".parquet"))) for t in TABLES})
         t1 = time.perf_counter()
         with warnings.catch_warnings(record=True) as w:

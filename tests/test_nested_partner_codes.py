@@ -8,10 +8,10 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-import mxframe as mx
-import mxframe.native_exec as nx
-from mxframe import _lazy_pc
-from mxframe.np_arrow import array as A
+import omxcore as mx
+import omxcore.native_exec as nx
+from omxcore import _lazy_pc
+from omxcore.np_arrow import array as A
 
 pytestmark = pytest.mark.skipif(not nx.available(), reason="libmxexec_cpu.so not built")
 

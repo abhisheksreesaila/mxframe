@@ -1,8 +1,8 @@
 """Phase 5 verification: Join operations (CPU path)."""
 import pyarrow as pa
 import numpy as np
-from mxframe.lazy_expr import col, lit
-from mxframe.lazy_frame import LazyFrame, Join
+from omxcore.lazy_expr import col, lit
+from omxcore.lazy_frame import LazyFrame, Join
 
 # ═══════════════════════════════════════════════════════════════════════
 # Test data

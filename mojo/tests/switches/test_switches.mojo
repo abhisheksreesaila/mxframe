@@ -4,13 +4,13 @@
 # Everything an app does must still give the right answer; the three things that are gone must say so readably.
 from std.sys import argv
 from std.os import getenv
-from mxframe import (Table, SharedTable, Frame, Query, QueryResult, INT, DECIMAL, col, sum, count, CPU, GPU, AUTO, DeviceTable,
+from omxcore import (Table, SharedTable, Frame, Query, QueryResult, INT, DECIMAL, col, sum, count, CPU, GPU, AUTO, DeviceTable,
                      gpu_available, read_csv, CsvOptions, write_parquet, read_parquet, scan_parquet, min_of, max_of, ZSTD, SNAPPY,
                      count_distinct, median, percentile, top_k, Catalog, PlannerOptions, GROUP_HASHED, GROUP_DENSE, sql,
                      compute_job, sql_job, read_csv_job, read_parquet_job, save_job, write_parquet_job, permutation_job, JOB_DONE, JOB_FAILED, JOB_CANCELLED)
-from mxframe.job import THREADS
-from mxframe.query import AUTO_GPU_MIN_ROWS
-from mxframe.kernels._fpenv import core_count
+from omxcore.job import THREADS
+from omxcore.query import AUTO_GPU_MIN_ROWS
+from omxcore.kernels._fpenv import core_count
 
 
 def expect(cond: Bool, what: String) raises:

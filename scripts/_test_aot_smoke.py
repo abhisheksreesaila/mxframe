@@ -21,7 +21,7 @@ def check(name, got, expected):
 
 # ── 1. Direct AOT kernel test ─────────────────────────────────────────────────
 print("=== AOT kernel correctness ===")
-from mxframe.aot_kernels import AOTKernels, AOT_AVAILABLE
+from omxcore.aot_kernels import AOTKernels, AOT_AVAILABLE
 print(f"AOT_AVAILABLE={AOT_AVAILABLE}")
 
 if not AOT_AVAILABLE:
@@ -111,9 +111,9 @@ check("join_scatter_left no-match right_idx", ro2[0], -1)
 
 # ── 2. CustomOpsCompiler AOT dispatch ────────────────────────────────────────
 print("\n=== CustomOpsCompiler AOT dispatch ===")
-from mxframe.custom_ops import CustomOpsCompiler
-from mxframe.lazy_expr import Expr, col
-from mxframe.lazy_frame import LazyFrame, Scan
+from omxcore.custom_ops import CustomOpsCompiler
+from omxcore.lazy_expr import Expr, col
+from omxcore.lazy_frame import LazyFrame, Scan
 
 N = 100
 comp = CustomOpsCompiler(device="cpu")
@@ -158,11 +158,11 @@ else:
 # ── 3. Q1-style test (multi-agg on filtered data) ────────────────────────────
 print("\n=== Q1-style multi-agg ===")
 try:
-    from mxframe import MXFrame
-    print("  PASS  mxframe importable")
+    from omxcore import omxcore
+    print("  PASS  omxcore importable")
     PASS += 1
 except Exception as e:
-    print(f"  WARN  skipping MXFrame import: {e}")
+    print(f"  WARN  skipping omxcore import: {e}")
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 print(f"\n=== SUMMARY: {PASS} passed, {FAIL} failed ===")

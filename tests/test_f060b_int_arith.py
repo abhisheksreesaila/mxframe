@@ -11,15 +11,15 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-import mxframe as mx
-import mxframe.native_exec as nx
-import mxframe.pipeline_exec as pe
-import mxframe.pipeline_kernels as pk
-from mxframe import LazyFrame, col, gpu_stream, lit
-from mxframe.custom_ops import CustomOpsCompiler
-from mxframe.io_parquet import scan_parquet
-from mxframe.np_arrow import array as A
-from mxframe.pipeline_program import compile_pipeline
+import omxcore as mx
+import omxcore.native_exec as nx
+import omxcore.pipeline_exec as pe
+import omxcore.pipeline_kernels as pk
+from omxcore import LazyFrame, col, gpu_stream, lit
+from omxcore.custom_ops import CustomOpsCompiler
+from omxcore.io_parquet import scan_parquet
+from omxcore.np_arrow import array as A
+from omxcore.pipeline_program import compile_pipeline
 
 HAS_GPU = gpu_stream.cuda_available()
 
@@ -64,8 +64,8 @@ MODES = [
 def prepass(monkeypatch):
     """Counts every pass over the data that decides whether an integer expression is exact: F-037's `col_bound` and
     `_minmax`, and F-032's range check of an int64 column the float64 registers load."""
-    from mxframe import join_engine
-    from mxframe.pipeline_program import _Builder
+    from omxcore import join_engine
+    from omxcore.pipeline_program import _Builder
     calls = []
     real_mm = join_engine._minmax
     monkeypatch.setattr(join_engine, "_minmax", lambda *a, **k: (calls.append("_minmax"), real_mm(*a, **k))[1])
@@ -367,7 +367,7 @@ def test_a_streamed_overflow_raises(tmp_path, monkeypatch):
 @pytest.mark.parametrize("fraction", [0.0, 0.3, 0.7, 1.0])
 @pytest.mark.parametrize("grouped", [True, False], ids=["grouped", "global"])
 def test_a_cpu_gpu_split_runs_the_int64_ops_on_both_devices(fraction, grouped):
-    import mxframe.coproc_fused as cf
+    import omxcore.coproc_fused as cf
     cf.clear_residency()
     t = _table(600_000, 37)
     con = duckdb.connect()

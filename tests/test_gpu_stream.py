@@ -4,7 +4,7 @@ import threading
 import numpy as np
 import pytest
 
-from mxframe import gpu_stream
+from omxcore import gpu_stream
 
 pytestmark = pytest.mark.skipif(not gpu_stream.cuda_available(), reason="no CUDA GPU")
 

@@ -7,8 +7,8 @@ import pyarrow as pa
 import pytest
 
 import conftest  # noqa: F401
-from mxframe import LazyFrame, col, lit
-from mxframe.lazy_frame import Scan
+from omxcore import LazyFrame, col, lit
+from omxcore.lazy_frame import Scan
 
 
 def _table():
@@ -208,7 +208,7 @@ def test_left_join_count_of_right_column_counts_unmatched_as_zero(device):
 
 
 def test_empty_global_aggregates_are_null_on_gpu():
-    from mxframe import gpu_stream
+    from omxcore import gpu_stream
     if not gpu_stream.cuda_available():
         pytest.skip("no GPU")
     n = 300_000                                   # above the auto/GPU thresholds

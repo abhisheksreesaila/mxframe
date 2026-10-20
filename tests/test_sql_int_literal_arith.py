@@ -8,8 +8,8 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-import mxframe as mx
-import mxframe.native_exec as nx
+import omxcore as mx
+import omxcore.native_exec as nx
 
 B = (1 << 53) + 1                      # the first integer float64 cannot hold
 N = 300

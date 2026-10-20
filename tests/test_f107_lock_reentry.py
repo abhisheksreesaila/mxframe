@@ -20,7 +20,7 @@ sys.path.insert(0, ".")
 import conftest  # noqa: F401
 import numpy as np
 import pyarrow as pa
-from mxframe import coproc_fused as cf
+from omxcore import coproc_fused as cf
 
 class Dc:
     freed = 0

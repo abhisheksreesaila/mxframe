@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MXFrame quickstart — write queries the way you'd expect.
+omxcore quickstart — write queries the way you'd expect.
 
 Run:
     pixi run python scripts/quickstart.py
@@ -120,8 +120,8 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.csv as pa_csv
 
-import mxframe as mxf
-from mxframe import col, lit, when
+import omxcore as mxf
+from omxcore import col, lit, when
 
 
 # ── CLI args ─────────────────────────────────────────────────────────────────
@@ -176,7 +176,7 @@ print(f"  customers: {customers_arrow.num_rows:>10,} rows")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Step 2: load into MXFrame  (LazyFrame — nothing executes yet)
+#  Step 2: load into omxcore  (LazyFrame — nothing executes yet)
 # ─────────────────────────────────────────────────────────────────────────────
 orders    = mxf.from_arrow(orders_arrow)
 customers = mxf.from_arrow(customers_arrow)

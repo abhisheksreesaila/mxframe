@@ -19,8 +19,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from mxframe import LazyFrame, col, gpu_stream
-from mxframe.io_parquet import scan_parquet
+from omxcore import LazyFrame, col, gpu_stream
+from omxcore.io_parquet import scan_parquet
 
 N = 6_000_000
 GROUP_ROWS = 100_000          # 60 row groups of ~3.4 MB decoded
@@ -467,7 +467,7 @@ def test_reproducible_mode_gives_the_same_bits_every_run(files):
 
 def test_reproducible_batches_do_not_depend_on_free_memory(monkeypatch):
     """With no override the budget is read from MemTotal in reproducible mode, not from what is free now."""
-    from mxframe import streamed
+    from omxcore import streamed
     monkeypatch.delenv("MXFRAME_HOST_MEM_BUDGET")
     monkeypatch.setattr(streamed, "_meminfo", lambda key: {"MemAvailable": 1 << 30, "MemTotal": 64 << 30}[key])
     a = streamed.host_budget(reproducible=True)
@@ -531,8 +531,8 @@ def test_a_dimension_bigger_than_half_the_budget_is_joined_by_partitions(tmp_pat
 PEAK = textwrap.dedent("""
     import json, sys
     import pyarrow as pa
-    from mxframe import col
-    from mxframe.io_parquet import scan_parquet
+    from omxcore import col
+    from omxcore.io_parquet import scan_parquet
 
     def status(key):
         with open("/proc/self/status") as f:
@@ -545,20 +545,20 @@ PEAK = textwrap.dedent("""
     open("/proc/self/clear_refs", "w").write("5")   # VmHWM starts again from the current size
     base = status("VmRSS")
     out = lf.compute(device=sys.argv[2])
-    import mxframe
-    print(json.dumps({"module": mxframe.__file__, "rows": out.num_rows, "path": lf.last_compile_provenance["path"],
+    import omxcore
+    print(json.dumps({"module": omxcore.__file__, "rows": out.num_rows, "path": lf.last_compile_provenance["path"],
                       "arrow_peak": pa.default_memory_pool().max_memory(), "rss_peak_growth": status("VmHWM") - base}))
 """)
 
 
 def conftest_root():
     import conftest
-    return os.path.realpath(conftest._shim / "mxframe")
+    return os.path.realpath(conftest._shim / "omxcore")
 
 
 def peak(files, device, budget):
     import json
-    import conftest                                  # its shim directory holds `mxframe` -> this checkout
+    import conftest                                  # its shim directory holds `omxcore` -> this checkout
     env = dict(os.environ, MXFRAME_HOST_MEM_BUDGET=budget, MXFRAME_GPU_MEM_BUDGET=GPU,
                PYTHONPATH=os.pathsep.join([str(conftest._shim)] + ([os.environ["PYTHONPATH"]] if os.environ.get("PYTHONPATH") else [])))
     out = subprocess.run([sys.executable, "-c", PEAK, files["fact"], device], env=env, capture_output=True, text=True,
@@ -572,7 +572,7 @@ def test_peak_memory_is_bounded_by_the_budget_not_the_file(files):
     decoded = N * (4 + 4 + 8 + 8 + 4 + 1)          # the file's columns as Arrow holds them (~170 MB)
     streamed = peak(files, "cpu", HOST)
     whole = peak(files, "cpu", "64G")
-    here = os.path.join(conftest_root(), "__init__.py")        # the checkout under test, not an installed mxframe
+    here = os.path.join(conftest_root(), "__init__.py")        # the checkout under test, not an installed omxcore
     assert os.path.realpath(streamed["module"]) == os.path.realpath(whole["module"]) == here
     assert streamed["path"] == "streamed" and whole["path"] != "streamed"
     assert streamed["rows"] == whole["rows"] == 12
@@ -649,7 +649,7 @@ def silent_reference(query, paths):
 
 @pytest.mark.parametrize("name", sorted(SILENT))
 def test_a_shape_that_cannot_stream_gives_the_in_memory_answer(silent, monkeypatch, name):
-    import mxframe as mx
+    import omxcore as mx
     query, why = SILENT[name]
     monkeypatch.setenv("MXFRAME_HOST_MEM_BUDGET", "100K")
     lf = mx.sql(query, fact=scan_parquet(silent["fact"]), dim=scan_parquet(silent["dim"]))
@@ -669,7 +669,7 @@ def test_a_shape_that_cannot_stream_gives_the_in_memory_answer(silent, monkeypat
 
 
 def test_count_star_counts_rows_when_the_first_column_and_the_keys_hold_nulls(silent, monkeypatch):
-    import mxframe as mx
+    import omxcore as mx
     monkeypatch.setenv("MXFRAME_HOST_MEM_BUDGET", "100K")
     query = "SELECT k, count(*) AS n, count(a) AS na, avg(a) AS m FROM fact GROUP BY k"
     lf = mx.sql(query, fact=scan_parquet(silent["fact"]))

@@ -6,9 +6,9 @@ import sys
 
 import pytest
 
-import mxframe
-import mxframe.calibration as cal_mod
-from mxframe.calibration import Calibration, Fit, Probe, calibrate, default_calibration
+import omxcore
+import omxcore.calibration as cal_mod
+from omxcore.calibration import Calibration, Fit, Probe, calibrate, default_calibration
 
 GPU = {"name": "Fake RTX", "driver": "999.1", "mem_bytes": 24 * 2**30}
 OTHER_GPU = {"name": "Other GPU", "driver": "1.0", "mem_bytes": 8 * 2**30}
@@ -113,7 +113,7 @@ def test_pinned_unavailable_falls_back_to_pageable():
 
 
 def test_cpu_thread_count_recorded(monkeypatch):
-    from mxframe import aot_kernels as _ak
+    from omxcore import aot_kernels as _ak
     monkeypatch.setattr(_ak, "_cpu_threads", 7)
     assert run_fake_calibration(save=False).cpu_threads == 7
 
@@ -228,7 +228,7 @@ def test_entry_with_bad_fields_gives_defaults(tmp_path):
 
 def test_stale_mxframe_version_gives_defaults(monkeypatch):
     run_fake_calibration()
-    monkeypatch.setattr(mxframe, "__version__", "99.0.0")
+    monkeypatch.setattr(omxcore, "__version__", "99.0.0")
     cal_mod.reset_calibration_cache()
     assert cal_mod.get_calibration().source == "defaults"
 
@@ -245,7 +245,7 @@ def test_other_machine_gives_defaults_and_entries_coexist(tmp_path, monkeypatch)
 
 def test_changed_cpu_thread_count_invalidates_cpu_fits_only(monkeypatch):
     run_fake_calibration()
-    from mxframe import aot_kernels as _ak
+    from omxcore import aot_kernels as _ak
     monkeypatch.setattr(_ak, "_cpu_threads", 16)
     cal_mod.reset_calibration_cache()
     c = cal_mod.get_calibration()
@@ -344,9 +344,9 @@ def test_probe_registry_covers_engine_kernels():
 
 # ---------------------------------------------------------------- packaging ---
 def test_import_mxframe_does_not_load_calibration_and_exports_calibrate():
-    code = ("import sys, mxframe; "
-            "assert 'mxframe.calibration' not in sys.modules; "
-            "assert callable(mxframe.calibrate) and 'calibrate' in mxframe.__all__")
+    code = ("import sys, omxcore; "
+            "assert 'omxcore.calibration' not in sys.modules; "
+            "assert callable(omxcore.calibrate) and 'calibrate' in omxcore.__all__")
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
                          env={**__import__('os').environ, "PYTHONPATH": ":".join(sys.path)})
     assert out.returncode == 0, out.stderr
@@ -426,7 +426,7 @@ def test_pipeline_op_is_reserved_with_default_fit():
 def test_unknown_op_logs_once_at_debug(caplog):
     import logging
     c = default_calibration(GPU)
-    with caplog.at_level(logging.DEBUG, logger="mxframe.calibration"):
+    with caplog.at_level(logging.DEBUG, logger="omxcore.calibration"):
         c.estimate("mystery_op_xyz", "cpu", 10)
         c.estimate("mystery_op_xyz", "cpu", 10)
     assert sum("mystery_op_xyz" in r.getMessage() for r in caplog.records) == 1
@@ -793,7 +793,7 @@ def test_pipeline_probes_exist_on_both_devices_and_are_compute_only():
 @pytest.mark.parametrize("dev", ["cpu", "gpu"])
 def test_pipeline_probe_runs_the_q1_shaped_program_correctly(dev):
     import numpy as np
-    from mxframe import pipeline_kernels as pk
+    from omxcore import pipeline_kernels as pk
     if dev == "cpu" and not pk.cpu_available():
         pytest.skip("libmxpipeline_cpu.so not built")
     if dev == "gpu":

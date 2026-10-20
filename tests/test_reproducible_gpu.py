@@ -10,11 +10,11 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-from mxframe import LazyFrame, col, lit
-from mxframe import coproc_fused as cf
-from mxframe import native_exec as nx
-from mxframe import pipeline_kernels as pk
-from mxframe.np_arrow import array as A
+from omxcore import LazyFrame, col, lit
+from omxcore import coproc_fused as cf
+from omxcore import native_exec as nx
+from omxcore import pipeline_kernels as pk
+from omxcore.np_arrow import array as A
 
 needs_gpu = pytest.mark.skipif(not pk.gpu_available() or not pk.cpu_available(),
                                reason="needs both pipeline libraries and a GPU")
@@ -121,7 +121,7 @@ def test_the_environment_variable_runs_the_ordered_gpu_kernel(monkeypatch):
     bad, total = _differing_groups(lambda: plan.compute(device="gpu"))
     assert plan.last_compile_provenance["path"] == "fused_pipeline_gpu"
     assert bad == 0, f"{bad} of {total} groups differ bitwise between runs"
-    from mxframe import pipeline_exec
+    from omxcore import pipeline_exec
     prog, _ = pipeline_exec._bind(*pipeline_exec._table_of(plan.plan)[:2], t)
     mode = lambda repro: pk._load_gpu().mx_pipeline_gpu_mode(200, prog.n_slots, int(prog.code[1]), int(len(prog.code)), repro)
     assert (mode(0), mode(1)) == (1, 4)       # atomics in the default mode, the ordered table (mode 4) when reproducible
@@ -180,7 +180,7 @@ def test_a_resident_split_with_no_explicit_fraction_runs_the_cpu_defined_order()
 @needs_gpu
 def test_a_split_merges_the_gpu_share_then_the_cpu_share_in_row_order():
     """The split's bits equal the two shares computed alone and added GPU rows first, CPU rows second."""
-    from mxframe.pipeline_program import merge_partials
+    from omxcore.pipeline_program import merge_partials
     cf.clear_residency()
     t = _fact(2_000_000, 200)
     plan = _revenue(t)
@@ -199,8 +199,8 @@ def test_a_split_merges_the_gpu_share_then_the_cpu_share_in_row_order():
 
 
 def _program_and_columns(plan, t):
-    from mxframe import pipeline_exec
-    from mxframe.plan_validation import validate_plan_or_raise  # noqa: F401  (plan is already valid)
+    from omxcore import pipeline_exec
+    from omxcore.plan_validation import validate_plan_or_raise  # noqa: F401  (plan is already valid)
     predicates, agg_node, table = pipeline_exec._table_of(plan.plan)
     return pipeline_exec._bind(predicates, agg_node, table)
 
@@ -213,7 +213,7 @@ def test_a_view_compared_with_its_own_maximum_runs_its_aggregate_once(device, mo
     """F-064's plan-level sharing already covers the Q15 shape on any device: the subquery and the outer plan
     read ONE materialized aggregate, so they cannot land on different devices (or different bits). The
     aggregate runs once per compute and the filter keeps exactly the maximum's group."""
-    from mxframe import pipeline_exec
+    from omxcore import pipeline_exec
     t = _fact(2_000_000, 20_000)
     view = LazyFrame(t).groupby("s").agg((col("p") * (lit(1.0) - col("d"))).sum().alias("tot"))
     big, real = [], LazyFrame.compute
@@ -253,7 +253,7 @@ def test_gpu_reproducible_min_max_count_and_a_filter_equal_the_cpu():
 
 @needs_gpu
 def test_the_ordered_kernel_asks_before_a_split_which_group_counts_it_takes():
-    from mxframe import pipeline_exec
+    from omxcore import pipeline_exec
     t = _fact(1000, 10)
     prog, _ = pipeline_exec._bind(*pipeline_exec._table_of(_revenue(t).plan)[:2], t)
     assert [pk.gpu_reproducible_fits(prog, g) for g in (1, 10, 1_000, 1_365, 1_366, 100_000)] == \
@@ -265,7 +265,7 @@ def test_auto_with_reproducible_runs_the_cpu_defined_order_and_says_so(monkeypat
     """A resident shape auto splits, its fraction drifting between runs the way every run's `observe` moves it
     (emulated: 0.30 to 0.60): with reproducible=True auto takes no timing-based choice, runs the CPU defined
     order, and gives the same bits every run. (Without the flag the same setup does split and the bits move.)"""
-    from mxframe import auto_mode
+    from omxcore import auto_mode
     cf.clear_residency()
     plan = _revenue(_fact(2_000_000, 200))
     with cf.policy(min_upload_bytes=0, gpu_fraction=0.5):

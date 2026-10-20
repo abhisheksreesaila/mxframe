@@ -29,7 +29,7 @@ THEMES = {
                   text="#20221F", mid="#4C5049", dim="#6E716A", accent="#6C3E78", accent_hi="#512B5C",
                   mx="#2a78d6", dk="#1baf7a", pa="#eda100", slow="#e34948", grid="#E4DDD0", green="#18704F"),
 }
-SERIES = {"mx": "MX frame", "dk": "DuckDB", "pa": "pyarrow"}
+SERIES = {"mx": "omxcore", "dk": "DuckDB", "pa": "pyarrow"}
 
 
 def load():
@@ -157,7 +157,7 @@ def hero_paper(data):
             b.append(f'<path d="M{cx} {y + 70}H{W - 56}" stroke="{t["border"]}"/>')
     b.append("</g>")
     b.append(f'<rect x=".5" y=".5" width="{W - 1}" height="{H - 1}" rx="18" fill="none" stroke="{t["border_hi"]}"/>')
-    return svg_doc(W, H, "\n".join(b), "MX frame: the Mojo engine (editorial)",
+    return svg_doc(W, H, "\n".join(b), "omxcore: the Mojo engine (editorial)",
                    data["vision"] + " " + "; ".join(f'{h["label"]}: {h["big"]} ({h["vs"]})' for h in data["headline"]) + ". " + data["caveat"])
 
 
@@ -242,7 +242,7 @@ def chart_wins(data, theme):
     rows.sort(key=lambda r: -r["ratio"])
     ticks = [(1, "1 ms"), (10, "10 ms"), (100, "100 ms"), (1000, "1 s")]
     return chart(theme, "Where the Mojo engine leads DuckDB", "SQL, joins, expressions and aggregates · time, log scale · lower is faster",
-                 [("mx", "MX frame"), ("dk", "DuckDB 1.5.1")], rows, log_scale(1, 4000), ticks, FOOT, "FASTER")
+                 [("mx", "omxcore"), ("dk", "DuckDB 1.5.1")], rows, log_scale(1, 4000), ticks, FOOT, "FASTER")
 
 
 def chart_read(data, theme):
@@ -261,7 +261,7 @@ def chart_read(data, theme):
     ]
     ticks = [(0, "0"), (0.2, "0.2 s"), (0.4, "0.4 s"), (0.6, "0.6 s")]
     return chart(theme, "Reading files at memory speed", "Parquet, text and bigger-than-RAM streams · time, linear · lower is faster",
-                 [("mx", "MX frame"), ("dk", "DuckDB 1.5.1"), ("pa", "pyarrow")], rows, lambda v: v / 0.75, ticks, FOOT)
+                 [("mx", "omxcore"), ("dk", "DuckDB 1.5.1"), ("pa", "pyarrow")], rows, lambda v: v / 0.75, ticks, FOOT)
 
 
 def gaps(data):
@@ -284,7 +284,7 @@ def chart_behind(data, theme):
     ticks = [(v, f"{v}x") for v in range(1, int(top) + 2)]
     # leave room right of the longest bar for its "5.8x  336 ms vs 58 ms" label
     return chart(theme, "Where we're still behind DuckDB", "how many times slower than DuckDB · 1x is a tie · shorter is better",
-                 [("slow", "MX frame time / DuckDB time")], rows, lambda v: (v - 1) / ((top - 1) / 0.66), ticks, FOOT)
+                 [("slow", "omxcore time / DuckDB time")], rows, lambda v: (v - 1) / ((top - 1) / 0.66), ticks, FOOT)
 
 
 def paper_frame(t, W, H, kicker, right):
@@ -405,7 +405,7 @@ def roadmap(data):
             "; ".join(f"{i + 1}. {s['title']}" + (" (we are here)" if i == now else "") for i, s in enumerate(steps)) +
             f". {ag['title']} ({ag['when'].lower()}): {ag['lead']}. " +
             "; ".join(f"{it['name']} ({it['status']}): {it['line']}" for it in ag["items"]) + ".")
-    return svg_doc(W, H, body, f"MX frame roadmap: the path to {rm['name']}", desc)
+    return svg_doc(W, H, body, f"omxcore roadmap: the path to {rm['name']}", desc)
 
 
 def hood(data):

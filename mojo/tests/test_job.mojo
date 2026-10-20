@@ -1,10 +1,10 @@
-# F-175: the job handle itself (mojo/mxframe/job.mojo) with made-up work: state, result, error, cancel, progress, callback,
+# F-175: the job handle itself (mojo/omxcore/job.mojo) with made-up work: state, result, error, cancel, progress, callback,
 # dropped handles, many jobs at once, and no memory left behind. The real work (queries, reads, saves) is test_jobs.mojo.
 from std.atomic import Atomic
 from std.ffi import external_call, c_int
 from std.memory.alloc import unsafe_alloc
-from mxframe import (Job, JobCtl, JobBody, JobDone, start_job, start_job_then, JOB_RUNNING, JOB_DONE, JOB_FAILED, JOB_CANCELLED, STAGE_AGGREGATE)
-from mxframe.kernels._fpenv import SERIAL
+from omxcore import (Job, JobCtl, JobBody, JobDone, start_job, start_job_then, JOB_RUNNING, JOB_DONE, JOB_FAILED, JOB_CANCELLED, STAGE_AGGREGATE)
+from omxcore.kernels._fpenv import SERIAL
 
 
 def expect(cond: Bool, what: String) raises:

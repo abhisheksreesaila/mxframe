@@ -12,8 +12,8 @@ from conftest import _shim
 
 SCRIPT = textwrap.dedent("""
     import numpy as np
-    from mxframe import aot_kernels
-    from mxframe.custom_ops import CustomOpsCompiler
+    from omxcore import aot_kernels
+    from omxcore.custom_ops import CustomOpsCompiler
 
     assert aot_kernels.AOT_AVAILABLE
     aot = aot_kernels.AOTKernels()

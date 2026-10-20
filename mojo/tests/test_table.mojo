@@ -1,5 +1,5 @@
-# F-132 (M1): Table and columns, the API in docs/mxframe-mojo-api.md section 1.
-from mxframe import Table, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL
+# F-132 (M1): Table and columns, the API in docs/omxcore-mojo-api.md section 1.
+from omxcore import Table, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL
 
 
 def expect(cond: Bool, what: String) raises:

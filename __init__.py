@@ -1,4 +1,8 @@
-"""mxframe - GPU-accelerated DataFrames with MAX Engine"""
+"""omxcore: a compute engine (CPU and GPU) with persistence to open Parquet files.
+
+The Python package; the Mojo package (no Python) is `omxcore` too. `import mxframe` still works, as a forwarding
+module, for one release (see compat/mxframe/).
+"""
 
 __version__ = "0.6.0"
 
@@ -27,7 +31,7 @@ _RUNTIME_EXPORTS = {"GraphCompiler", "CustomOpsCompiler", "KERNELS_PATH"}
 
 def _runtime_import_error() -> ImportError:
     return ImportError(
-        "MXFrame computation requires the Modular MAX runtime. "
+        "omxcore computation requires the Modular MAX runtime. "
         "Install with: pip install 'mxframe[runtime]'"
     )
 
@@ -67,7 +71,7 @@ def sql(*args, **kwargs):
         from .sql_frontend import sql as _sql
     except ImportError:
         raise ImportError(
-            "mxframe.sql requires the optional `sqlglot` dependency. "
+            "omxcore.sql requires the optional `sqlglot` dependency. "
             "Install with: pip install 'mxframe[sql]'"
         ) from None
     return _sql(*args, **kwargs)
@@ -75,9 +79,9 @@ def sql(*args, **kwargs):
 
 def calibrate(full: bool = False, **kwargs):
     """Measure this machine (link bandwidth, GPU init, per-kernel cost fits) and save it
-    to ~/.mxframe/calibration.json.  Quick mode takes < 30 s.  See `mxframe.calibration`.
+    to ~/.mxframe/calibration.json.  Quick mode takes < 30 s.  See `omxcore.calibration`.
 
-    Imported lazily so `import mxframe` stays fast.
+    Imported lazily so `import omxcore` stays fast.
     """
     from .calibration import calibrate as _calibrate
     return _calibrate(full, **kwargs)

@@ -4,10 +4,10 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-from mxframe import custom_ops
-from mxframe import pipeline_kernels as pk
-from mxframe.lazy_expr import col, lit, when
-from mxframe.lazy_frame import LazyFrame, Scan
+from omxcore import custom_ops
+from omxcore import pipeline_kernels as pk
+from omxcore.lazy_expr import col, lit, when
+from omxcore.lazy_frame import LazyFrame, Scan
 
 
 def _gpu_ok():
@@ -127,7 +127,7 @@ def test_switch_off_env(spy, monkeypatch):
 # ── shapes the Router relies on ────────────────────────────────────────────
 
 def test_count_only_programs(spy):
-    from mxframe.pipeline_program import compile_pipeline, finalize
+    from omxcore.pipeline_program import compile_pipeline, finalize
     t = make_table(5000)
     for device in DEVICES:
         prog = compile_pipeline([col("x") > lit(50.0)], [col("n").count().alias("c")], t)
@@ -146,7 +146,7 @@ def test_count_only_programs(spy):
 def test_concurrent_callers_from_python_threads():
     """The Router calls the CPU kernel from several threads and the GPU kernel from another."""
     import threading
-    from mxframe.pipeline_program import compile_pipeline, merge_partials
+    from omxcore.pipeline_program import compile_pipeline, merge_partials
     t = make_table(400_000)
     aggs = [(col("x") * col("y")).sum().alias("s"), col("x").max().alias("hi"), col("n").count().alias("c")]
     prog = compile_pipeline([col("y") < lit(0.8)], aggs, t)

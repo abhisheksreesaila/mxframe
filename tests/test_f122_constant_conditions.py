@@ -185,7 +185,7 @@ def test_a_false_on_does_not_build_the_cross_product_of_big_inputs():
     import duckdb
     import numpy as np
     import pyarrow as pa
-    import mxframe as mx
+    import omxcore as mx
     n = 3000
     a = pa.table({"k": pa.array(np.arange(n)), "v": pa.array(np.arange(n))})
     b = pa.table({"k": pa.array(np.arange(n)), "w": pa.array(np.arange(n))})

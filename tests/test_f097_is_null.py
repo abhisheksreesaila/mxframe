@@ -16,13 +16,13 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-import mxframe as mx
-import mxframe.native_exec as nx
-from mxframe import LazyFrame, col
-from mxframe import gpu_stream
-from mxframe.io_parquet import resolve_plan
-from mxframe.lazy_frame import Scan
-from mxframe.custom_ops import CustomOpsCompiler
+import omxcore as mx
+import omxcore.native_exec as nx
+from omxcore import LazyFrame, col
+from omxcore import gpu_stream
+from omxcore.io_parquet import resolve_plan
+from omxcore.lazy_frame import Scan
+from omxcore.custom_ops import CustomOpsCompiler
 
 GPU = gpu_stream.cuda_available()
 DEVICES = ["cpu"] + (["gpu"] if GPU else [])
@@ -162,7 +162,7 @@ def test_list_and_struct_columns_are_not_pruned_by_leaf_counts(tmp_path, name):
 
 
 def test_filters_expression_maps_null_tests():
-    from mxframe.io_parquet import _filters_expression
+    from omxcore.io_parquet import _filters_expression
     e = _filters_expression([("v", "isnull", None), ("w", "notnull", None)])
     assert "is_null(v" in str(e) and "invert(is_null(w" in str(e)
 

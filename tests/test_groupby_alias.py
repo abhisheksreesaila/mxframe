@@ -5,8 +5,8 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-from mxframe import LazyFrame, col
-from mxframe.np_arrow import array as A
+from omxcore import LazyFrame, col
+from omxcore.np_arrow import array as A
 
 PATHS = {
     "default": {},
@@ -25,7 +25,7 @@ def path(request, monkeypatch):
 @pytest.fixture
 def served(monkeypatch):
     """Which engine path answered: "native", "fused", or neither (the kernel path)."""
-    import mxframe.custom_ops as co
+    import omxcore.custom_ops as co
     log = []
     real_native, real_fused = co._native_exec.try_execute, co.try_fused_aggregate
 
@@ -88,7 +88,7 @@ def test_each_path_serves_the_renamed_key(path, served, key, alias):
 
 def _gpu_ok():
     try:
-        import mxframe.custom_ops as co
+        import omxcore.custom_ops as co
         return co._max_accelerator() is not None
     except Exception:
         return False

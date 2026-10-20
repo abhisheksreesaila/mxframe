@@ -59,7 +59,7 @@ def test_a_library_loads_in_a_foreign_interpreter_from_an_installed_layout(tmp_p
     if system_python is None or not all((_env_lib() / n).exists() for n in RUNTIME):
         pytest.skip("needs /usr/bin/python3 and the Mojo runtime in this environment")
     site = tmp_path / "venv" / "lib" / "python3.12" / "site-packages"
-    kernels = site / "mxframe" / "kernels_aot"
+    kernels = site / "omxcore" / "kernels_aot"
     kernels.mkdir(parents=True)
     runtime_dir = tmp_path / "venv" / "lib" if layout == "venv" else site / "modular" / "lib"
     runtime_dir.mkdir(parents=True, exist_ok=True)
@@ -76,7 +76,7 @@ def test_the_same_copy_fails_without_the_runtime_so_the_check_means_something(tm
     system_python = shutil.which("python3", path="/usr/bin")
     if system_python is None:
         pytest.skip("needs /usr/bin/python3")
-    kernels = tmp_path / "venv" / "lib" / "python3.12" / "site-packages" / "mxframe" / "kernels_aot"
+    kernels = tmp_path / "venv" / "lib" / "python3.12" / "site-packages" / "omxcore" / "kernels_aot"
     kernels.mkdir(parents=True)
     shutil.copy(KERNELS / "libmxexec_cpu.so", kernels)
     code = f"import ctypes; ctypes.CDLL({str(kernels / 'libmxexec_cpu.so')!r})"
@@ -90,7 +90,7 @@ def test_a_checkout_prefers_its_own_pixi_env_over_a_runtime_planted_next_to_it(t
     system_python = shutil.which("python3", path="/usr/bin")
     if system_python is None or not all((_env_lib() / n).exists() for n in RUNTIME):
         pytest.skip("needs /usr/bin/python3 and the Mojo runtime in this environment")
-    repo = tmp_path / "mxframe"
+    repo = tmp_path / "omxcore"
     (repo / "kernels_aot").mkdir(parents=True)
     own = repo / ".pixi" / "envs" / "default" / "lib"
     planted = tmp_path / "modular" / "lib"

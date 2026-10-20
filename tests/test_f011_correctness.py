@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 import _f011_scenarios as sc
-from mxframe.aot_kernels import GPU_AOT_AVAILABLE
+from omxcore.aot_kernels import GPU_AOT_AVAILABLE
 
 SCRIPT = Path(__file__).with_name("_f011_scenarios.py")
 
@@ -57,7 +57,7 @@ def test_scenario(name, device):
 def test_take_rows_slices_string_columns_by_bytes(monkeypatch):
     import numpy as np
     import pyarrow as pa
-    from mxframe import np_arrow
+    from omxcore import np_arrow
     monkeypatch.setattr(np_arrow, "TAKE_CHUNK_BYTES", 400)
     monkeypatch.setattr(np_arrow, "TAKE_SLICE_MIN_ROWS", 10)
     t = pa.table({"s": pa.array([f"v{i}" * (1 + i % 5) for i in range(1000)]),
@@ -83,7 +83,7 @@ def test_take_rows_survives_more_than_2gib_of_long_strings():
     join at SF10 gathers 3 GB of o_comment; 3.2M rows of 703 bytes are 2.25 GB."""
     import numpy as np
     import pyarrow as pa
-    from mxframe import np_arrow
+    from omxcore import np_arrow
     n = 100_000
     t = pa.table({"s": pa.array(["x" * 700 + f"{i % 1000:03d}" for i in range(n)])})    # 70 MB
     idx = np.tile(np.arange(n, dtype=np.int64), 32)                                      # 3.2M rows, 2.25 GB

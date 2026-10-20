@@ -1222,7 +1222,7 @@ struct _Parser(Movable):
             if w == "INTERVAL" and (next_string or self.toks[min(self.pos + 1, len(self.toks) - 1)].kind == T_INT or next_paren):
                 return self.interval_expr()
             if (w == "TIMESTAMP" or w == "TIME") and next_string:
-                raise self.unsupported(t, "`" + w + "` literals", "MX frame has no timestamp kind")
+                raise self.unsupported(t, "`" + w + "` literals", "omxcore has no timestamp kind")
             if (w == "ARRAY" or w == "STRUCT" or w == "MAP" or w == "LIST") and next_paren:
                 raise self.unsupported(t, "`" + w + "` values", "")
             if w == "EXISTS" or (w == "NOT" and self.is_kw("EXISTS", 1)):
@@ -1316,7 +1316,7 @@ struct _Parser(Movable):
             var trimmed = String(unit[byte=0:cut])
             unit = trimmed^
         if unit != "DAY" and unit != "WEEK" and unit != "MONTH" and unit != "YEAR":
-            raise self.unsupported(t, "an interval in " + unit.lower() + "s", "MX frame has no timestamp kind: days, weeks, months and years only")
+            raise self.unsupported(t, "an interval in " + unit.lower() + "s", "omxcore has no timestamp kind: days, weeks, months and years only")
         return self.node(X_INTERVAL, unit, amount, -1, -1, t)
 
     def column_rest(mut self, first: Token) raises -> Int:

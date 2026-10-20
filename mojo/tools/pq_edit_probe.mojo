@@ -8,7 +8,7 @@
 # Usage: pq_edit_probe <path> <out path> <cache MiB> [permute] [allow]     (the file is the one pq_scan_probe reads)
 from std.sys import argv
 from std.time import perf_counter_ns
-from mxframe import Frame, Query, col, sum, count, scan_parquet, AUTO
+from omxcore import Frame, Query, col, sum, count, scan_parquet, AUTO
 
 
 def peak_kb() raises -> Int:

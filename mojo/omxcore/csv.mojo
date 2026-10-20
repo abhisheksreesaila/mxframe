@@ -1,4 +1,4 @@
-"""CSV and TSV reader (docs/mxframe-mojo-api.md section 2): a file in, a typed `Table` and an import report out.
+"""CSV and TSV reader (docs/omxcore-mojo-api.md section 2): a file in, a typed `Table` and an import report out.
 
     var r = read_csv("sales.csv", options=CsvOptions(infer_rows=100_000))
     r.table; r.rows; r.seconds
@@ -538,7 +538,7 @@ def first_invalid_utf8(p: BP, n: Int) -> Int:
 def _check_text_encoding(p: BP, n: Int, path: String) raises:
     """A CSV is read as UTF-8 and nothing else: a UTF-16 byte order mark or a byte that is not UTF-8 (Latin-1 `caf\\xe9`) raises, naming the byte and line."""
     if n >= 2 and ((p[0] == 0xFF and p[1] == 0xFE) or (p[0] == 0xFE and p[1] == 0xFF)):
-        raise Error("`" + path + "` is UTF-16 (it starts with a byte order mark), and MX frame reads UTF-8 only")
+        raise Error("`" + path + "` is UTF-16 (it starts with a byte order mark), and omxcore reads UTF-8 only")
     var bad = first_invalid_utf8(p, n)
     if bad >= 0:
         var line = 1

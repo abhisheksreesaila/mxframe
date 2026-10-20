@@ -4,10 +4,10 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-import mxframe.custom_ops as co
-from mxframe import LazyFrame, col, lit
-from mxframe.aot_kernels import AOT_AVAILABLE
-from mxframe.lazy_frame import Scan
+import omxcore.custom_ops as co
+from omxcore import LazyFrame, col, lit
+from omxcore.aot_kernels import AOT_AVAILABLE
+from omxcore.lazy_frame import Scan
 
 pytestmark = pytest.mark.skipif(not AOT_AVAILABLE, reason="libmxkernels_aot.so not built")
 

@@ -14,13 +14,13 @@ def blocked_import(name, *args, **kwargs):
 
 builtins.__import__ = blocked_import
 
-import mxframe
+import omxcore
 
-assert mxframe.col("x").op == "col"
-# Since F-019 MAX is imported lazily (mxframe/_max_lazy.py): the runtime exports load without
+assert omxcore.col("x").op == "col"
+# Since F-019 MAX is imported lazily (omxcore/_max_lazy.py): the runtime exports load without
 # it and only need MAX when a MAX graph is actually built.
 import sys
-mxframe.GraphCompiler
+omxcore.GraphCompiler
 assert not any(m == "max" or m.startswith("max.") for m in sys.modules), "MAX imported eagerly"
 
 print("OK base package import without optional MAX runtime")

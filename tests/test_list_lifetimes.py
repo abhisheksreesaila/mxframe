@@ -119,7 +119,7 @@ def test_the_check_lets_through(tmp_path, name):
 
 def test_deleting_the_keep_alive_in_the_top_k_is_caught(tmp_path):
     """The reviewer's mutation: rows.mojo without `_ = ranks^` (the indexed shape) and without `_ = ctl^`-style keep-alives."""
-    src = (ROOT / "mojo/mxframe/rows.mojo").read_text()
+    src = (ROOT / "mojo/omxcore/rows.mojo").read_text()
     assert "_ = ranks^" in src
     f = tmp_path / "rows_mut.mojo"
     f.write_text(src.replace("    _ = ranks^\n", ""))

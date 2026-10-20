@@ -8,10 +8,10 @@ import pytest
 
 duckdb = pytest.importorskip("duckdb")
 
-from mxframe import LazyFrame, col, lit
-from mxframe import join_engine
-from mxframe.custom_ops import CustomOpsCompiler
-from mxframe.lazy_frame import Join, Scan, Filter, Aggregate
+from omxcore import LazyFrame, col, lit
+from omxcore import join_engine
+from omxcore.custom_ops import CustomOpsCompiler
+from omxcore.lazy_frame import Join, Scan, Filter, Aggregate
 
 
 

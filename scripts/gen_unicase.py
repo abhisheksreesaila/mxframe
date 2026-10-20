@@ -1,4 +1,4 @@
-"""F-156: generates mojo/mxframe/unicase.mojo, the lower- and upper-case mappings of every Unicode code point below U+20000 exactly as DuckDB
+"""F-156: generates mojo/omxcore/unicase.mojo, the lower- and upper-case mappings of every Unicode code point below U+20000 exactly as DuckDB
 applies them (utf8proc's simple mappings: 'İ' lowers to 'i', 'ß' uppers to 'ẞ', 'ſ' to 'S', no multi-character results).
 
     pixi run python scripts/gen_unicase.py
@@ -11,7 +11,7 @@ from pathlib import Path
 
 import duckdb
 
-OUT = Path(__file__).resolve().parent.parent / "mojo" / "mxframe" / "unicase.mojo"
+OUT = Path(__file__).resolve().parent.parent / "mojo" / "omxcore" / "unicase.mojo"
 LIMIT = 0x20000
 
 

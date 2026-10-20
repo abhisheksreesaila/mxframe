@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from mxframe import pipeline_kernels as pk
+from omxcore import pipeline_kernels as pk
 
 HERE = Path(__file__).resolve().parent
 LONG = os.environ.get("MXFRAME_F107_STRESS") == "1"
@@ -24,11 +24,11 @@ import faulthandler, gc, sys, threading, time
 sys.path.insert(0, ".")
 import conftest  # noqa: F401
 import numpy as np, pyarrow as pa
-import mxframe as mx
-from mxframe import LazyFrame, col, lit, coproc_fused as cf, auto_mode as am
+import omxcore as mx
+from omxcore import LazyFrame, col, lit, coproc_fused as cf, auto_mode as am
 
 THREADS, ITERS, STALL = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
-from mxframe import calibration as cal
+from omxcore import calibration as cal
 cf.MIN_UPLOAD_BYTES = 1
 cf.IDLE_BEFORE_BACKGROUND_S = 0.0
 

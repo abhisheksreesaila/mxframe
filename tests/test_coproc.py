@@ -5,7 +5,7 @@ import time
 import numpy as np
 import pytest
 
-from mxframe.coproc import MorselQueue, Worker, run_router
+from omxcore.coproc import MorselQueue, Worker, run_router
 
 
 def _sum_worker(name, device, data, morsel_rows, delay_per_row=0.0, **kw):

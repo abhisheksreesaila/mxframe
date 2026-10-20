@@ -4,7 +4,7 @@ the result names them as DuckDB does (`v`, `v_1`). Expected answers come from Du
 import pyarrow.parquet as pq
 import pytest
 
-import mxframe as mx
+import omxcore as mx
 from test_sql_select_star_join import DEVICES, _check, _expect, _rows, _tables
 
 

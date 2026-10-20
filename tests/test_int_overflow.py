@@ -6,9 +6,9 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-import mxframe.native_exec as nx
-from mxframe import LazyFrame, col, lit
-from mxframe.np_arrow import array as A
+import omxcore.native_exec as nx
+from omxcore import LazyFrame, col, lit
+from omxcore.np_arrow import array as A
 
 BIG = 1 << 30
 
@@ -132,7 +132,7 @@ def test_normal_sized_integer_queries_do_no_checked_arithmetic_work(monkeypatch)
     """The native path answers them: no Arrow arithmetic, no exact-sum pass (no new data pass)."""
     if not nx.available():
         pytest.skip("libmxexec_cpu.so not built")
-    import mxframe.custom_ops as co
+    import omxcore.custom_ops as co
     calls = []
     monkeypatch.setenv("MXFRAME_NATIVE", "1")
     monkeypatch.setattr(co, "_checked_arith", lambda *a: calls.append("arith"))
@@ -144,7 +144,7 @@ def test_normal_sized_integer_queries_do_no_checked_arithmetic_work(monkeypatch)
 
 
 def test_the_gpu_session_does_not_wrap_either():
-    from mxframe import gpu_stream
+    from omxcore import gpu_stream
     if not gpu_stream.cuda_available():
         pytest.skip("no CUDA GPU")
     t = _t()

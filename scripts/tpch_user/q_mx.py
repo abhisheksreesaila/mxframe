@@ -1,4 +1,4 @@
-"""MXFrame implementations of the 22 queries, written the way a user of the public API would.
+"""omxcore implementations of the 22 queries, written the way a user of the public API would.
 
 Every table is a `mx.scan_parquet(path)` LazyFrame (column pruning and simple filter pushdown
 are the engine's job), every query is a chain of LazyFrame operations ending in `.compute(device=)`
@@ -10,22 +10,22 @@ What the public API cannot express is done with PyArrow / NumPy inside the timed
 declared per query in `spec.OUTSIDE_MX` (the report prints it, so nobody mistakes those queries for
 pure-mxframe ones).  The Parquet files store dates as int32 days since 1970-01-01, and
 `Expr.year()` assumes YYYYMMDD ints or date32, so `_year` derives the year with a sum of
-`when(date >= 1 January of year, 1, 0)` terms, which is plain mxframe.
+`when(date >= 1 January of year, 1, 0)` terms, which is plain omxcore.
 """
 from __future__ import annotations
 
 import pyarrow as pa
 
-import mxframe as mx
-from mxframe import LazyFrame, col, lit, when
+import omxcore as mx
+from omxcore import LazyFrame, col, lit, when
 
-from mxframe import np_arrow
+from omxcore import np_arrow
 
 from . import spec as S
 from .readers import table_path
 
 def _year(c: str, y0: int, y1: int):
-    """Year of an int32 days-since-epoch column, for years y0..y1 (mxframe expression)."""
+    """Year of an int32 days-since-epoch column, for years y0..y1 (omxcore expression)."""
     e = when(col(c) >= lit(S.days(y0 + 1, 1, 1)), lit(1), lit(0))
     for y in range(y0 + 2, y1 + 1):
         e = e + when(col(c) >= lit(S.days(y, 1, 1)), lit(1), lit(0))

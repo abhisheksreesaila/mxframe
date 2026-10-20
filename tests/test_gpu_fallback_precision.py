@@ -4,12 +4,12 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-import mxframe.custom_ops as co
-import mxframe.native_exec as nx
-from mxframe import LazyFrame, col, lit
-from mxframe.aot_kernels import AOT_AVAILABLE, GPU_AOT_AVAILABLE
-from mxframe.lazy_expr import when
-from mxframe.lazy_frame import Scan
+import omxcore.custom_ops as co
+import omxcore.native_exec as nx
+from omxcore import LazyFrame, col, lit
+from omxcore.aot_kernels import AOT_AVAILABLE, GPU_AOT_AVAILABLE
+from omxcore.lazy_expr import when
+from omxcore.lazy_frame import Scan
 
 pytestmark = pytest.mark.skipif(not (AOT_AVAILABLE and GPU_AOT_AVAILABLE),
                                 reason="needs the CPU and GPU AOT kernels")

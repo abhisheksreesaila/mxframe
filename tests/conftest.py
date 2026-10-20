@@ -1,4 +1,4 @@
-"""Shared pytest setup: make `import mxframe` resolve to this checkout (works in git worktrees)."""
+"""Shared pytest setup: make `import omxcore` resolve to this checkout (works in git worktrees)."""
 import hashlib
 import os
 import sys
@@ -6,11 +6,11 @@ import tempfile
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
-_shim = Path(tempfile.gettempdir()) / f"mxframe-shim-{hashlib.sha1(str(_ROOT).encode()).hexdigest()[:10]}"
+_shim = Path(tempfile.gettempdir()) / f"omxcore-shim-{hashlib.sha1(str(_ROOT).encode()).hexdigest()[:10]}"
 _shim.mkdir(exist_ok=True)
-_link = _shim / "mxframe"
-if not _link.exists():
-    _link.symlink_to(_ROOT)
+for _name, _target in (("omxcore", _ROOT), ("mxframe", _ROOT / "compat" / "mxframe")):   # mxframe: the forwarding module
+    if not (_shim / _name).exists():
+        (_shim / _name).symlink_to(_target)
 sys.path.insert(0, str(_shim))
 
 TPCH_DATA = Path(os.environ.get("MXFRAME_TPCH_DATA", "/home/abhisheksreesaila/Projects/mxframe/data"))

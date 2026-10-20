@@ -26,17 +26,17 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def _import_mxframe():
-    """`import mxframe` from THIS checkout (the repo root is the package; a worktree may have another name)."""
+    """`import omxcore` from THIS checkout (the repo root is the package; a worktree may have another name)."""
     import hashlib
     import tempfile
     shim = Path(tempfile.gettempdir()) / f"mxframe-shim-{hashlib.sha1(str(ROOT).encode()).hexdigest()[:10]}"
     shim.mkdir(exist_ok=True)
-    link = shim / "mxframe"
+    link = shim / "omxcore"
     if not link.exists():
         link.symlink_to(ROOT)
     sys.path.insert(0, str(shim))
-    import mxframe
-    return mxframe
+    import omxcore
+    return omxcore
 
 
 # ── the workloads: each returns None or raises AssertionError ───────────────
@@ -96,7 +96,7 @@ def w_fused_query(rng, np, mx, pa, **_):
     n = int(rng.integers(60_000, 1_500_000))
     t = pa.table({"g": pa.array(rng.integers(0, 200, n)), "a": pa.array(rng.random(n)),
                   "b": pa.array(rng.integers(0, 1000, n))})
-    from mxframe import col
+    from omxcore import col
     out = (mx.LazyFrame(t).filter(col("b") < 500).groupby("g")
            .agg((col("a") * 2).sum().alias("s"), col("b").count().alias("c")).compute(device="cpu"))
     m = np.asarray(t.column("b")) < 500
@@ -122,12 +122,12 @@ def child(args) -> int:
     mx = _import_mxframe()
     import numpy as np
     import pyarrow as pa
-    from mxframe import group_keys as gk
-    from mxframe.aot_kernels import AOTKernels
+    from omxcore import group_keys as gk
+    from omxcore.aot_kernels import AOTKernels
     aot = AOTKernels()
     if args.warm:                      # the background warm-up thread that device="auto" starts, racing the queries
         try:
-            from mxframe.custom_ops import _process_gpu_warmup
+            from omxcore.custom_ops import _process_gpu_warmup
             _process_gpu_warmup()
         except Exception:
             pass

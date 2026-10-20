@@ -1,7 +1,7 @@
 # F-151: tables as text. json_string and csv_quote always produce valid UTF-8 (a byte that is not UTF-8 becomes U+FFFD, a backstop:
 # the CSV and Parquet readers refuse such bytes), and a CSV cell for the empty string is two quotes (a NULL is an empty cell).
-from mxframe.output import json_string, csv_quote, decimal_text, civil_date
-from mxframe.csv import first_invalid_utf8, BP
+from omxcore.output import json_string, csv_quote, decimal_text, civil_date
+from omxcore.csv import first_invalid_utf8, BP
 
 
 def check_eq(got: String, want: String, what: String) raises:

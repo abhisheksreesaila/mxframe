@@ -1,4 +1,4 @@
-"""Run one mxframe TPC-H benchmark query in a fresh process and save the result.
+"""Run one omxcore TPC-H benchmark query in a fresh process and save the result.
 
     python _tpch_runner.py <data_dir> <query number> <device> <out.arrow>
 
@@ -10,7 +10,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-import conftest  # noqa: F401,E402  (makes `import mxframe` resolve to this checkout)
+import conftest  # noqa: F401,E402  (makes `import omxcore` resolve to this checkout)
 
 QUERIES = {
     1: ["lineitem"], 2: ["nation", "region", "part", "supplier", "partsupp"],
@@ -35,7 +35,7 @@ SCALAR_NAME = {6: "revenue", 17: "avg_yearly", 19: "revenue"}
 
 def run_query(data_dir, q, device):
     import pyarrow as pa
-    import mxframe as mx
+    import omxcore as mx
     sys.path.insert(0, str(HERE.parent / "scripts"))
     import benchmark_tpch as bm
     dictionary = False if device in ("pandas", "polars") else "auto"   # baselines get plain strings

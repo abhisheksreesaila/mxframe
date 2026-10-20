@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import List
 
 from .lazy_expr import Expr
-from mxframe.lazy_frame import (
+from omxcore.lazy_frame import (
     JOIN_TYPES,
     LogicalPlan,
     Scan,

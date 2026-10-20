@@ -5,9 +5,9 @@ Compares against Polars as external baseline.
 """
 import sys, time, numpy as np, pyarrow as pa
 
-from mxframe.custom_ops import CustomOpsCompiler, _MODEL_CACHE, _INPUT_PREP_CACHE, _GROUP_ENCODE_CACHE, _POST_OP_MODEL_CACHE
-from mxframe.lazy_expr import col, lit, when, Expr
-from mxframe.lazy_frame import LazyFrame, Scan, Filter, Aggregate
+from omxcore.custom_ops import CustomOpsCompiler, _MODEL_CACHE, _INPUT_PREP_CACHE, _GROUP_ENCODE_CACHE, _POST_OP_MODEL_CACHE
+from omxcore.lazy_expr import col, lit, when, Expr
+from omxcore.lazy_frame import LazyFrame, Scan, Filter, Aggregate
 
 # ── data generation ───────────────────────────────────────────────────────────
 N = 1_000_000

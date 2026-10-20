@@ -8,9 +8,9 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-import mxframe.native_exec as nx
-from mxframe import LazyFrame, col, lit
-from mxframe.np_arrow import array as A
+import omxcore.native_exec as nx
+from omxcore import LazyFrame, col, lit
+from omxcore.np_arrow import array as A
 
 pytestmark = pytest.mark.skipif(not nx.available(), reason="libmxexec_cpu.so not built")
 
@@ -117,8 +117,8 @@ def test_a_column_also_in_the_output_is_decoded(coded):
 
 
 def test_leaf_by_leaf_path_keeps_codes(coded, monkeypatch):
-    import mxframe.join_engine as je
-    import mxframe.arrow_dict as ad
+    import omxcore.join_engine as je
+    import omxcore.arrow_dict as ad
     monkeypatch.setattr(je, "_star_fact", lambda comp, fl: None)       # force the leaf-by-leaf join
     decoded = []
     real = ad.decode
@@ -142,7 +142,7 @@ def test_predicate_on_the_kept_column_above_the_join(coded):
 
 
 def test_a_column_in_an_expression_above_the_join_is_not_kept(coded):
-    from mxframe import when
+    from omxcore import when
     fact, dim = _tables()
     got = (LazyFrame(fact).join(LazyFrame(dim), left_on="k", right_on="dk")
            .groupby("w").agg(when(col("flag") == lit("A"), col("v"), lit(0.0)).sum().alias("s"))
@@ -156,7 +156,7 @@ def test_a_column_in_an_expression_above_the_join_is_not_kept(coded):
 @pytest.mark.parametrize("device", ["auto", "cpu"])
 def test_from_parquet_and_auto_device(coded, tmp_path, device):
     import pyarrow.parquet as pq
-    import mxframe as mx
+    import omxcore as mx
     fact, dim = _tables(chunks=1)
     pq.write_table(fact.cast(pa.schema([pa.field("k", pa.int64()), pa.field("flag", pa.string()),
                                         pa.field("v", pa.float64()), pa.field("d", pa.int32())])),
@@ -177,7 +177,7 @@ def test_from_parquet_and_auto_device(coded, tmp_path, device):
 
 def test_join_cache_keeps_coded_and_plain_results_apart(coded):
     # same tables and columns: one plan keeps flag coded (group key), the next needs it plain
-    from mxframe import when
+    from omxcore import when
     fact, dim = _tables()
     a = (LazyFrame(fact).join(LazyFrame(dim), left_on="k", right_on="dk")
          .groupby("flag").agg(col("w").sum().alias("s")).compute(device="cpu"))
@@ -194,7 +194,7 @@ def test_filtered_and_nested_partners_keep_their_string_group_key_as_codes(monke
     """F-033: a partner leaf with a filter (TPC-H Q5's `nation WHERE region = ..`) and a partner that is itself a
     star (orders -> customer -> nation) deliver the name as codes; the aggregate groups by them and no Arrow
     `dictionary_encode` runs over the partner's rows."""
-    from mxframe._lazy_pc import pc
+    from omxcore._lazy_pc import pc
     r = np.random.default_rng(4)
     n = 200_000
     facts = pa.table({"ok": A(r.integers(0, 20_000, n).astype(np.int64)), "v": A(r.random(n))})

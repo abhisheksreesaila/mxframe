@@ -13,9 +13,9 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-import mxframe.native_exec as nx
-from mxframe import LazyFrame, col, lit, when
-from mxframe.np_arrow import array as A
+import omxcore.native_exec as nx
+from omxcore import LazyFrame, col, lit, when
+from omxcore.np_arrow import array as A
 
 pytestmark = pytest.mark.skipif(not nx.available(), reason="libmxexec_cpu.so not built")
 
@@ -422,7 +422,7 @@ def test_global_aggregate_over_a_fact_filter_that_keeps_nothing(calls):
 
 def test_a_repeated_query_is_answered_from_the_join_cache(calls, monkeypatch):
     """The old path keeps a join's result for the next query; asking the fused call then would only add cost."""
-    import mxframe.custom_ops as co
+    import omxcore.custom_ops as co
     fact, dim1, dim2, _ = _tables()
     # tables holding exactly the columns the query reads (the cache is keyed by table identity, and column
     # pruning would make a new table per query)
@@ -444,7 +444,7 @@ def test_a_repeated_query_is_answered_from_the_join_cache(calls, monkeypatch):
 
 
 def test_a_declined_fused_call_does_not_build_the_partners_again(calls, monkeypatch):
-    import mxframe.join_engine as je
+    import omxcore.join_engine as je
     built = []
     real = je._star_setup
     monkeypatch.setattr(je, "_star_setup", lambda *a, **k: (built.append(1), real(*a, **k))[1])
@@ -459,7 +459,7 @@ def test_a_declined_fused_call_does_not_build_the_partners_again(calls, monkeypa
 
 
 def test_nothing_is_built_when_the_executor_cannot_run_the_aggregate(calls, monkeypatch):
-    import mxframe.join_engine as je
+    import omxcore.join_engine as je
     built = []
     real = je._star_setup
     monkeypatch.setattr(je, "_star_setup", lambda *a, **k: (built.append(1), real(*a, **k))[1])
@@ -656,8 +656,8 @@ def test_a_wrong_caller_range_declines_instead_of_indexing_past_the_groups(calls
 @pytest.mark.parametrize("gpu", ["unavailable", "cold"])
 def test_device_auto_fuses_when_it_decides_on_the_cpu(calls, monkeypatch, gpu):
     """The default device: a CPU decision (no GPU, or one not warm yet) runs as device='cpu', fused."""
-    import mxframe.auto_mode as am
-    import mxframe.calibration as cal
+    import omxcore.auto_mode as am
+    import omxcore.calibration as cal
 
     class Calib:
         def __init__(self, has_gpu):
@@ -698,7 +698,7 @@ def test_device_auto_fuses_when_it_decides_on_the_cpu(calls, monkeypatch, gpu):
 
 
 def test_a_memory_error_is_not_swallowed_in_a_strict_compute(monkeypatch):
-    import mxframe.gpu_budget as gb
+    import omxcore.gpu_budget as gb
     monkeypatch.setenv("MXFRAME_STRICT_NATIVE", "0")
     assert nx.swallowed(MemoryError("x"), "t") is None                  # not strict: a quiet decline
     monkeypatch.setattr(gb, "strict", lambda: True)                     # inside compute(strict=True)

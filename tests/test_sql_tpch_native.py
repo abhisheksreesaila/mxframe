@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-import mxframe.native_exec as nx
+import omxcore.native_exec as nx
 
 pytestmark = pytest.mark.skipif(not nx.available(), reason="libmxexec_cpu.so not built")
 

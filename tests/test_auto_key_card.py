@@ -7,7 +7,7 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-from mxframe import auto_mode as am
+from omxcore import auto_mode as am
 
 
 def _reference(col, rows):
@@ -44,7 +44,7 @@ def test_same_estimate_as_before(i):
 def test_numeric_estimate_imports_nothing_heavy():
     code = (
         "import sys, numpy as np, pyarrow as pa\n"
-        "from mxframe import auto_mode as am\n"
+        "from omxcore import auto_mode as am\n"
         "t = pa.table({'k': pa.array(np.arange(1_000_000) % 5000)})\n"
         "before = set(sys.modules)\n"
         "am._key_card('k', [t], 1_000_000)\n"
@@ -100,7 +100,7 @@ def test_string_estimate_does_not_import_arrow_compute():
     """F-058: a string group key imported pyarrow.compute (~25 ms) on auto's first query; device="cpu" never does."""
     code = (
         "import sys, numpy as np, pyarrow as pa\n"
-        "from mxframe import auto_mode as am\n"
+        "from omxcore import auto_mode as am\n"
         "n = 1_000_002\n"     # built from buffers: pa.array(list of str) imports pyarrow.compute itself
         "off = pa.py_buffer(np.arange(n + 1, dtype=np.int32).tobytes())\n"
         "data = pa.py_buffer((b'ANR' * (n // 3)))\n"

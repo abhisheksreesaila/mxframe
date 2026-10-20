@@ -9,8 +9,8 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-import mxframe as mx
-from mxframe import gpu_stream
+import omxcore as mx
+from omxcore import gpu_stream
 
 NAN, INF = float("nan"), float("inf")
 

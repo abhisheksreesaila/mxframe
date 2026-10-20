@@ -542,7 +542,7 @@ ERRORS = [
     ("SELECT sum(sum(x)) FROM t", "SQL error at line 1, column 12: aggregate functions cannot be nested"),
     ("SELECT count(*) FROM t WHERE sum(x) > 1", "SQL error at line 1, column 37: aggregate functions are not allowed in WHERE: filter the groups with HAVING"),
     ("SELECT sum(s) FROM t", "SQL error at line 1, column 12: sum() needs numbers, found TEXT"),
-    ("SELECT median(dt) FROM t", "SQL error at line 1, column 15: median() of a DATE is a TIMESTAMP in DuckDB (the middle of two dates can be half a day), which MX frame has no kind for yet (F-157): use quantile_disc(dt, 0.5)"),
+    ("SELECT median(dt) FROM t", "SQL error at line 1, column 15: median() of a DATE is a TIMESTAMP in DuckDB (the middle of two dates can be half a day), which omxcore has no kind for yet (F-157): use quantile_disc(dt, 0.5)"),
     ("SELECT count(*) FROM t WHERE dt = '1965-02-29'", "SQL error at line 1, column 33: cannot read '1965-02-29' as a DATE: the day 29 does not exist: February 1965 has 28 days"),
     ("SELECT count(*) FROM t WHERE dt = DATE '2020-04-31'", "SQL error at line 1, column 35: `2020-04-31` is not a date: the day 31 does not exist: April 2020 has 30 days"),
     ("SELECT count(*) FROM t WHERE x = 'a'", "SQL error at line 1, column 32: cannot compare INT with TEXT (`=`)"),

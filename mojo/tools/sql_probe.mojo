@@ -12,7 +12,7 @@
 # FLOAT the float64's bits as "0x....", NULL null. On a SQL error: {"error": "the message"} and exit status 1.
 from std.sys import argv
 from std.time import perf_counter_ns
-from mxframe import (Catalog, sql, PlannerOptions, GROUP_AUTO, GROUP_DENSE, GROUP_HASHED, Frame, Table, SharedTable, read_parquet,
+from omxcore import (Catalog, sql, PlannerOptions, GROUP_AUTO, GROUP_DENSE, GROUP_HASHED, Frame, Table, SharedTable, read_parquet,
                      scan_parquet, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT)
 
 

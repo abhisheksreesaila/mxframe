@@ -29,8 +29,8 @@ def _run(code, *args):
 PREAMBLE = """
 import sys
 sys.path.insert(0, ".")
-import conftest  # noqa: F401  (makes `import mxframe` resolve to this checkout)
-from mxframe import auto_mode
+import conftest  # noqa: F401  (makes `import omxcore` resolve to this checkout)
+from omxcore import auto_mode
 """
 
 
@@ -95,7 +95,7 @@ def test_a_resident_upload_stops_at_its_next_chunk_once_exiting(monkeypatch):
     import time
     sys.path.insert(0, str(HERE))
     import conftest  # noqa: F401
-    from mxframe import coproc_fused as cf
+    from omxcore import coproc_fused as cf
     monkeypatch.setattr(cf, "_closing", True)
     monkeypatch.setattr(cf, "_active", 1)          # a query is running: would wait YIELD_MAX_S
     t0 = time.monotonic()

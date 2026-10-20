@@ -3,9 +3,9 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-from mxframe import LazyFrame, col, lit
-from mxframe.lazy_frame import Filter, Join, Scan
-from mxframe.optimizer import optimize_plan
+from omxcore import LazyFrame, col, lit
+from omxcore.lazy_frame import Filter, Join, Scan
+from omxcore.optimizer import optimize_plan
 
 
 def tables(n=20_000, m=500, seed=0):
@@ -83,6 +83,6 @@ def test_pushdown_through_chained_joins():
 
 
 def test_window_and_aggregate_predicates_are_not_pushed():
-    from mxframe.optimizer import _expr_columns
+    from omxcore.optimizer import _expr_columns
     assert _expr_columns(col("v").sum().over("t") > lit(10)) is None
     assert _expr_columns(col("v") > col("v").mean()) is None

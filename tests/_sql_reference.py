@@ -11,9 +11,9 @@ import duckdb
 import pyarrow as pa
 import pytest
 
-import mxframe as mx
-import mxframe.native_exec as nx
-from mxframe import gpu_stream
+import omxcore as mx
+import omxcore.native_exec as nx
+from omxcore import gpu_stream
 
 GPU = gpu_stream.cuda_available()
 D0 = dt.date(2024, 1, 1)
@@ -79,7 +79,7 @@ def kind(t):
 
 
 def check(q, dev, types=True):
-    """Run ``q`` on DuckDB and on mxframe: the same names, rows (in order) and types. Returns DuckDB's table."""
+    """Run ``q`` on DuckDB and on omxcore: the same names, rows (in order) and types. Returns DuckDB's table."""
     want = CON.execute(q).to_arrow_table()
     got = mx.sql(q, t=T, u=U).compute(device=dev)
     assert got.column_names == want.column_names, q
@@ -93,7 +93,7 @@ def check(q, dev, types=True):
 
 
 def refused(q, dev, match=None):
-    """DuckDB raises on ``q`` and so does mxframe (a ValueError / NotImplementedError saying why)."""
+    """DuckDB raises on ``q`` and so does omxcore (a ValueError / NotImplementedError saying why)."""
     with pytest.raises(Exception):
         CON.execute(q)
     with pytest.raises((ValueError, NotImplementedError), match=match):

@@ -9,10 +9,10 @@
 from std.sys import argv, exit
 from std.time import perf_counter_ns
 from std.os.path import dirname, isdir
-from mxframe import (Catalog, PlannerOptions, GROUP_AUTO, GROUP_DENSE, GROUP_HASHED, BUILD_LEFT, BUILD_RIGHT, sql, SqlResult, Table, SharedTable, read_csv, CsvOptions,
+from omxcore import (Catalog, PlannerOptions, GROUP_AUTO, GROUP_DENSE, GROUP_HASHED, BUILD_LEFT, BUILD_RIGHT, sql, SqlResult, Table, SharedTable, read_csv, CsvOptions,
                      read_parquet, scan_parquet, write_parquet, ZSTD, parse_sql, TEXT, INT, DECIMAL, DATE, BOOL, FLOAT)
-from mxframe.output import (json_string, columns_json, rows_json, rows_json_one, row_jsonl, csv_header, csv_row, cell_json, kind_text)
-from mxframe.parquet import physical_memory
+from omxcore.output import (json_string, columns_json, rows_json, rows_json_one, row_jsonl, csv_header, csv_row, cell_json, kind_text)
+from omxcore.parquet import physical_memory
 
 comptime USAGE = ("usage: mx sql \"<SQL>\" [-t name=path ...] [-f query.sql] [--format json|jsonl|csv|parquet] [--out file] [--max-rows N] [--device cpu|gpu|auto]\n"
                   "       mx explain [--analyze] \"<SQL>\" [-t name=path ...] [--format text|json]\n"

@@ -1,9 +1,9 @@
 # F-137 (M6): the GPU path of Query. The oracle is the CPU path of the same query (itself checked against a plain
 # loop in test_query.mojo): every number, count and presence flag must be identical, not close. Skips cleanly when
 # there is no GPU. Allocations are modest: GPU 0 is shared with other processes.
-from mxframe import (Table, SharedTable, Frame, INT, DECIMAL, TEXT, Query, QueryResult, col, lit, least, greatest, sum,
+from omxcore import (Table, SharedTable, Frame, INT, DECIMAL, TEXT, Query, QueryResult, col, lit, least, greatest, sum,
                      count, mean, min_of, max_of, CPU, GPU, AUTO, DeviceTable, gpu_available)
-from mxframe.query import AUTO_GPU_MIN_ROWS
+from omxcore.query import AUTO_GPU_MIN_ROWS
 from max.gpu.host import DeviceContext, DeviceBuffer
 from std.os import getenv
 
@@ -337,7 +337,7 @@ def test_auto_picks_the_gpu_for_big_tables_only() raises:
 
 
 def test_the_apps_device_context_is_shared() raises:
-    """The app's context allocates its own buffer; MX frame's table and kernels run on the same context."""
+    """The app's context allocates its own buffer; omxcore's table and kernels run on the same context."""
     var ctx = DeviceContext()
     var mine = ctx.enqueue_create_buffer[DType.int64](1000)
     ctx.enqueue_memset(mine, 7)

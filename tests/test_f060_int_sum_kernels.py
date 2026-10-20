@@ -8,9 +8,9 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-import mxframe.native_exec as nx
-from mxframe import LazyFrame, col, gpu_stream, lit
-from mxframe.np_arrow import array as A
+import omxcore.native_exec as nx
+from omxcore import LazyFrame, col, gpu_stream, lit
+from omxcore.np_arrow import array as A
 
 HAS_GPU = gpu_stream.cuda_available()
 
@@ -70,8 +70,8 @@ GPU_MODES = {"global": (0, 0), "few": (3, 3), "thousands": (1, 4), "many": (2, -
 def _gpu_mode(t, groups, repro):
     """The mode (0 to 4, negative: declined) the kernel library picks for this query's program: the same function
     `mx_pipeline_gpu` calls."""
-    import mxframe.pipeline_kernels as pk
-    from mxframe.pipeline_program import compile_pipeline
+    import omxcore.pipeline_kernels as pk
+    from omxcore.pipeline_program import compile_pipeline
     prog = compile_pipeline([], [col("v").sum().alias("sv"), col("w").sum().alias("sw")], t)
     return pk._load_gpu().mx_pipeline_gpu_mode(groups, prog.n_slots, int(prog.code[1]), int(len(prog.code)), int(repro))
 
@@ -201,7 +201,7 @@ def test_order_by_and_having_on_sums_past_2_53_are_exact(monkeypatch, native):
 @pytest.mark.skipif(not HAS_GPU or not nx.available(), reason="needs a CUDA GPU and the native executor")
 @pytest.mark.parametrize("grouped", [True, False], ids=["grouped", "global"])
 def test_a_cpu_gpu_split_adds_int64_partials_exactly(monkeypatch, grouped):
-    from mxframe import coproc_fused as cf
+    from omxcore import coproc_fused as cf
     monkeypatch.setenv("MXFRAME_NATIVE", "1")
     rows, groups = 1_500_000, 7 if grouped else 1
     t = _table(rows, groups)

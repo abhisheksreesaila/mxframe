@@ -1,7 +1,7 @@
 # F-136 (M5): a session's edits, merges, formulas and sort; queries over a Frame include them. The main oracle: a
 # query over the frame equals the same query over `f.bake()` (the edits applied into a plain table), which runs
 # the kernel alone; undo returns to the shared results exactly.
-from mxframe import (Table, SharedTable, Frame, INT, DECIMAL, TEXT, DATE, BOOL, Query, QueryResult, Expr, col, least,
+from omxcore import (Table, SharedTable, Frame, INT, DECIMAL, TEXT, DATE, BOOL, Query, QueryResult, Expr, col, least,
                      greatest, sum, count, mean, min_of, max_of)
 
 

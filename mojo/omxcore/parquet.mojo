@@ -1,8 +1,8 @@
-"""Parquet files with no Python (docs/mxframe-mojo-api.md section 2): `write_parquet` and `read_parquet`.
+"""Parquet files with no Python (docs/omxcore-mojo-api.md section 2): `write_parquet` and `read_parquet`.
 
 The `.omx` document is one Parquet file whose key-value metadata holds one JSON string under the key "omx".
 
-How MX frame's kinds are stored (any Parquet reader understands them):
+How omxcore's kinds are stored (any Parquet reader understands them):
   INT      INT64
   DECIMAL  INT64 with the DECIMAL(18, scale) logical type (the stored value is the scaled integer, as in memory)
   DATE     INT32 with the DATE logical type (days since 1970)
@@ -550,7 +550,7 @@ def _footer(t: Table, optional: List[Bool], n: Int, groups: List[List[_Chunk]], 
             w.binary(1, extra[2 * i])
             w.binary(2, extra[2 * i + 1])
             w.end_struct()
-    w.binary(6, "MX frame version 0.6.0")
+    w.binary(6, "omxcore version 0.6.0")
     w.end()
     return w^.take()
 
@@ -780,11 +780,11 @@ def _is_timestamp(leaf: _Leaf) -> Bool:
 
 
 def _kind_of(leaf: _Leaf) raises -> Tuple[ColumnKind, Int]:
-    """The MX frame kind (and scale) a Parquet leaf column becomes."""
+    """The omxcore kind (and scale) a Parquet leaf column becomes."""
     if leaf.ptype < 0 or leaf.ptype > PT_FIXED:
         raise Error("column `" + leaf.name + "` has an unknown physical type (" + String(leaf.ptype) + ", corrupt file)")
     if leaf.logical == 7 or leaf.converted == CT_TIME_MILLIS or leaf.converted == CT_TIME_MICROS:
-        raise Error("column `" + leaf.name + "` is a TIME: MX frame has no kind for it yet")
+        raise Error("column `" + leaf.name + "` is a TIME: omxcore has no kind for it yet")
     var decimal = leaf.converted == CT_DECIMAL or leaf.logical == 5
     if decimal:
         if leaf.precision > 18:
@@ -793,14 +793,14 @@ def _kind_of(leaf: _Leaf) raises -> Tuple[ColumnKind, Int]:
         if leaf.ptype == PT_INT32 or leaf.ptype == PT_INT64 or leaf.ptype == PT_FIXED:
             return (DECIMAL, leaf.scale)
         if leaf.ptype == PT_BYTE_ARRAY:
-            raise Error("column `" + leaf.name + "` is a DECIMAL stored as BYTE_ARRAY: MX frame reads DECIMAL on INT32, INT64 and FIXED_LEN_BYTE_ARRAY only")
+            raise Error("column `" + leaf.name + "` is a DECIMAL stored as BYTE_ARRAY: omxcore reads DECIMAL on INT32, INT64 and FIXED_LEN_BYTE_ARRAY only")
     if leaf.ptype == PT_BOOLEAN:
         return (BOOL, 0)
     if leaf.ptype == PT_BYTE_ARRAY:
         if leaf.logical == 1 or leaf.logical == 4 or leaf.logical == 12 or leaf.converted == CT_UTF8 or \
            leaf.converted == CT_ENUM or leaf.converted == CT_JSON:
             return (TEXT, 0)
-        raise Error("column `" + leaf.name + "` is BINARY (BYTE_ARRAY without a string type): MX frame has no kind for it yet")
+        raise Error("column `" + leaf.name + "` is BINARY (BYTE_ARRAY without a string type): omxcore has no kind for it yet")
     if leaf.converted == CT_DATE or leaf.logical == 6:
         return (DATE, 0)
     if _is_timestamp(leaf):
@@ -811,11 +811,11 @@ def _kind_of(leaf: _Leaf) raises -> Tuple[ColumnKind, Int]:
         return (FLOAT, F32_COLUMN)                      # widened to float64 (exact); the scale remembers the 32 bits; saved as DOUBLE
     if leaf.ptype == PT_DOUBLE:
         return (FLOAT, 0)
-    raise Error("column `" + leaf.name + "` is " + _ptype_name(leaf.ptype) + ": MX frame has no kind for it yet")
+    raise Error("column `" + leaf.name + "` is " + _ptype_name(leaf.ptype) + ": omxcore has no kind for it yet")
 
 
 def _to_stored(leaf: _Leaf, raw: Int64) raises -> Int64:
-    """A plain value of the leaf's physical type as MX frame stores it (timestamps become days, floored; unsigned
+    """A plain value of the leaf's physical type as omxcore stores it (timestamps become days, floored; unsigned
     integers keep their value: UINT_32 is zero-extended, UINT_64 past the int64 range is refused)."""
     if _is_timestamp(leaf):
         var per_day = Int64(86_400_000) if (leaf.ts_unit == 1 or leaf.converted == CT_TIMESTAMP_MILLIS) else \
@@ -826,12 +826,12 @@ def _to_stored(leaf: _Leaf, raw: Int64) raises -> Int64:
             return raw & 0xFFFFFFFF
         if raw < 0:
             raise Error("column `" + leaf.name + "` is UINT_64 and holds " + String(UInt64(raw)) +
-                        ", past the int64 range MX frame stores")
+                        ", past the int64 range omxcore stores")
     return raw
 
 
 def read_parquet(path: String, job: JobCtl = JobCtl()) raises -> ParquetResult:
-    """Reads a Parquet file (written by MX frame, pyarrow, DuckDB, ...) into a Table, plus its "omx" metadata. `job` (F-175): the
+    """Reads a Parquet file (written by omxcore, pyarrow, DuckDB, ...) into a Table, plus its "omx" metadata. `job` (F-175): the
     background job it runs for; a cancel is seen between row groups."""
     var file = _open_file(path)
     var n = _file_size(file, path)

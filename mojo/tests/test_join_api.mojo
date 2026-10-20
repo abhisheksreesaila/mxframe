@@ -1,7 +1,7 @@
 # F-153: `Query.join` (the builder's inner equi-join) against a plain double loop over the same tables, on the key rules the engine promises:
 # NULL keys never match, TEXT keys match by bytes across dictionaries, DECIMAL scales are aligned, INT is scale 0, a repeated key multiplies rows,
 # the join comes first.
-from mxframe import Table, SharedTable, INT, DECIMAL, TEXT, Query, col, sum, count
+from omxcore import Table, SharedTable, INT, DECIMAL, TEXT, Query, col, sum, count
 
 
 def expect(cond: Bool, what: String) raises:

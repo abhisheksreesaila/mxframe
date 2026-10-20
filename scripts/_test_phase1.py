@@ -1,9 +1,9 @@
 """Phase 1 verification: all grouped aggregations."""
 import pyarrow as pa
 from pathlib import Path
-from mxframe.lazy_expr import col, lit
-from mxframe.lazy_frame import LazyFrame, Scan
-from mxframe.custom_ops import CustomOpsCompiler
+from omxcore.lazy_expr import col, lit
+from omxcore.lazy_frame import LazyFrame, Scan
+from omxcore.custom_ops import CustomOpsCompiler
 
 compiler = CustomOpsCompiler()
 
@@ -104,8 +104,8 @@ print("✅ filter + grouped min/max/mean/count — all correct")
 
 # ── Test 8: unknown grouped op raises NotImplementedError ──
 # Build a fake Expr with an unsupported op and verify the guard fires.
-from mxframe.lazy_expr import Expr
-from mxframe.lazy_frame import Aggregate
+from omxcore.lazy_expr import Expr
+from omxcore.lazy_frame import Aggregate
 bad_expr = Expr("stddev", col("v"))
 bad_plan = LazyFrame(Scan(table)).groupby("g").agg(bad_expr).plan
 try:

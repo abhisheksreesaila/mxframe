@@ -1,6 +1,6 @@
-"""MX frame: a Mojo dataframe engine, usable with no Python (docs/mxframe-mojo-api.md, docs/briefs/mojo-api.md).
+"""omxcore: a Mojo dataframe engine, usable with no Python (docs/omxcore-mojo-api.md, docs/briefs/mojo-api.md).
 
-Build: `bash scripts/build_mojo_pkg.sh` -> build/mxframe.mojoc. Tests: `pixi run mojo-test`.
+Build: `bash scripts/build_mojo_pkg.sh` -> build/omxcore.mojoc. Tests: `pixi run mojo-test`.
 """
 from .table import Table, SharedTable, Column, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT, F32_COLUMN
 from .expr import Expr, col, lit, lit_float, lit_f32, least, greatest

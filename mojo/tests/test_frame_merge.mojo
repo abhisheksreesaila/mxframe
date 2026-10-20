@@ -1,6 +1,6 @@
 # F-153: a query over edited Frames (edits on both sides: session words, NULL keys, appends, removes, and a merge of TEXT values on each side)
 # must equal the same query over their baked tables: row queries, aggregates and joins, fused and materialized.
-from mxframe import Table, SharedTable, Frame, Catalog, PlannerOptions, sql, sql_with, INT, DECIMAL, TEXT
+from omxcore import Table, SharedTable, Frame, Catalog, PlannerOptions, sql, sql_with, INT, DECIMAL, TEXT
 
 def cell(t: Table, c: Int, r: Int) raises -> String:
     if t.is_null(c, r):

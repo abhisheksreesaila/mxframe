@@ -9,9 +9,9 @@ import pyarrow.parquet as pq
 import pytest
 
 from conftest import TPCH_DATA
-from mxframe import LazyFrame, col, lit
-from mxframe.aot_kernels import AOT_AVAILABLE, set_cpu_threads, get_cpu_threads
-from mxframe.lazy_frame import Scan
+from omxcore import LazyFrame, col, lit
+from omxcore.aot_kernels import AOT_AVAILABLE, set_cpu_threads, get_cpu_threads
+from omxcore.lazy_frame import Scan
 
 pytestmark = pytest.mark.skipif(not AOT_AVAILABLE, reason="libmxkernels_aot.so not built")
 

@@ -20,7 +20,7 @@ QUERIES = sorted(spec.OUTPUT)
 
 _RUN = """
 import json, sys
-import mxframe, pyarrow.parquet, pyarrow.compute       # what the benchmark worker imports first
+import omxcore, pyarrow.parquet, pyarrow.compute       # what the benchmark worker imports first
 from tpch_user import q_mx
 q, d, mode = int(sys.argv[1]), sys.argv[2], sys.argv[3]
 out = {"before": "pandas" in sys.modules}
@@ -72,9 +72,9 @@ def test_no_query_imports_pandas(data_dir, mode):
 
 _PATHS = """
 import sys, numpy as np, pyarrow as pa
-import mxframe
-from mxframe import LazyFrame, col, lit
-from mxframe.np_arrow import array as A
+import omxcore
+from omxcore import LazyFrame, col, lit
+from omxcore.np_arrow import array as A
 r = np.random.default_rng(0)
 n = 2000
 m = np.ma.array(r.random(n), mask=r.random(n) < 0.1)

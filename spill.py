@@ -193,7 +193,7 @@ class SpillDir:
                                  f"({e}); set MXFRAME_SPILL_DIR to a writable directory on disk") from e
             kind = ram_backed(self.path)
             if kind:
-                warnings.warn(f"mxframe: the spill directory {base} is on {kind} (RAM), so spilling uses the memory it "
+                warnings.warn(f"omxcore: the spill directory {base} is on {kind} (RAM), so spilling uses the memory it "
                               f"is meant to save; set MXFRAME_SPILL_DIR to a directory on disk",
                               RuntimeWarning, stacklevel=2)
         self._n += 1

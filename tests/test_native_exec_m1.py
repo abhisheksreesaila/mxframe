@@ -13,10 +13,10 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-import mxframe.native_exec as nx
-from mxframe import LazyFrame, col, lit
-from mxframe.lazy_expr import when
-from mxframe.np_arrow import array as A
+import omxcore.native_exec as nx
+from omxcore import LazyFrame, col, lit
+from omxcore.lazy_expr import when
+from omxcore.np_arrow import array as A
 
 SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
 sys.path.insert(0, str(SCRIPTS))

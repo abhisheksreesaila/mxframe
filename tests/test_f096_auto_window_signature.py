@@ -6,9 +6,9 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-import mxframe as mx
-from mxframe import auto_mode
-from mxframe.lazy_expr import col, row_number
+import omxcore as mx
+from omxcore import auto_mode
+from omxcore.lazy_expr import col, row_number
 
 
 def test_window_signature_is_hashable():

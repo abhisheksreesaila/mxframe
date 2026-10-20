@@ -2,8 +2,8 @@
 import numpy as np
 import pytest
 
-from mxframe import join_engine as je
-from mxframe.custom_ops import CustomOpsCompiler
+from omxcore import join_engine as je
+from omxcore.custom_ops import CustomOpsCompiler
 
 pytestmark = pytest.mark.skipif(je._semi_lib() is None, reason="libmxjoin_cpu.so not built")
 

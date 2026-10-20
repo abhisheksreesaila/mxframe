@@ -10,7 +10,7 @@ those natively as group keys and in string filters; in every other position they
 are decoded back to plain values before execution, so results match the
 ``pq.read_table`` path exactly.
 
-``pyarrow.parquet`` is imported lazily to keep ``import mxframe`` fast.
+``pyarrow.parquet`` is imported lazily to keep ``import omxcore`` fast.
 """
 from __future__ import annotations
 

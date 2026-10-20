@@ -1,8 +1,8 @@
 """Phase 4 integration tests: Sort, Limit, Distinct via Mojo kernels."""
 import pyarrow as pa
-from mxframe.lazy_expr import col, lit
-from mxframe.lazy_frame import LazyFrame, Scan, Sort, Limit, Distinct
-from mxframe.custom_ops import CustomOpsCompiler, clear_cache
+from omxcore.lazy_expr import col, lit
+from omxcore.lazy_frame import LazyFrame, Scan, Sort, Limit, Distinct
+from omxcore.custom_ops import CustomOpsCompiler, clear_cache
 
 clear_cache()
 

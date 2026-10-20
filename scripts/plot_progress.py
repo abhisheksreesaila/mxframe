@@ -4,7 +4,7 @@ engine-only benchmark CSVs in docs/bench/.
     pixi run python scripts/plot_progress.py docs/bench/m2s-engine.csv F-046
 
 1. docs/img/progress.svg: the 22-query total per milestone, SF10 and SF1 side by side (two panels,
-   one axis each), MXFrame as a line, Polars and DuckDB (from the final run) as reference lines.
+   one axis each), omxcore as a line, Polars and DuckDB (from the final run) as reference lines.
 2. docs/img/per-query-sf10.svg / per-query-sf1.svg: how much faster or slower than Polars each
    query is (diverging bars on a log scale centred at 1x).
 
@@ -83,9 +83,9 @@ def progress_svg(final_rows, final_label):
     W, H = 1000, 360
     pw, ph, top, left_pad = 360, 230, 80, 56
     out = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}" '
-           f'role="img" aria-label="MXFrame engine-only TPC-H total per milestone, against Polars and DuckDB">',
+           f'role="img" aria-label="omxcore engine-only TPC-H total per milestone, against Polars and DuckDB">',
            f"<style>{STYLE}</style>", f'<rect class="bg" width="{W}" height="{H}" rx="8"/>',
-           '<text class="t1 title" x="24" y="32">MXFrame CPU engine: total of the 22 TPC-H queries, seconds (lower is faster)</text>',
+           '<text class="t1 title" x="24" y="32">omxcore CPU engine: total of the 22 TPC-H queries, seconds (lower is faster)</text>',
            '<text class="t2" x="24" y="52">engine-only first runs: data in memory, fresh process, every result checked against DuckDB</text>']
     for k, sf in enumerate(("10", "1")):
         pts, polars, duck = series[sf]
@@ -113,7 +113,7 @@ def progress_svg(final_rows, final_label):
                        f'style="stroke: var(--bg, transparent)"><title>{esc(label)}: {val:.2f} s</title></circle>')
             out.append(f'<text class="t2" x="{x(i):.1f}" y="{top + ph + 18}" text-anchor="middle">{esc(label)}</text>')
         first, last = pts[0][1], pts[-1][1]
-        out.append(f'<text class="t1" x="{x(0) + 8:.1f}" y="{y(first) + 18:.1f}">MXFrame {first:.2f}</text>')
+        out.append(f'<text class="t1" x="{x(0) + 8:.1f}" y="{y(first) + 18:.1f}">omxcore {first:.2f}</text>')
         out.append(f'<text class="t1" x="{x(len(pts) - 1):.1f}" y="{y(last) - 10:.1f}" text-anchor="end">{last:.2f}</text>')
     out.append("</svg>")
     return "\n".join(out)
@@ -131,7 +131,7 @@ def _nice_step(ymax):
 def per_query_svg(final_rows, sf, titles):
     mx, pl = per_query(final_rows, "mx-cpu", sf), per_query(final_rows, "polars", sf)
     qs = sorted(q for q in mx if q in pl)
-    ratio = {q: pl[q] / mx[q] for q in qs}             # >1: MXFrame faster
+    ratio = {q: pl[q] / mx[q] for q in qs}             # >1: omxcore faster
     bad = {(r["engine"], int(r["query"])) for r in final_rows if r["sf"] == sf
            and r["engine"] in ("mx-cpu", "polars") and r.get("verdict") not in ("ok", "drift")}
     wrong = {q for _, q in bad}
@@ -147,7 +147,7 @@ def per_query_svg(final_rows, sf, titles):
     out = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}" role="img" '
            f'aria-label="Per-query speed against Polars at SF{sf}">', f"<style>{STYLE}</style>",
            f'<rect class="bg" width="{W}" height="{H}" rx="8"/>',
-           f'<text class="t1 title" x="24" y="32">SF{sf}: MXFrame against Polars, per TPC-H query ({wins} of {len(verified)} verified faster)</text>',
+           f'<text class="t1 title" x="24" y="32">SF{sf}: omxcore against Polars, per TPC-H query ({wins} of {len(verified)} verified faster)</text>',
            '<text class="t2" x="24" y="52">times faster (right) or slower (left) than Polars, log scale; engine-only first runs</text>',
            f'<text class="t2" x="{mid + 8:.1f}" y="{top - 14}">faster \u2192</text>',
            f'<text class="t2" x="{mid - 8:.1f}" y="{top - 14}" text-anchor="end">\u2190 slower</text>']
@@ -161,11 +161,11 @@ def per_query_svg(final_rows, sf, titles):
         w = max(-left, min(right, math.log2(r))) * scale
         x1, ww = (mid, w) if w >= 0 else (mid + w, -w)
         cls = "fast" if r >= 1 else "slow"
-        who = [n for e, n in (("mx-cpu", "MXFrame"), ("polars", "Polars")) if (e, q) in bad]
+        who = [n for e, n in (("mx-cpu", "omxcore"), ("polars", "Polars")) if (e, q) in bad]
         note = f" ({' and '.join(who)} result wrong)" if who else ""
         out.append(f'<text class="t2" x="{24}" y="{yy + 14}">Q{q} {esc(titles.get(q, ""))}{note}</text>')
         out.append(f'<rect class="{cls}" x="{x1:.1f}" y="{yy + 3}" width="{max(ww, 2):.1f}" height="{row - 6}" rx="3">'
-                   f'<title>Q{q}: MXFrame {mx[q]:.0f} ms, Polars {pl[q]:.0f} ms</title></rect>')
+                   f'<title>Q{q}: omxcore {mx[q]:.0f} ms, Polars {pl[q]:.0f} ms</title></rect>')
         label = (f"{r:.1f}x" + (" \u2192" if r > CAP else "")) if r >= 1 else f"{1 / r:.1f}x slower"
         lx = (x1 + ww + 6) if w >= 0 else (x1 - 6)
         out.append(f'<text class="t1" x="{lx:.1f}" y="{yy + 14}" text-anchor="{"start" if w >= 0 else "end"}">'

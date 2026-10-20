@@ -5,9 +5,9 @@
 # One output line per word: the status and value for INTEGER, BIGINT, TINYINT, DECIMAL(12,3), DECIMAL(18,0), DECIMAL(5,2), DOUBLE, REAL, DATE, BOOLEAN, separated
 # by `|`: `ok:<value>`, `bad` (the word is not one) or `unsure` (DuckDB's quirk that the engine does not read). tests/test_mojo_cast_fuzz.py compares it with DuckDB.
 from std.sys import argv
-from mxframe.sqlfn import parse_text
-from mxframe import INT, DECIMAL, DATE, BOOL, FLOAT
-from mxframe.table import F32_COLUMN
+from omxcore.sqlfn import parse_text
+from omxcore import INT, DECIMAL, DATE, BOOL, FLOAT
+from omxcore.table import F32_COLUMN
 
 
 def hex_value(c: UInt8) -> Int:

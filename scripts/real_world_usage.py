@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-MXFrame — Real-World Usage Examples
+omxcore — Real-World Usage Examples
 ====================================
-This script shows how a regular developer would use MXFrame for typical
+This script shows how a regular developer would use omxcore for typical
 data analysis tasks: NOT a benchmark — just clean, readable API usage.
 
 Run with:
@@ -25,9 +25,9 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from mxframe import LazyFrame, col, lit, when
-from mxframe.lazy_frame import Scan
-from mxframe.custom_ops import clear_cache
+from omxcore import LazyFrame, col, lit, when
+from omxcore.lazy_frame import Scan
+from omxcore.custom_ops import clear_cache
 
 # Clear any stale GPU/model caches at startup
 clear_cache()
@@ -81,7 +81,7 @@ customers = pa.table({
 })
 
 print("=" * 60)
-print("  MXFrame — Real-World Usage Demo")
+print("  omxcore — Real-World Usage Demo")
 print("=" * 60)
 print(f"  Orders:    {orders.num_rows:,} rows")
 print(f"  Customers: {customers.num_rows:,} rows")

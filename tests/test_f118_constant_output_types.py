@@ -11,7 +11,7 @@ types compared (INTEGER is not BIGINT).
 import pyarrow as pa
 import pytest
 
-import mxframe as mx
+import omxcore as mx
 from _sql_reference import T, check, cfg  # noqa: F401  (cfg is the fixture)
 
 CONSTANTS = {

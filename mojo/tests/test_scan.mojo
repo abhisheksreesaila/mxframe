@@ -2,7 +2,7 @@
 # `read_parquet(path)` + the same query: every slot, count, sum, min / max, mean and `present`, TEXT keys and filters
 # through the file-wide dictionary, nulls, a row group where a column is all null, overflow.
 from std.ffi import external_call
-from mxframe import (Table, SharedTable, Query, QueryResult, col, lit, least, sum, count, mean, min_of, max_of,
+from omxcore import (Table, SharedTable, Query, QueryResult, col, lit, least, sum, count, mean, min_of, max_of,
                      INT, DECIMAL, TEXT, write_parquet, read_parquet, scan_parquet, ParquetScan, ZSTD, SNAPPY,
                      UNCOMPRESSED, CPU, GPU, AUTO, MORSELS_ON, MORSELS_OFF, gpu_available)
 

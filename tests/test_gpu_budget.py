@@ -16,10 +16,10 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-from mxframe import LazyFrame, col, custom_ops, gpu_budget, gpu_stream
-from mxframe import auto_mode as am
-from mxframe.optimizer import optimize_plan
-from mxframe.aot_kernels import get_aot_gpu
+from omxcore import LazyFrame, col, custom_ops, gpu_budget, gpu_stream
+from omxcore import auto_mode as am
+from omxcore.optimizer import optimize_plan
+from omxcore.aot_kernels import get_aot_gpu
 
 from test_gpu_kernel_errors import HOG, _fail
 
@@ -102,7 +102,7 @@ def pieces(lf):
 
 def test_the_queries_run_on_the_gpu_when_they_fit(tables):
     """Control: with no budget set no piece leaves the GPU (so the tests below do exercise a GPU path)."""
-    from mxframe import aot_kernels
+    from omxcore import aot_kernels
     for name, q in QUERIES.items():
         lf, sql = q(*tables)
         aot_kernels.gpu_call_log = log = []
@@ -160,7 +160,7 @@ def test_the_budget_is_per_gpu_pool(monkeypatch):
 
 def limit_cuda_alloc(monkeypatch, biggest):
     """The fused pipeline's driver allocations fail above `biggest` bytes, like a GPU with that much left."""
-    from mxframe import pipeline_kernels as pk
+    from omxcore import pipeline_kernels as pk
     cu = pk._get_cuda()
     real = cu.malloc
 
@@ -331,7 +331,7 @@ def test_strict_raises_for_the_pieces_inside_error_swallowing_handlers(monkeypat
     t = pa.table({"d": rng.integers(0, 100, N).astype(np.int32), "f": rng.random(N, dtype=np.float32),
                   "u": (rng.random(N) * 50).astype(np.float32), "a": rng.random(N, dtype=np.float32),
                   "b": rng.random(N, dtype=np.float32)})
-    from mxframe.lazy_frame import Aggregate
+    from omxcore.lazy_frame import Aggregate
     pred = ((col("d") >= 10) & (col("d") < 60) & (col("f") >= 0.2) & (col("f") <= 0.7) & (col("u") < 24.0))
     lf = LazyFrame(Aggregate(LazyFrame(t).filter(pred).plan, [], [(col("a") * col("b")).sum().alias("r")]))
     with pytest.raises(MemoryError, match="range5 sum-product: needs about"):
@@ -374,8 +374,8 @@ REAL = pytest.mark.skipif(not os.environ.get("MXFRAME_TEST_GPU_BUDGET"),
 
 REAL_SCRIPT = r"""
 import warnings, numpy as np, pyarrow as pa, duckdb
-from mxframe import LazyFrame, col
-from mxframe import gpu_budget
+from omxcore import LazyFrame, col
+from omxcore import gpu_budget
 n = 30_000_000
 rng = np.random.default_rng(3)
 t = pa.table({"k": rng.integers(0, 100, n).astype(np.int32), "v": rng.integers(0, 50, n).astype(np.int32)})

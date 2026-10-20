@@ -2,7 +2,7 @@
 # Query, test_scan.mojo): every slot, count and presence flag identical, nulls, an all-null column in a row group, a
 # TEXT key, a frame's edits over the scan, a plan the GPU cannot take. Skips cleanly with no GPU; allocations are modest
 # (GPU 0 is shared): 8 row groups of 16,000 rows.
-from mxframe import (Table, SharedTable, Frame, Query, QueryResult, col, lit, sum, count, mean, min_of, max_of, count_distinct,
+from omxcore import (Table, SharedTable, Frame, Query, QueryResult, col, lit, sum, count, mean, min_of, max_of, count_distinct,
                      INT, DECIMAL, TEXT, write_parquet, scan_parquet, ZSTD, CPU, GPU, AUTO, MORSELS_OFF, gpu_available)
 
 

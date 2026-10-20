@@ -5,7 +5,7 @@
 # Usage: holistic_probe <path> <scan|read|frame> <all|global|filtered> <groups> [<baked path> <edit seed>]
 # (tests/test_mojo_holistic.py compares it with DuckDB.)
 from std.sys import argv
-from mxframe import (Query, QueryResult, Frame, Table, SharedTable, col, lit, sum, count, count_distinct, percentile,
+from omxcore import (Query, QueryResult, Frame, Table, SharedTable, col, lit, sum, count, count_distinct, percentile,
                      median, top_k, read_parquet, scan_parquet, write_parquet, ZSTD, AUTO)
 
 

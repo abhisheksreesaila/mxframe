@@ -2,7 +2,7 @@
 import numpy as np
 import pytest
 
-from mxframe.residency import ResidencyTracker
+from omxcore.residency import ResidencyTracker
 
 
 class FakeDevice:
@@ -110,7 +110,7 @@ def test_non_contiguous_input_rejected():
 
 
 def test_real_gpu_roundtrip():
-    from mxframe import gpu_stream
+    from omxcore import gpu_stream
     if not gpu_stream.cuda_available():
         pytest.skip("no CUDA GPU")
     rt = ResidencyTracker(1 << 26, gpu_stream.CudaDevice())

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MXFrame live demo — 5 TPC-H queries at 1M and 10M rows (CPU + GPU).
+omxcore live demo — 5 TPC-H queries at 1M and 10M rows (CPU + GPU).
 
 Run:
     pixi run python scripts/demo.py
@@ -23,10 +23,10 @@ import pyarrow as pa
 import pyarrow.compute as pc
 from max import driver as _driver
 
-# ── MXFrame public API ─────────────────────────────────────────────────────
-from mxframe import LazyFrame, col, lit, when
-from mxframe.lazy_frame import Scan
-from mxframe.custom_ops import clear_cache
+# ── omxcore public API ─────────────────────────────────────────────────────
+from omxcore import LazyFrame, col, lit, when
+from omxcore.lazy_frame import Scan
+from omxcore.custom_ops import clear_cache
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -165,7 +165,7 @@ def make_q9_tables(n: int, seed: int = 9):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Query definitions (MXFrame API)
+#  Query definitions (omxcore API)
 # ═══════════════════════════════════════════════════════════════════════════
 
 # Q1 — Filter + grouped 8-agg on flat table (pure Mojo group_sum/mean/count)
@@ -316,7 +316,7 @@ def _validate_scalar(name, mxf_val, pan_val, tol=0.01):
     else:
         mxf_val, pan_val = round(a, 4), round(b, 4)
     status = "✓" if ok else "✗ MISMATCH"
-    print(f"  Correctness: {status}  (MXFrame={mxf_val}  Pandas={pan_val})")
+    print(f"  Correctness: {status}  (omxcore={mxf_val}  Pandas={pan_val})")
 
 
 def _validate_rows(name, mxf_tbl, pan_df):
@@ -369,7 +369,7 @@ def demo_q1(lineitem, device):
     mxf_hot  = _hot_times(lambda: q1(lineitem, device))
     pan_hot2 = min(_hot_times(lambda: _pandas_q1(pdf)))
 
-    _row(f"MXFrame {device.upper()}", cold_ms, mxf_hot, pan_hot2)
+    _row(f"omxcore {device.upper()}", cold_ms, mxf_hot, pan_hot2)
     print(f"  Pandas        hot_min={_fmt(pan_hot2)}")
     return res
 
@@ -409,7 +409,7 @@ def demo_q6(lineitem, device):
     mxf_hot  = _hot_times(lambda: q6(lineitem, device))
     pan_hot  = min(_hot_times(lambda: _pandas_q6(pdf)))
 
-    _row(f"MXFrame {device.upper()}", cold_ms, mxf_hot, pan_hot)
+    _row(f"omxcore {device.upper()}", cold_ms, mxf_hot, pan_hot)
     print(f"  Pandas        hot_min={_fmt(pan_hot)}")
 
 
@@ -445,7 +445,7 @@ def demo_q12(orders, lineitem, device):
     mxf_hot = _hot_times(lambda: q12(orders, lineitem, device))
     pan_hot = min(_hot_times(lambda: _pandas_q12(orders, lineitem)))
 
-    _row(f"MXFrame {device.upper()}", cold_ms, mxf_hot, pan_hot)
+    _row(f"omxcore {device.upper()}", cold_ms, mxf_hot, pan_hot)
     print(f"  Pandas        hot_min={_fmt(pan_hot)}")
 
 
@@ -483,7 +483,7 @@ def demo_q14(part, lineitem, device):
     mxf_hot = _hot_times(lambda: q14(part, lineitem, device))
     pan_hot = min(_hot_times(lambda: _pandas_q14(part, lineitem)))
 
-    _row(f"MXFrame {device.upper()}", cold_ms, mxf_hot, pan_hot)
+    _row(f"omxcore {device.upper()}", cold_ms, mxf_hot, pan_hot)
     print(f"  Pandas        hot_min={_fmt(pan_hot)}")
 
 
@@ -518,7 +518,7 @@ def demo_q9(nation, supplier, partsupp, part, orders, lineitem, device):
     mxf_hot = _hot_times(lambda: q9(nation, supplier, partsupp, part, orders, lineitem, device))
     pan_hot = min(_hot_times(lambda: _pandas_q9(nation, supplier, partsupp, part, orders, lineitem)))
 
-    _row(f"MXFrame {device.upper()}", cold_ms, mxf_hot, pan_hot)
+    _row(f"omxcore {device.upper()}", cold_ms, mxf_hot, pan_hot)
     print(f"  Pandas        hot_min={_fmt(pan_hot)}")
 
 
@@ -542,7 +542,7 @@ def _pandas_q9(nation, supplier, partsupp, part, orders, lineitem):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def main():
-    ap = argparse.ArgumentParser(description="MXFrame demo — 5 TPC-H queries")
+    ap = argparse.ArgumentParser(description="omxcore demo — 5 TPC-H queries")
     ap.add_argument("--scale",  type=int,  default=1_000_000,
                     help="lineitem row count (default 1_000_000)")
     ap.add_argument("--device", default="cpu", choices=["cpu","gpu","both"],
@@ -569,7 +569,7 @@ def main():
 
     print()
     print("╔══════════════════════════════════════════════════════════╗")
-    print("║           MXFrame — TPC-H Query Demo                    ║")
+    print("║           omxcore — TPC-H Query Demo                    ║")
     print("╚══════════════════════════════════════════════════════════╝")
     print(f"  Scale   : {N:,} rows")
     print(f"  Device  : {device}  (GPU available: {has_gpu})")

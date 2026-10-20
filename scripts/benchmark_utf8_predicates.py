@@ -1,4 +1,4 @@
-"""Benchmark MXFrame AOT GPU UTF-8 predicates against Arrow and Polars."""
+"""Benchmark omxcore AOT GPU UTF-8 predicates against Arrow and Polars."""
 
 import argparse
 import statistics
@@ -9,7 +9,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import polars as pl
 
-from mxframe.aot_kernels import AOTKernelsGPU
+from omxcore.aot_kernels import AOTKernelsGPU
 
 
 def median_ms(fn, runs: int) -> float:

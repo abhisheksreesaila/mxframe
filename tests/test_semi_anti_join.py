@@ -9,10 +9,10 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-import mxframe as mx
-import mxframe.custom_ops as co
-from mxframe import LazyFrame, col, lit
-from mxframe.np_arrow import array as A
+import omxcore as mx
+import omxcore.custom_ops as co
+from omxcore import LazyFrame, col, lit
+from omxcore.np_arrow import array as A
 
 
 def _gpu_usable() -> bool:
@@ -217,8 +217,8 @@ def test_sql_join_types():
 
 def test_only_the_right_keys_are_read_from_parquet(tmp_path):
     import pyarrow.parquet as pq
-    from mxframe.io_parquet import resolve_plan
-    from mxframe.lazy_frame import ParquetScan
+    from omxcore.io_parquet import resolve_plan
+    from omxcore.lazy_frame import ParquetScan
     left, right = _tables(2000)
     pq.write_table(left, tmp_path / "l.parquet")
     pq.write_table(right, tmp_path / "r.parquet")
@@ -226,7 +226,7 @@ def test_only_the_right_keys_are_read_from_parquet(tmp_path):
         for top in (lambda q: q, lambda q: q.sort("k"), lambda q: q.select("s", "k")):
             q = top(mx.scan_parquet(str(tmp_path / "l.parquet")).join(
                 mx.scan_parquet(str(tmp_path / "r.parquet")), left_on="k", right_on="rk", how=how))
-            from mxframe.optimizer import optimize_plan
+            from omxcore.optimizer import optimize_plan
             plan = resolve_plan(optimize_plan(q.plan).plan, read=False)
             scans = []
 

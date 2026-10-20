@@ -15,9 +15,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-import mxframe
-from mxframe import aot_kernels
-from mxframe.aot_kernels import AOT_AVAILABLE, AOTKernels, get_cpu_threads, set_cpu_threads
+import omxcore
+from omxcore import aot_kernels
+from omxcore.aot_kernels import AOT_AVAILABLE, AOTKernels, get_cpu_threads, set_cpu_threads
 
 pytestmark = pytest.mark.skipif(not AOT_AVAILABLE, reason="libmxkernels_aot.so not built")
 
@@ -315,8 +315,8 @@ def test_join_negative_probe_keys_do_not_match(aot):
 def test_set_and_get_cpu_threads():
     assert set_cpu_threads(3) == 3
     assert get_cpu_threads() == 3
-    assert mxframe.get_cpu_threads() == 3
-    mxframe.set_cpu_threads(2)
+    assert omxcore.get_cpu_threads() == 3
+    omxcore.set_cpu_threads(2)
     assert get_cpu_threads() == 2
     with pytest.raises(ValueError):
         set_cpu_threads(0)
@@ -326,13 +326,13 @@ def test_set_and_get_cpu_threads():
 
 def _threads_in_fresh_process(env_value):
     # the shim dir (tests/conftest.py) is the parent of the un-resolved package path
-    shim = str(Path(os.path.abspath(mxframe.__file__)).parent.parent)
+    shim = str(Path(os.path.abspath(omxcore.__file__)).parent.parent)
     env = dict(os.environ, PYTHONPATH=shim)
     env.pop("MXFRAME_CPU_THREADS", None)
     if env_value is not None:
         env["MXFRAME_CPU_THREADS"] = env_value
     out = subprocess.run(
-        [sys.executable, "-c", "from mxframe.aot_kernels import get_cpu_threads; print(get_cpu_threads())"],
+        [sys.executable, "-c", "from omxcore.aot_kernels import get_cpu_threads; print(get_cpu_threads())"],
         env=env, capture_output=True, text=True, timeout=120, check=True)
     return int(out.stdout.strip().splitlines()[-1])
 

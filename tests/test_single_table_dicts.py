@@ -8,10 +8,10 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-import mxframe as mx
-import mxframe.native_exec as nx
-from mxframe import LazyFrame, col, lit
-from mxframe.np_arrow import array as A
+import omxcore as mx
+import omxcore.native_exec as nx
+from omxcore import LazyFrame, col, lit
+from omxcore.np_arrow import array as A
 
 pytestmark = pytest.mark.skipif(not nx.available(), reason="libmxexec_cpu.so not built")
 
@@ -32,7 +32,7 @@ def _table(n=400_000, seed=3, chunks=4):
 
 @pytest.fixture
 def decodes(monkeypatch):
-    import mxframe.arrow_dict as ad
+    import omxcore.arrow_dict as ad
     log = []
     real = ad.decode
     monkeypatch.setattr(ad, "decode", lambda arr: (log.append(len(arr)), real(arr))[1])
@@ -77,7 +77,7 @@ def test_distinct_order_is_first_appearance(decodes):
 
 def test_a_value_read_of_the_column_decodes_first():
     d, plain = _table()
-    from mxframe import when
+    from omxcore import when
     got = (LazyFrame(d).filter(when(col("st") == lit("F"), lit(1), lit(0)) == lit(1)).select("st", "k").distinct()
            .compute(device="cpu"))
     assert sorted(zip(*got.to_pydict().values())) == _duck("SELECT DISTINCT st, k FROM t WHERE st = 'F'", plain)

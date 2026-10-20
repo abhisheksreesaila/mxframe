@@ -16,7 +16,7 @@ from conftest import _shim
 
 SCRIPT = textwrap.dedent("""
     import numpy as np
-    from mxframe.aot_kernels import GPU_AOT_AVAILABLE, get_aot_gpu
+    from omxcore.aot_kernels import GPU_AOT_AVAILABLE, get_aot_gpu
     if not GPU_AOT_AVAILABLE:
         print("NO_GPU")
         raise SystemExit(0)

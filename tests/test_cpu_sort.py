@@ -8,7 +8,7 @@ import time
 import numpy as np
 import pytest
 
-from mxframe.aot_kernels import AOT_AVAILABLE, AOTKernels, get_cpu_threads, set_cpu_threads
+from omxcore.aot_kernels import AOT_AVAILABLE, AOTKernels, get_cpu_threads, set_cpu_threads
 
 pytestmark = pytest.mark.skipif(not AOT_AVAILABLE, reason="libmxkernels_aot.so not built")
 

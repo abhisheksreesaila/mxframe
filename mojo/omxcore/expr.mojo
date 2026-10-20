@@ -1,4 +1,4 @@
-"""Column expressions (docs/mxframe-mojo-api.md sections 4 and 5).
+"""Column expressions (docs/omxcore-mojo-api.md sections 4 and 5).
 
 An `Expr` is a tree kept flat in post-order (operands before their operator), the order a stack machine and the
 kernels' register programs both want. Values are exact Int64 (every column stores Int64, see table.mojo), except FLOAT (F-157): a FLOAT column or a float literal is a

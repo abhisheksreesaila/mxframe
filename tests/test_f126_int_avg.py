@@ -14,12 +14,12 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-import mxframe as mx
-import mxframe.native_exec as nx
-from mxframe import LazyFrame, col, gpu_stream
-from mxframe.custom_ops import CustomOpsCompiler
-from mxframe.io_parquet import scan_parquet
-from mxframe.np_arrow import array as A
+import omxcore as mx
+import omxcore.native_exec as nx
+from omxcore import LazyFrame, col, gpu_stream
+from omxcore.custom_ops import CustomOpsCompiler
+from omxcore.io_parquet import scan_parquet
+from omxcore.np_arrow import array as A
 
 HAS_GPU = gpu_stream.cuda_available()
 I64_MIN, I64_MAX = -(1 << 63), (1 << 63) - 1
@@ -245,7 +245,7 @@ def test_a_streamed_sum_of_the_same_column_still_raises(tmp_path, monkeypatch):
 @pytest.mark.parametrize("grouped", [True, False], ids=["grouped", "global"])
 @pytest.mark.parametrize("c", ["over", "wide", "fits"])
 def test_a_cpu_gpu_split_averages_like_duckdb(fraction, grouped, c):
-    import mxframe.coproc_fused as cf
+    import omxcore.coproc_fused as cf
     cf.clear_residency()
     r = np.random.default_rng(7)
     rows = 600_000
@@ -330,7 +330,7 @@ def test_the_division_is_duckdbs_long_double_not_the_correctly_rounded_quotient(
 
 @pytest.fixture
 def no_x87(monkeypatch):
-    import mxframe.np_arrow as npa
+    import omxcore.np_arrow as npa
     monkeypatch.setattr(npa, "_X87", False)
     return npa
 
@@ -352,7 +352,7 @@ def test_without_an_x87_long_double_the_mean_is_the_correctly_rounded_quotient(n
 
 
 def test_the_halves_of_a_total_are_not_added_in_int64_when_a_half_is_large(monkeypatch):
-    import mxframe.np_arrow as npa
+    import omxcore.np_arrow as npa
     lo = np.array([(1 << 62) + 1], dtype=np.int64)          # hi << 32 + lo would wrap int64
     hi = np.array([(1 << 30) - 1], dtype=np.int64)
     c = np.array([3], dtype=np.int64)
@@ -381,7 +381,7 @@ def test_a_sink_parquet_whose_streamed_run_overflows_while_merging_spilled_group
     pq.write_table(t, src, row_group_size=500)
     monkeypatch.setenv("MXFRAME_HOST_MEM_BUDGET", "300K")
     lf = scan_parquet(src).groupby("k").agg(col("x").mean().alias("m"), col("x").count().alias("n"))
-    import mxframe.streamed as st
+    import omxcore.streamed as st
     seen = []
     real_reset = st.ParquetOut.reset
     monkeypatch.setattr(st.ParquetOut, "reset", lambda self: (seen.append(self.rows + self.buffered), real_reset(self))[1])

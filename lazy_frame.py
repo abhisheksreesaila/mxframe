@@ -329,7 +329,7 @@ class LazyFrame:
             plan = opt.plan
             optimizer_trace = opt.trace
             if verbose and opt.trace:
-                print("[mxframe] optimizer passes:")
+                print("[omxcore] optimizer passes:")
                 for line in opt.trace:
                     print(f"  - {line}")
 
@@ -1118,8 +1118,8 @@ def _run_on_device(plan, device: str, *, verbose: bool = False, optimizer_trace=
                    auto: bool = False):
     """Execute an already optimized plan on one device; returns (result, provenance). A GPU piece that
     left the GPU for memory reasons is listed in the provenance as ``gpu_pieces`` (F-056)."""
-    from mxframe import gpu_budget
-    from mxframe.custom_ops import CustomOpsCompiler
+    from omxcore import gpu_budget
+    from omxcore.custom_ops import CustomOpsCompiler
     compiler = CustomOpsCompiler(device=device)
     with gpu_budget.track(strict=strict, device="auto" if auto else device) as run:
         result = compiler.compile_and_run(plan, verbose=verbose, optimizer_trace=optimizer_trace)
@@ -1136,7 +1136,7 @@ def _oom_free(err: BaseException):
     if not isinstance(err, MemoryError):
         return None
     try:
-        from mxframe import gpu_budget
+        from omxcore import gpu_budget
         return gpu_budget.free_bytes()
     except Exception:
         return None

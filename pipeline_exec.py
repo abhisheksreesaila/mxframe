@@ -3,7 +3,7 @@
 ``try_fused_aggregate`` is the single entry point used by
 ``CustomOpsCompiler.compile_and_run``. For a plan of the shape
 ``Aggregate(Filter*(Scan))`` whose predicate and aggregate expressions compile
-to bytecode (see :mod:`mxframe.pipeline_program`) it runs filter, arithmetic
+to bytecode (see :mod:`omxcore.pipeline_program`) it runs filter, arithmetic
 and aggregation in one vectorized pass over the raw columns on the compiler's
 current device, and assembles the same ``pa.Table`` the existing paths build.
 Anything else returns ``None`` and the caller carries on with its existing

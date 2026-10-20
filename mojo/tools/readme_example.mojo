@@ -1,6 +1,6 @@
 # The README's Mojo example (kept compiling: scripts/mojo_test.sh runs it)
 from std.sys import argv
-from mxframe import read_csv, CsvOptions, Query, Frame, col, lit, sum, count, AUTO
+from omxcore import read_csv, CsvOptions, Query, Frame, col, lit, sum, count, AUTO
 
 
 def main() raises:

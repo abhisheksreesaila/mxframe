@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-TPC-H Benchmark Suite: MXFrame vs Polars vs Pandas (vs DuckDB for Q3)
+TPC-H Benchmark Suite: omxcore vs Polars vs Pandas (vs DuckDB for Q3)
 
 Queries:
   Q1  -- filter + groupby + 8 aggregates (lineitem)
@@ -27,13 +27,13 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.compute as pc
-from mxframe.np_arrow import array as _npa
+from omxcore.np_arrow import array as _npa
 from max import driver as _driver
 
-from mxframe import LazyFrame, col, lit, when
-from mxframe.lazy_frame import Scan
-from mxframe.custom_ops import clear_cache
-from mxframe.aot_kernels import AOTKernelsGPU, GPU_AOT_AVAILABLE
+from omxcore import LazyFrame, col, lit, when
+from omxcore.lazy_frame import Scan
+from omxcore.custom_ops import clear_cache
+from omxcore.aot_kernels import AOTKernelsGPU, GPU_AOT_AVAILABLE
 
 try:
     import polars as pl
@@ -1545,7 +1545,7 @@ def run_q4_mxframe(orders, lineitem, device="cpu") -> pa.Table:
                 "order_count": pa.array(counts[order], type=pa.int64()),
             })
 
-    # Semi-join via MXFrame hash join (unique right keys = semi-join semantics)
+    # Semi-join via omxcore hash join (unique right keys = semi-join semantics)
     # Step 1: get unique orderkeys from qualifying lineitems
     valid_li = lineitem.filter(
         pc.less(lineitem.column("l_commitdate"), lineitem.column("l_receiptdate"))
@@ -2746,7 +2746,7 @@ def run_q22_polars(customer, orders):
 #  Main
 # ---------------------------------------------------------------
 def main() -> None:
-    parser = argparse.ArgumentParser(description="TPC-H Benchmark: MXFrame vs Polars vs Pandas")
+    parser = argparse.ArgumentParser(description="TPC-H Benchmark: omxcore vs Polars vs Pandas")
     parser.add_argument("--rows",     type=int, default=1_000_000)
     parser.add_argument("--cold",     type=int, default=3)
     parser.add_argument("--hot",      type=int, default=5)
@@ -2826,12 +2826,12 @@ def main() -> None:
         print(f"  Correctness warning: {e}")
 
     q1_rows = []
-    q1_rows.append(("MXFrame CPU",
+    q1_rows.append(("omxcore CPU",
         _stats(_time_cold(lambda: run_q1_mxframe(lineitem, device="cpu"), COLD)),
         _stats(_time_runs( lambda: run_q1_mxframe(lineitem, device="cpu"), HOT, warmup=2))))
 
     if GPU_READY:
-        q1_rows.append(("MXFrame GPU",
+        q1_rows.append(("omxcore GPU",
             _stats(_time_cold(lambda: run_q1_mxframe(lineitem, device="gpu"), COLD)),
             _stats(_time_runs( lambda: run_q1_mxframe(lineitem, device="gpu"), HOT, warmup=2))))
 
@@ -2848,12 +2848,12 @@ def main() -> None:
     _section(f"Q6  Multi-Predicate Filter + Global Sum  ({N:,} rows)")
 
     q6_rows = []
-    q6_rows.append(("MXFrame CPU",
+    q6_rows.append(("omxcore CPU",
         _stats(_time_cold(lambda: run_q6_mxframe(lineitem, device="cpu"), COLD)),
         _stats(_time_runs( lambda: run_q6_mxframe(lineitem, device="cpu"), HOT, warmup=2))))
 
     if GPU_READY:
-        q6_rows.append(("MXFrame GPU",
+        q6_rows.append(("omxcore GPU",
             _stats(_time_cold(lambda: run_q6_mxframe(lineitem, device="gpu"), COLD)),
             _stats(_time_runs( lambda: run_q6_mxframe(lineitem, device="gpu"), HOT, warmup=2))))
 
@@ -2883,13 +2883,13 @@ def main() -> None:
             print(f"  Correctness warning: {e}")
 
         q3_rows = []
-        q3_rows.append(("MXFrame CPU",
+        q3_rows.append(("omxcore CPU",
             _stats(_time_cold(lambda: run_q3_mxframe(customer, orders, q3_li, device="cpu"), COLD)),
             _stats(_time_runs( lambda: run_q3_mxframe(customer, orders, q3_li, device="cpu"), HOT, warmup=2))))
 
         if GPU_READY:
             try:
-                q3_rows.append(("MXFrame GPU",
+                q3_rows.append(("omxcore GPU",
                     _stats(_time_cold(lambda: run_q3_mxframe(customer, orders, q3_li, device="gpu"), COLD)),
                     _stats(_time_runs( lambda: run_q3_mxframe(customer, orders, q3_li, device="gpu"), HOT, warmup=2))))
             except Exception as e:
@@ -2927,12 +2927,12 @@ def main() -> None:
             print(f"  Correctness warning: {e}")
 
         q12_rows = []
-        q12_rows.append(("MXFrame CPU",
+        q12_rows.append(("omxcore CPU",
             _stats(_time_cold(lambda: run_q12_mxframe(orders_q12, li_q12, device="cpu"), COLD)),
             _stats(_time_runs( lambda: run_q12_mxframe(orders_q12, li_q12, device="cpu"), HOT, warmup=2))))
         if GPU_READY:
             try:
-                q12_rows.append(("MXFrame GPU",
+                q12_rows.append(("omxcore GPU",
                     _stats(_time_cold(lambda: run_q12_mxframe(orders_q12, li_q12, device="gpu"), COLD)),
                     _stats(_time_runs( lambda: run_q12_mxframe(orders_q12, li_q12, device="gpu"), HOT, warmup=2))))
             except Exception as e:
@@ -2960,12 +2960,12 @@ def main() -> None:
             print(f"  Correctness warning: {e}")
 
         q14_rows = []
-        q14_rows.append(("MXFrame CPU",
+        q14_rows.append(("omxcore CPU",
             _stats(_time_cold(lambda: run_q14_mxframe(part_q14, li_q14, device="cpu"), COLD)),
             _stats(_time_runs( lambda: run_q14_mxframe(part_q14, li_q14, device="cpu"), HOT, warmup=2))))
         if GPU_READY:
             try:
-                q14_rows.append(("MXFrame GPU",
+                q14_rows.append(("omxcore GPU",
                     _stats(_time_cold(lambda: run_q14_mxframe(part_q14, li_q14, device="gpu"), COLD)),
                     _stats(_time_runs( lambda: run_q14_mxframe(part_q14, li_q14, device="gpu"), HOT, warmup=2))))
             except Exception as e:
@@ -2986,12 +2986,12 @@ def main() -> None:
 
         def _bench_op(label, fn_mx_cpu, fn_pd, fn_pl=None, fn_mx_gpu=None):
             rows = []
-            rows.append((f"MXFrame CPU",
+            rows.append((f"omxcore CPU",
                 _stats(_time_cold(fn_mx_cpu, COLD)),
                 _stats(_time_runs( fn_mx_cpu, HOT, warmup=2))))
             if GPU_READY and fn_mx_gpu:
                 try:
-                    rows.append((f"MXFrame GPU",
+                    rows.append((f"omxcore GPU",
                         _stats(_time_cold(fn_mx_gpu, COLD)),
                         _stats(_time_runs( fn_mx_gpu, HOT, warmup=2))))
                 except Exception:
@@ -3045,14 +3045,14 @@ def main() -> None:
         ref_q5 = run_q5_pandas(q5_nation, q5_cust, q5_orders, q5_li, supplier=q5_sup)
         q5_rows = []
         q5_rows.append((
-            "MXFrame CPU",
+            "omxcore CPU",
             _stats(_time_cold(lambda: run_q5_mxframe(q5_nation, q5_cust, q5_orders, q5_li, supplier=q5_sup), COLD)),
             _stats(_time_runs( lambda: run_q5_mxframe(q5_nation, q5_cust, q5_orders, q5_li, supplier=q5_sup), HOT, warmup=2)),
         ))
         if GPU_READY:
             try:
                 q5_rows.append((
-                    "MXFrame GPU",
+                    "omxcore GPU",
                     _stats(_time_cold(lambda: run_q5_mxframe(q5_nation, q5_cust, q5_orders, q5_li, supplier=q5_sup, device="gpu"), COLD)),
                     _stats(_time_runs( lambda: run_q5_mxframe(q5_nation, q5_cust, q5_orders, q5_li, supplier=q5_sup, device="gpu"), HOT, warmup=2)),
                 ))
@@ -3073,14 +3073,14 @@ def main() -> None:
         )
         q10_rows = []
         q10_rows.append((
-            "MXFrame CPU",
+            "omxcore CPU",
             _stats(_time_cold(lambda: run_q10_mxframe(q10_nation, q10_cust, q10_orders, q10_li), COLD)),
             _stats(_time_runs( lambda: run_q10_mxframe(q10_nation, q10_cust, q10_orders, q10_li), HOT, warmup=2)),
         ))
         if GPU_READY:
             try:
                 q10_rows.append((
-                    "MXFrame GPU",
+                    "omxcore GPU",
                     _stats(_time_cold(lambda: run_q10_mxframe(q10_nation, q10_cust, q10_orders, q10_li, device="gpu"), COLD)),
                     _stats(_time_runs( lambda: run_q10_mxframe(q10_nation, q10_cust, q10_orders, q10_li, device="gpu"), HOT, warmup=2)),
                 ))
@@ -3101,14 +3101,14 @@ def main() -> None:
         )
         q7_rows = []
         q7_rows.append((
-            "MXFrame CPU",
+            "omxcore CPU",
             _stats(_time_cold(lambda: run_q7_mxframe(q7_nation, q7_sup, q7_cust, q7_orders, q7_li), COLD)),
             _stats(_time_runs( lambda: run_q7_mxframe(q7_nation, q7_sup, q7_cust, q7_orders, q7_li), HOT, warmup=2)),
         ))
         if GPU_READY:
             try:
                 q7_rows.append((
-                    "MXFrame GPU",
+                    "omxcore GPU",
                     _stats(_time_cold(lambda: run_q7_mxframe(q7_nation, q7_sup, q7_cust, q7_orders, q7_li, device="gpu"), COLD)),
                     _stats(_time_runs( lambda: run_q7_mxframe(q7_nation, q7_sup, q7_cust, q7_orders, q7_li, device="gpu"), HOT, warmup=2)),
                 ))
@@ -3129,14 +3129,14 @@ def main() -> None:
         )
         q8_rows = []
         q8_rows.append((
-            "MXFrame CPU",
+            "omxcore CPU",
             _stats(_time_cold(lambda: run_q8_mxframe(q8_nation, q8_region, q8_part, q8_cust, q8_orders, q8_li, supplier=q8_sup), COLD)),
             _stats(_time_runs( lambda: run_q8_mxframe(q8_nation, q8_region, q8_part, q8_cust, q8_orders, q8_li, supplier=q8_sup), HOT, warmup=2)),
         ))
         if GPU_READY:
             try:
                 q8_rows.append((
-                    "MXFrame GPU",
+                    "omxcore GPU",
                     _stats(_time_cold(lambda: run_q8_mxframe(q8_nation, q8_region, q8_part, q8_cust, q8_orders, q8_li, supplier=q8_sup, device="gpu"), COLD)),
                     _stats(_time_runs( lambda: run_q8_mxframe(q8_nation, q8_region, q8_part, q8_cust, q8_orders, q8_li, supplier=q8_sup, device="gpu"), HOT, warmup=2)),
                 ))
@@ -3156,7 +3156,7 @@ def main() -> None:
         )
         q13_rows = []
         q13_rows.append((
-            "MXFrame CPU",
+            "omxcore CPU",
             _stats(_time_cold(lambda: run_q13_mxframe(q13_cust, q13_orders), COLD)),
             _stats(_time_runs( lambda: run_q13_mxframe(q13_cust, q13_orders), HOT, warmup=2)),
         ))
@@ -3174,14 +3174,14 @@ def main() -> None:
         )
         q19_rows = []
         q19_rows.append((
-            "MXFrame CPU",
+            "omxcore CPU",
             _stats(_time_cold(lambda: run_q19_mxframe(q19_part, q19_li), COLD)),
             _stats(_time_runs( lambda: run_q19_mxframe(q19_part, q19_li), HOT, warmup=2)),
         ))
         if GPU_READY:
             try:
                 q19_rows.append((
-                    "MXFrame GPU",
+                    "omxcore GPU",
                     _stats(_time_cold(lambda: run_q19_mxframe(q19_part, q19_li, device="gpu"), COLD)),
                     _stats(_time_runs( lambda: run_q19_mxframe(q19_part, q19_li, device="gpu"), HOT, warmup=2)),
                 ))
@@ -3202,14 +3202,14 @@ def main() -> None:
         )
         q4_rows = []
         q4_rows.append((
-            "MXFrame CPU",
+            "omxcore CPU",
             _stats(_time_cold(lambda: run_q4_mxframe(q4_orders, q4_li), COLD)),
             _stats(_time_runs( lambda: run_q4_mxframe(q4_orders, q4_li), HOT, warmup=2)),
         ))
         if GPU_READY:
             try:
                 q4_rows.append((
-                    "MXFrame GPU",
+                    "omxcore GPU",
                     _stats(_time_cold(lambda: run_q4_mxframe(q4_orders, q4_li, device="gpu"), COLD)),
                     _stats(_time_runs( lambda: run_q4_mxframe(q4_orders, q4_li, device="gpu"), HOT, warmup=2)),
                 ))
@@ -3229,14 +3229,14 @@ def main() -> None:
         )
         q9_rows = []
         q9_rows.append((
-            "MXFrame CPU",
+            "omxcore CPU",
             _stats(_time_cold(lambda: run_q9_mxframe(q9_nation, q9_sup, q9_ps, q9_part, q9_orders, q9_li), COLD)),
             _stats(_time_runs( lambda: run_q9_mxframe(q9_nation, q9_sup, q9_ps, q9_part, q9_orders, q9_li), HOT, warmup=2)),
         ))
         if GPU_READY:
             try:
                 q9_rows.append((
-                    "MXFrame GPU",
+                    "omxcore GPU",
                     _stats(_time_cold(lambda: run_q9_mxframe(q9_nation, q9_sup, q9_ps, q9_part, q9_orders, q9_li, device="gpu"), COLD)),
                     _stats(_time_runs( lambda: run_q9_mxframe(q9_nation, q9_sup, q9_ps, q9_part, q9_orders, q9_li, device="gpu"), HOT, warmup=2)),
                 ))
@@ -3256,14 +3256,14 @@ def main() -> None:
         )
         q11_rows = []
         q11_rows.append((
-            "MXFrame CPU",
+            "omxcore CPU",
             _stats(_time_cold(lambda: run_q11_mxframe(q11_nation, q11_sup, q11_ps), COLD)),
             _stats(_time_runs( lambda: run_q11_mxframe(q11_nation, q11_sup, q11_ps), HOT, warmup=2)),
         ))
         if GPU_READY:
             try:
                 q11_rows.append((
-                    "MXFrame GPU",
+                    "omxcore GPU",
                     _stats(_time_cold(lambda: run_q11_mxframe(q11_nation, q11_sup, q11_ps, device="gpu"), COLD)),
                     _stats(_time_runs( lambda: run_q11_mxframe(q11_nation, q11_sup, q11_ps, device="gpu"), HOT, warmup=2)),
                 ))
@@ -3283,14 +3283,14 @@ def main() -> None:
         )
         q18_rows = []
         q18_rows.append((
-            "MXFrame CPU",
+            "omxcore CPU",
             _stats(_time_cold(lambda: run_q18_mxframe(q18_cust, q18_orders, q18_li), COLD)),
             _stats(_time_runs( lambda: run_q18_mxframe(q18_cust, q18_orders, q18_li), HOT, warmup=2)),
         ))
         if GPU_READY:
             try:
                 q18_rows.append((
-                    "MXFrame GPU",
+                    "omxcore GPU",
                     _stats(_time_cold(lambda: run_q18_mxframe(q18_cust, q18_orders, q18_li, device="gpu"), COLD)),
                     _stats(_time_runs( lambda: run_q18_mxframe(q18_cust, q18_orders, q18_li, device="gpu"), HOT, warmup=2)),
                 ))
@@ -3307,16 +3307,16 @@ def main() -> None:
         _section(f"Q16 (part={q16_part.num_rows:,}  ps={q16_ps.num_rows:,}  distinct suppkey count)")
         mx16 = run_q16_mxframe(q16_part, q16_sup, q16_ps)
         pd16 = run_q16_pandas(q16_part, q16_sup, q16_ps)
-        print(f"  Rows: MXFrame={mx16.num_rows}  Pandas={len(pd16)}")
+        print(f"  Rows: omxcore={mx16.num_rows}  Pandas={len(pd16)}")
         q16_rows = [(
-            "MXFrame CPU",
+            "omxcore CPU",
             _stats(_time_cold(lambda: run_q16_mxframe(q16_part, q16_sup, q16_ps), COLD)),
             _stats(_time_runs( lambda: run_q16_mxframe(q16_part, q16_sup, q16_ps), HOT, warmup=2)),
         )]
         if GPU_READY:
             try:
                 q16_rows.append((
-                    "MXFrame GPU",
+                    "omxcore GPU",
                     _stats(_time_cold(lambda: run_q16_mxframe(q16_part, q16_sup, q16_ps, device="gpu"), COLD)),
                     _stats(_time_runs( lambda: run_q16_mxframe(q16_part, q16_sup, q16_ps, device="gpu"), HOT, warmup=2)),
                 ))
@@ -3331,16 +3331,16 @@ def main() -> None:
         _section(f"Q17 (part={q17_part.num_rows:,}  l={q17_li.num_rows:,}  2-pass avg)")
         mx17 = run_q17_mxframe(q17_part, q17_li)
         pd17 = run_q17_pandas(q17_part, q17_li)
-        print(f"  avg_yearly: MXFrame={mx17}  Pandas={pd17}")
+        print(f"  avg_yearly: omxcore={mx17}  Pandas={pd17}")
         q17_rows = [(
-            "MXFrame CPU",
+            "omxcore CPU",
             _stats(_time_cold(lambda: run_q17_mxframe(q17_part, q17_li), COLD)),
             _stats(_time_runs( lambda: run_q17_mxframe(q17_part, q17_li), HOT, warmup=2)),
         )]
         if GPU_READY:
             try:
                 q17_rows.append((
-                    "MXFrame GPU",
+                    "omxcore GPU",
                     _stats(_time_cold(lambda: run_q17_mxframe(q17_part, q17_li, device="gpu"), COLD)),
                     _stats(_time_runs( lambda: run_q17_mxframe(q17_part, q17_li, device="gpu"), HOT, warmup=2)),
                 ))
@@ -3370,14 +3370,14 @@ def main() -> None:
             print(f"  Correctness warning: {e}")
 
         q2_rows = [(
-            "MXFrame CPU",
+            "omxcore CPU",
             _stats(_time_cold(lambda: run_q2_mxframe(q2_nation, q2_region, q2_part, q2_sup, q2_ps), COLD)),
             _stats(_time_runs( lambda: run_q2_mxframe(q2_nation, q2_region, q2_part, q2_sup, q2_ps), HOT, warmup=2)),
         )]
         if GPU_READY:
             try:
                 q2_rows.append((
-                    "MXFrame GPU",
+                    "omxcore GPU",
                     _stats(_time_cold(lambda: run_q2_mxframe(q2_nation, q2_region, q2_part, q2_sup, q2_ps, device="gpu"), COLD)),
                     _stats(_time_runs( lambda: run_q2_mxframe(q2_nation, q2_region, q2_part, q2_sup, q2_ps, device="gpu"), HOT, warmup=2)),
                 ))
@@ -3403,14 +3403,14 @@ def main() -> None:
             print(f"  Correctness warning: {e}")
 
         q15_rows = [(
-            "MXFrame CPU",
+            "omxcore CPU",
             _stats(_time_cold(lambda: run_q15_mxframe(q15_sup, q15_li), COLD)),
             _stats(_time_runs( lambda: run_q15_mxframe(q15_sup, q15_li), HOT, warmup=2)),
         )]
         if GPU_READY:
             try:
                 q15_rows.append((
-                    "MXFrame GPU",
+                    "omxcore GPU",
                     _stats(_time_cold(lambda: run_q15_mxframe(q15_sup, q15_li, device="gpu"), COLD)),
                     _stats(_time_runs( lambda: run_q15_mxframe(q15_sup, q15_li, device="gpu"), HOT, warmup=2)),
                 ))
@@ -3435,14 +3435,14 @@ def main() -> None:
             print(f"  Correctness warning: {e}")
 
         q20_rows = [(
-            "MXFrame CPU",
+            "omxcore CPU",
             _stats(_time_cold(lambda: run_q20_mxframe(q20_nation, q20_part, q20_sup, q20_ps, q20_li), COLD)),
             _stats(_time_runs( lambda: run_q20_mxframe(q20_nation, q20_part, q20_sup, q20_ps, q20_li), HOT, warmup=2)),
         )]
         if GPU_READY:
             try:
                 q20_rows.append((
-                    "MXFrame GPU",
+                    "omxcore GPU",
                     _stats(_time_cold(lambda: run_q20_mxframe(q20_nation, q20_part, q20_sup, q20_ps, q20_li, device="gpu"), COLD)),
                     _stats(_time_runs( lambda: run_q20_mxframe(q20_nation, q20_part, q20_sup, q20_ps, q20_li, device="gpu"), HOT, warmup=2)),
                 ))
@@ -3467,14 +3467,14 @@ def main() -> None:
             print(f"  Correctness warning: {e}")
 
         q21_rows = [(
-            "MXFrame CPU",
+            "omxcore CPU",
             _stats(_time_cold(lambda: run_q21_mxframe(q21_nation, q21_sup, q21_orders, q21_li), COLD)),
             _stats(_time_runs( lambda: run_q21_mxframe(q21_nation, q21_sup, q21_orders, q21_li), HOT, warmup=2)),
         )]
         if GPU_READY:
             try:
                 q21_rows.append((
-                    "MXFrame GPU",
+                    "omxcore GPU",
                     _stats(_time_cold(lambda: run_q21_mxframe(q21_nation, q21_sup, q21_orders, q21_li, device="gpu"), COLD)),
                     _stats(_time_runs( lambda: run_q21_mxframe(q21_nation, q21_sup, q21_orders, q21_li, device="gpu"), HOT, warmup=2)),
                 ))
@@ -3499,14 +3499,14 @@ def main() -> None:
             print(f"  Correctness warning: {e}")
 
         q22_rows = [(
-            "MXFrame CPU",
+            "omxcore CPU",
             _stats(_time_cold(lambda: run_q22_mxframe(q22_cust, q22_orders), COLD)),
             _stats(_time_runs( lambda: run_q22_mxframe(q22_cust, q22_orders), HOT, warmup=2)),
         )]
         if GPU_READY:
             try:
                 q22_rows.append((
-                    "MXFrame GPU",
+                    "omxcore GPU",
                     _stats(_time_cold(lambda: run_q22_mxframe(q22_cust, q22_orders, device="gpu"), COLD)),
                     _stats(_time_runs( lambda: run_q22_mxframe(q22_cust, q22_orders, device="gpu"), HOT, warmup=2)),
                 ))
@@ -3531,7 +3531,7 @@ if __name__ == "__main__":
 #  Apache DataFusion implementations (all 22 TPC-H queries)
 #  Uses DataFusion's Python SQL API: ctx.register_record_batches + ctx.sql
 #  Included as a reference baseline; not a direct apples-to-apples
-#  comparison with MXFrame (different languages, different optimisers).
+#  comparison with omxcore (different languages, different optimisers).
 # ─────────────────────────────────────────────────────────────────────────
 try:
     from datafusion import SessionContext as _DFCtx

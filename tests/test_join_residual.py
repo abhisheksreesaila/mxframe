@@ -5,7 +5,7 @@ import pytest
 
 duckdb = pytest.importorskip("duckdb")
 
-from mxframe import LazyFrame, col, lit
+from omxcore import LazyFrame, col, lit
 
 
 def _i32(a):

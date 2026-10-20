@@ -5,8 +5,8 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-from mxframe import LazyFrame, gpu_stream
-from mxframe.sort_check import is_sorted_topk
+from omxcore import LazyFrame, gpu_stream
+from omxcore.sort_check import is_sorted_topk
 
 
 def test_is_sorted_topk_accepts_the_stable_top_k_and_rejects_everything_else():
@@ -23,13 +23,13 @@ def test_is_sorted_topk_accepts_the_stable_top_k_and_rejects_everything_else():
 @pytest.mark.skipif(not gpu_stream.cuda_available(), reason="no CUDA GPU")
 @pytest.mark.parametrize("limit", [10, None])
 def test_gpu_sort_with_a_failed_kernel_still_returns_the_right_rows(monkeypatch, limit):
-    from mxframe.aot_kernels import AOTKernelsGPU
+    from omxcore.aot_kernels import AOTKernelsGPU
     rng = np.random.default_rng(3)
     n = 50_000
     t = pa.table({"k": rng.integers(0, 1000, n).astype(np.int32), "v": np.arange(n, dtype=np.int32)})
     monkeypatch.setattr(AOTKernelsGPU, "sort_topk",
                         lambda self, keys, k, descending=False, device_out=False: np.zeros(k, dtype=np.int32))
-    from mxframe import sort_check
+    from omxcore import sort_check
     before = sort_check.gpu_sort_fallbacks
     lf = LazyFrame(t).sort("k", descending=True)
     if limit:
@@ -42,7 +42,7 @@ def test_gpu_sort_with_a_failed_kernel_still_returns_the_right_rows(monkeypatch,
 
 def test_the_backstop_counts_each_redone_sort_and_warns_once_per_kind(monkeypatch):
     import warnings
-    from mxframe import sort_check
+    from omxcore import sort_check
     monkeypatch.setattr(sort_check, "_WARNED", set())
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")
@@ -51,4 +51,4 @@ def test_the_backstop_counts_each_redone_sort_and_warns_once_per_kind(monkeypatc
         sort_check.warn_fallback()
         sort_check.warn_fallback("the GPU sort returned a wrong order")
     assert [str(x.message).split(";")[0] for x in w] == [
-        "mxframe: radix sort returned an unsorted order", "mxframe: the GPU sort returned a wrong order"]
+        "omxcore: radix sort returned an unsorted order", "omxcore: the GPU sort returned a wrong order"]

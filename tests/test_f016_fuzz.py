@@ -1,7 +1,7 @@
 """F-016: random plan shapes against DuckDB (cpu and auto).
 
 Each seed builds a random pipeline of 2-4 operators (filter / with_columns / select / aggregate /
-join / top-n / distinct) over random data with nulls, runs it through mxframe and through the
+join / top-n / distinct) over random data with nulls, runs it through omxcore and through the
 equivalent SQL in DuckDB, and compares the rows (order ignored: an order is only checked through
 a full-row sort followed by a limit, which decides WHICH rows come back).
 
@@ -17,8 +17,8 @@ import pyarrow as pa
 import pytest
 
 import conftest  # noqa: F401
-from mxframe import LazyFrame, col, lit
-from mxframe.lazy_frame import Scan
+from omxcore import LazyFrame, col, lit
+from omxcore.lazy_frame import Scan
 
 N_SEEDS = 60
 LONG_SEEDS = int(os.environ.get("MXFRAME_FUZZ_SEEDS", "300"))
@@ -43,7 +43,7 @@ def _random_table(rng, n, prefix, n_int, n_float, key_card=6, null_rate=0.12):
 
 
 class State:
-    """A relation being built: its mxframe plan, the SQL that computes it, and its columns."""
+    """A relation being built: its omxcore plan, the SQL that computes it, and its columns."""
 
     def __init__(self, lf, sql, kinds):
         self.lf, self.sql, self.kinds = lf, sql, dict(kinds)   # kinds: name -> "int" | "float"
@@ -324,7 +324,7 @@ def test_random_plans_match_duckdb_long(seed):
 @pytest.mark.parametrize("device", ["auto", "gpu"])
 def test_random_plans_match_duckdb_large(seed, device):
     """20k rows: past the auto threshold, so the GPU and the fused kernels take part."""
-    from mxframe.aot_kernels import GPU_AOT_AVAILABLE
+    from omxcore.aot_kernels import GPU_AOT_AVAILABLE
     if device == "gpu" and not GPU_AOT_AVAILABLE:
         pytest.skip("no GPU AOT kernels")
     run_seed(5000 + seed, device, n_rows=20_000)
@@ -335,7 +335,7 @@ def test_random_plans_match_duckdb_large(seed, device):
 def test_regression_seeds_from_the_large_runs(seed, device):
     """5061 (F-020): distinct -> select -> grouped sums of a float64 column cancelling to ~0.1. A Project under the
     aggregate declined the fused pipeline and the GPU fallback summed in float32."""
-    from mxframe.aot_kernels import GPU_AOT_AVAILABLE
+    from omxcore.aot_kernels import GPU_AOT_AVAILABLE
     if device == "gpu" and not GPU_AOT_AVAILABLE:
         pytest.skip("no GPU AOT kernels")
     run_seed(seed, device, n_rows=20_000)

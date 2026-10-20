@@ -19,9 +19,9 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-import mxframe as mx
-from mxframe import col, gpu_stream
-from mxframe.io_parquet import scan_parquet
+import omxcore as mx
+from omxcore import col, gpu_stream
+from omxcore.io_parquet import scan_parquet
 
 from test_f056_streamed import same
 from test_f056_step3a import spill_leftovers
@@ -232,7 +232,7 @@ def test_a_self_join_of_the_big_file_equals_duckdb(files, device, _env):
 
 def skewed_pair(tmp_path):
     """80% of the left rows (and the right rows) have keys that all hash to partition 0 of the first level."""
-    from mxframe import spill
+    from omxcore import spill
     cand = pa.table({"k": np.arange(2_000_000, dtype=np.int64)})
     part = ((spill.hash_keys(cand, ["k"], 0) >> np.uint64(33)) % np.uint64(spill.PARTITIONS)).astype(np.int64)
     hot = np.flatnonzero(part == 0)[:3000]
@@ -260,7 +260,7 @@ def test_a_partition_that_is_still_too_big_is_split_again(tmp_path, monkeypatch,
 
 
 def test_keys_that_never_split_raise_a_memory_error_and_clean_up(tmp_path, monkeypatch, _env):
-    from mxframe import spill
+    from omxcore import spill
     monkeypatch.setenv("MXFRAME_HOST_MEM_BUDGET", "2M")
     monkeypatch.setattr(spill, "MAX_DEPTH", 2)
     n = 100_000
@@ -398,7 +398,7 @@ def test_a_reproducible_grace_join_is_the_same_bits_twice(files):
 
 
 def test_the_spill_directory_is_removed_after_an_error_in_a_pair(files, _env, monkeypatch):
-    from mxframe import streamed
+    from omxcore import streamed
     real = streamed._spill.Partitioned.read
     seen = {}
 
@@ -416,8 +416,8 @@ def test_the_spill_directory_is_removed_after_an_error_in_a_pair(files, _env, mo
 PEAK = textwrap.dedent("""
     import json, sys
     import pyarrow as pa
-    import mxframe as mx
-    from mxframe.io_parquet import scan_parquet
+    import omxcore as mx
+    from omxcore.io_parquet import scan_parquet
 
     def status(key):
         with open("/proc/self/status") as f:
@@ -501,7 +501,7 @@ def test_an_integer_with_no_exact_double_against_a_float_key_is_a_type_error_lik
 
 
 def test_the_memory_error_names_the_hot_key_and_its_row_count(tmp_path, monkeypatch, _env):
-    from mxframe import spill
+    from omxcore import spill
     monkeypatch.setenv("MXFRAME_HOST_MEM_BUDGET", "2M")
     monkeypatch.setattr(spill, "MAX_DEPTH", 2)
     n = 100_000

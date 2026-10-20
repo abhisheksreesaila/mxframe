@@ -28,7 +28,7 @@ def warn_fallback(what="radix sort returned an unsorted order") -> None:
     """One warning per kind of failure (the radix sort and the GPU sort do not share it)."""
     if what not in _WARNED:
         _WARNED.add(what)
-        warnings.warn(f"mxframe: {what}; using np.argsort (please report)",
+        warnings.warn(f"omxcore: {what}; using np.argsort (please report)",
                       RuntimeWarning, stacklevel=3)
 
 

@@ -383,10 +383,10 @@ def test_a_cast_that_cannot_hold_the_value_raises(probe, data, mode):
 
 @pytest.mark.parametrize("mode", MODES)
 def test_a_word_with_a_quirk_in_duckdb_is_an_error_not_a_guess(probe, data, mode):
-    """`inf` is a date in DuckDB (infinity), which MX frame has no value for: a CAST and a TRY_CAST both say so instead of answering NULL."""
+    """`inf` is a date in DuckDB (infinity), which omxcore has no value for: a CAST and a TRY_CAST both say so instead of answering NULL."""
     for kind in ("CAST", "TRY_CAST"):
         res = run_probe(probe, f"SELECT {kind}(nsb AS DATE) FROM t", {"t": data.path}, mode=mode, edits=data.edits_path if mode in ("frame", "framescan") else None, expect_error=True)
-        assert "quirks that MX frame does not read" in res["error"], res
+        assert "quirks that omxcore does not read" in res["error"], res
 
 
 @pytest.mark.parametrize("mode", MODES)

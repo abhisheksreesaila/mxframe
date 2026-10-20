@@ -3,7 +3,7 @@
 # cases: decimal_overflow, no_columns, null_text (13 rows in groups of 8, a TEXT column of nulls with no words),
 #        atomic (a good file, then a refused write over it).
 from std.sys import argv
-from mxframe import Table, INT, DECIMAL, TEXT, write_parquet
+from omxcore import Table, INT, DECIMAL, TEXT, write_parquet
 
 
 def main() raises:

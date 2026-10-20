@@ -19,7 +19,7 @@ or Ctrl-C loses nothing; the markdown is rendered from the CSV at the end.  `--r
 (engine, sf, query) rows already in the CSV; `--report-only` just re-renders the markdown.
 
 Environment: the subprocesses use CUDA_VISIBLE_DEVICES=<--gpu> (default 1) and import
-mxframe from THIS checkout.  Data: $MXFRAME_TPCH_DATA or <repo>/data or the main checkout's
+omxcore from THIS checkout.  Data: $MXFRAME_TPCH_DATA or <repo>/data or the main checkout's
 data/ (a worktree has none); files are <data>/tpch_sf<SF>_exact/<table>.parquet (exact DECIMALs; --legacy-data uses tpch_sf<SF>).
 """
 from __future__ import annotations
@@ -188,7 +188,7 @@ def main() -> None:
     if csv_path.exists() and csv_path.stat().st_size > 0 and not (a.resume or a.force):
         raise SystemExit(f"{csv_path} already has results; pass --resume to add to it, --force to overwrite, "
                          "or use another --name")
-    # fail BEFORE the loop: data present, and workers import mxframe from THIS checkout
+    # fail BEFORE the loop: data present, and workers import omxcore from THIS checkout
     suffix = "" if a.legacy_data else "_exact"
     data_dirs = {sf: root / f"tpch_sf{sf}{suffix}" for sf in sfs}
     missing = [str(d) for d in data_dirs.values() if not d.is_dir()]
@@ -197,7 +197,7 @@ def main() -> None:
     if any(e.startswith("mx-") for e in engines):
         mxp = check_mxframe_path()
         if os.path.realpath(mxp) != os.path.realpath(REPO_ROOT):
-            raise SystemExit(f"workers import mxframe from {mxp}, not {REPO_ROOT}")
+            raise SystemExit(f"workers import omxcore from {mxp}, not {REPO_ROOT}")
 
     # the DuckDB reference always runs first (it is only *reported* when requested)
     order = ["duckdb"] + [e for e in engines if e != "duckdb"]
@@ -231,7 +231,7 @@ def main() -> None:
                                repeat_verdict="")
                     mxp = rec.pop("mxframe_path", None)
                     if mxp and os.path.realpath(mxp) != os.path.realpath(REPO_ROOT):
-                        rec["error"] = f"imported mxframe from {mxp}, not {REPO_ROOT}"
+                        rec["error"] = f"imported omxcore from {mxp}, not {REPO_ROOT}"
                     if eng == "duckdb":
                         ref_ok = "error" not in rec and res_path.exists()
                         if ref_ok and sf == "1":

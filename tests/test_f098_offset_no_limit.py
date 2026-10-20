@@ -12,11 +12,11 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-import mxframe as mx
-import mxframe.native_exec as nx
-from mxframe import col, gpu_stream
-from mxframe.io_parquet import scan_parquet
-from mxframe.lazy_frame import Limit
+import omxcore as mx
+import omxcore.native_exec as nx
+from omxcore import col, gpu_stream
+from omxcore.io_parquet import scan_parquet
+from omxcore.lazy_frame import Limit
 
 GPU = gpu_stream.cuda_available()
 N = 400

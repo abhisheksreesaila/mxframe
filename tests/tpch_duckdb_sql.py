@@ -1,6 +1,6 @@
 """TPC-H reference answers from DuckDB (F-011).
 
-The mxframe benchmark queries read Parquet written by ``scripts/gen_tpch_parquet.py``:
+The omxcore benchmark queries read Parquet written by ``scripts/gen_tpch_parquet.py``:
 dates are int32 day numbers (days since 1970-01-01) and DECIMAL columns are float32.
 DuckDB reads the very same files through views that turn them back into what TPC-H
 says they are (DATE and DECIMAL(15,2)), so the SQL below is the official TPC-H text

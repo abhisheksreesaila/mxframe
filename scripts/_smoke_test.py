@@ -2,8 +2,8 @@
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pyarrow as pa, numpy as np
-from mxframe import LazyFrame, col, lit
-from mxframe.custom_ops import clear_cache, KERNELS_PATH
+from omxcore import LazyFrame, col, lit
+from omxcore.custom_ops import clear_cache, KERNELS_PATH
 
 print("KERNELS_PATH:", KERNELS_PATH)
 clear_cache()

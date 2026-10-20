@@ -1,7 +1,7 @@
 # F-141: dumps every cell of a Parquet file, read through read_parquet (mode read) or through scan_parquet's read_group (mode scan),
 # TEXT as the word (or its code with a fourth argument `codes`), null as N, one tab-separated line per row (tests/test_mojo_parquet.py compares it with pyarrow).
 from std.sys import argv
-from mxframe import read_parquet, scan_parquet, TEXT
+from omxcore import read_parquet, scan_parquet, TEXT
 
 
 def main() raises:

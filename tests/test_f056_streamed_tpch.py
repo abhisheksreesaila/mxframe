@@ -20,8 +20,8 @@ DATA = TPCH_DATA / "tpch_sf1_exact"
 pytestmark = [pytest.mark.slow,
               pytest.mark.skipif(not (DATA / "lineitem.parquet").exists(), reason="TPC-H SF1 data not present")]
 
-import mxframe as mx  # noqa: E402
-from mxframe import gpu_stream  # noqa: E402
+import omxcore as mx  # noqa: E402
+from omxcore import gpu_stream  # noqa: E402
 
 HAS_GPU = gpu_stream.cuda_available()
 DEVICES = ["cpu", pytest.param("gpu", marks=pytest.mark.skipif(not HAS_GPU, reason="no CUDA GPU")),

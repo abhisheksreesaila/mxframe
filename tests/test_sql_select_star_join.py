@@ -8,8 +8,8 @@ import duckdb
 import pyarrow as pa
 import pytest
 
-import mxframe as mx
-from mxframe import pipeline_kernels as pk
+import omxcore as mx
+from omxcore import pipeline_kernels as pk
 
 DEVICES = ["cpu", pytest.param("gpu", marks=pytest.mark.skipif(not pk.gpu_available(), reason="needs a GPU"))]
 

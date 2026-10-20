@@ -1,6 +1,6 @@
 # F-155: the join planner (rule_join_order on plain statistics), a custom Planner's join order, and joins of three Frames with edits and a merge
 # equal to the same joins over their baked tables under every join order.
-from mxframe import (Table, SharedTable, Frame, Catalog, PlannerOptions, Planner, RulePlanner, PhysicalPlan, Stats, BoundQuery, JoinStats, JoinPlan,
+from omxcore import (Table, SharedTable, Frame, Catalog, PlannerOptions, Planner, RulePlanner, PhysicalPlan, Stats, BoundQuery, JoinStats, JoinPlan,
                      rule_join_order, sql, sql_with, INT, DECIMAL, TEXT, BUILD_LEFT, BUILD_RIGHT)
 
 

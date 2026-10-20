@@ -1,10 +1,10 @@
-"""F-044: random queries on the TPC-H data, engine-only, MXFrame vs Polars vs DuckDB.
+"""F-044: random queries on the TPC-H data, engine-only, omxcore vs Polars vs DuckDB.
 
     pixi run python scripts/bench_random/run.py --sf 1 --n 100 [--shuffle] [--seed0 0] --out docs/bench
 
 Each (query, engine) runs in a fresh process (worker.py): load untimed, first run timed. DuckDB's
 result is the reference: ordered queries are compared row by row, others as sorted rows; floats
-within 1e-3 relative (inputs are float32), `drift` up to 1e-2, else `WRONG`. MXFrame also reports
+within 1e-3 relative (inputs are float32), `drift` up to 1e-2, else `WRONG`. omxcore also reports
 which native kernels ran and why a part fell back to Python.
 """
 import argparse
@@ -165,7 +165,7 @@ def main():
     ap.add_argument("--timeout", type=float, default=300)
     ap.add_argument("--out", default=os.path.join(ROOT, "docs", "bench"))
     ap.add_argument("--name", default=None)
-    ap.add_argument("--device", default="cpu", help="device for MXFrame's compute() (F-055: gpu)")
+    ap.add_argument("--device", default="cpu", help="device for omxcore's compute() (F-055: gpu)")
     ap.add_argument("--gpu", default="-1", help="CUDA_VISIBLE_DEVICES for the workers (a UUID or index)")
     ap.add_argument("--engines", default=",".join(ENGINES))
     a = ap.parse_args()
@@ -204,14 +204,14 @@ def _gm(xs):
 
 def report(rows, path, a):
     ok = lambda r, e: "error" not in r[e] and r[e].get("verdict", "ok") in ("ok", "drift")
-    L = [f"# Random queries on TPC-H SF{a.sf}{' (rows shuffled)' if a.shuffle else ''}: MXFrame vs Polars vs DuckDB\n",
+    L = [f"# Random queries on TPC-H SF{a.sf}{' (rows shuffled)' if a.shuffle else ''}: omxcore vs Polars vs DuckDB\n",
          f"{len(rows)} seeded random queries (seeds {a.seed0}..{a.seed0 + len(rows) - 1}, `scripts/bench_random/`), "
          "engine-only: each (query, engine) in a fresh process, columns loaded untimed, the first run timed "
          "(query + materialized result). DuckDB's result is the reference.\n"]
     by = defaultdict(list)
     for r in rows:
         by[r["shape"]].append(r)
-    L.append("| shape | queries | MXFrame correct | faster than Polars | faster than DuckDB | Polars / MXFrame (geo. mean) | DuckDB / MXFrame (geo. mean) | MXFrame: no native decline logged |")
+    L.append("| shape | queries | omxcore correct | faster than Polars | faster than DuckDB | Polars / omxcore (geo. mean) | DuckDB / omxcore (geo. mean) | omxcore: no native decline logged |")
     L.append("|---|---:|---:|---:|---:|---:|---:|---:|")
     tot = defaultdict(int)
     for shape in sorted(by) + ["all"]:
@@ -226,10 +226,10 @@ def report(rows, path, a):
         nat = sum(1 for r in good if not r["mx"].get("declines"))
         L.append(f"| {shape} | {len(rs)} | {len(good)}/{len(rs)} | {wp}/{len(vp)} | {wd}/{len(vd)} | {gp:.2f}x | {gd:.2f}x | {nat}/{len(good)} |")
     tm = {e: sum(r[e].get("ms", 0) for r in rows if all("error" not in r[x] for x in ENGINES)) for e in ENGINES}
-    L.append(f"\nTotal time over queries every engine ran: MXFrame {tm['mx']:.0f} ms, Polars {tm['polars']:.0f} ms, "
-             f"DuckDB {tm['duckdb']:.0f} ms. Geo. mean ratio > 1: MXFrame faster.\n")
+    L.append(f"\nTotal time over queries every engine ran: omxcore {tm['mx']:.0f} ms, Polars {tm['polars']:.0f} ms, "
+             f"DuckDB {tm['duckdb']:.0f} ms. Geo. mean ratio > 1: omxcore faster.\n")
     bad = [r for r in rows if not ok(r, "mx")]
-    L.append(f"## MXFrame results that differ from DuckDB or failed ({len(bad)})\n")
+    L.append(f"## omxcore results that differ from DuckDB or failed ({len(bad)})\n")
     for r in bad:
         L.append(f"- q{r['seed']} ({r['shape']}): {r['mx'].get('verdict', r['mx'].get('error'))} {r['mx'].get('why', '')}  \n  `{r['sql']}`")
     pb = [r for r in rows if not ok(r, "polars")]
@@ -238,8 +238,8 @@ def report(rows, path, a):
         L.append(f"- q{r['seed']}: {r['polars'].get('verdict', r['polars'].get('error'))} {r['polars'].get('why', '')}")
     slow = sorted([r for r in rows if ok(r, "mx") and "error" not in r["duckdb"]],
                   key=lambda r: r["mx"]["ms"] / max(min(r["duckdb"]["ms"], r["polars"].get("ms", 1e9)), 1e-3), reverse=True)[:12]
-    L.append("\n## Where MXFrame is slowest relative to the faster of Polars / DuckDB\n")
-    L.append("| query | shape | MXFrame ms | Polars ms | DuckDB ms | fell back to Python for |")
+    L.append("\n## Where omxcore is slowest relative to the faster of Polars / DuckDB\n")
+    L.append("| query | shape | omxcore ms | Polars ms | DuckDB ms | fell back to Python for |")
     L.append("|---|---|---:|---:|---:|---|")
     for r in slow:
         L.append(f"| q{r['seed']} | {r['shape']} | {r['mx']['ms']:.1f} | {r['polars'].get('ms', float('nan')):.1f} | "
@@ -248,7 +248,7 @@ def report(rows, path, a):
     for r in rows:
         for d in r["mx"].get("declines", []):
             reasons[d] += 1
-    L.append("\n## Why parts of MXFrame queries ran in Python (count of queries)\n")
+    L.append("\n## Why parts of omxcore queries ran in Python (count of queries)\n")
     for d, c in sorted(reasons.items(), key=lambda x: -x[1]):
         L.append(f"- {c}: {d}")
     L.append("\n## Queries\n")

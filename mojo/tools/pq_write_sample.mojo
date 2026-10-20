@@ -1,6 +1,6 @@
 # Writes a sample table to the Parquet file named on the command line (used by tests/test_mojo_parquet.py).
 from std.sys import argv
-from mxframe import Table, INT, DECIMAL, TEXT, DATE, BOOL, write_parquet, UNCOMPRESSED, SNAPPY, ZSTD
+from omxcore import Table, INT, DECIMAL, TEXT, DATE, BOOL, write_parquet, UNCOMPRESSED, SNAPPY, ZSTD
 
 
 def main() raises:

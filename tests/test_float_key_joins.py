@@ -20,11 +20,11 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-import mxframe.custom_ops as co
-import mxframe.join_engine as je
-import mxframe.native_exec as nx
-from mxframe import LazyFrame, col, gpu_budget, sql
-from mxframe.np_arrow import array as A
+import omxcore.custom_ops as co
+import omxcore.join_engine as je
+import omxcore.native_exec as nx
+from omxcore import LazyFrame, col, gpu_budget, sql
+from omxcore.np_arrow import array as A
 
 BITS = {np.float64: ("<Q", "<d"), np.float32: ("<I", "<f")}
 NAN_PAYLOADS = {np.float64: (0x7FF8000000000000, 0xFFF8000000001234, 0x7FF0000000000001),

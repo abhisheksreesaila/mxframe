@@ -1,8 +1,8 @@
 """GPU end-to-end regression test for all 5 grouped aggregations."""
 import numpy as np
 import pyarrow as pa
-from mxframe.lazy_frame import LazyFrame, Scan
-from mxframe.lazy_expr import col
+from omxcore.lazy_frame import LazyFrame, Scan
+from omxcore.lazy_expr import col
 
 # N=8 rows, 2 groups — matches the standalone Mojo test data
 # group 0: values [1,3,5,7]  -> sum=16, min=1, max=7, mean=4, count=4

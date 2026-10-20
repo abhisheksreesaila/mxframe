@@ -4,7 +4,7 @@ import duckdb
 import pyarrow as pa
 import pytest
 
-from mxframe import LazyFrame, col
+from omxcore import LazyFrame, col
 
 NAN = float("nan")
 K = [1, 1, 1, 1, 1, 2, 2, 2, 3, 3]

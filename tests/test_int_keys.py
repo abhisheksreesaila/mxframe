@@ -4,8 +4,8 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-from mxframe import group_keys
-from mxframe.custom_ops import CustomOpsCompiler
+from omxcore import group_keys
+from omxcore.custom_ops import CustomOpsCompiler
 
 pytestmark = pytest.mark.skipif(not group_keys.available(), reason="libmxgroupkeys_cpu.so not built")
 
@@ -50,7 +50,7 @@ def test_encode_int_declines_wide_ranges_small_inputs_and_wide_types():
 
 
 def test_encode_key_uses_it_for_plain_integer_columns_only():
-    from mxframe.arrow_dict import encode_key
+    from omxcore.arrow_dict import encode_key
     a = _rng().integers(0, 1000, N).astype(np.int64)
     got = encode_key(pa.chunked_array([pa.array(a[:1000]), pa.array(a[1000:])]))
     want = pa.array(a).dictionary_encode()
@@ -119,7 +119,7 @@ def test_build_group_ids_is_unchanged_for_integer_keys(keys):
 
 
 def test_distinct_keeps_first_appearance_order():
-    from mxframe import LazyFrame
+    from omxcore import LazyFrame
     r = _rng()
     t = pa.table({"a": r.integers(0, 90_000, N).astype(np.int64), "b": r.integers(0, 30, N).astype(np.int64)})
     got = LazyFrame(t).select("a", "b").distinct().compute(device="cpu")
@@ -132,7 +132,7 @@ def test_distinct_keeps_first_appearance_order():
 
 @pytest.mark.parametrize("damage", ["swap", "out_of_range"])
 def test_dense_sorted_survives_a_bad_radix_permutation(monkeypatch, damage):
-    from mxframe import aot_kernels, sort_check
+    from omxcore import aot_kernels, sort_check
     monkeypatch.setattr(sort_check, "_WARNED", set())
     real = aot_kernels.AOTKernels.sort_indices
 

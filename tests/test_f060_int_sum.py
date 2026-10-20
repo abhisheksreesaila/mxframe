@@ -12,11 +12,11 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-import mxframe as mx
-import mxframe.native_exec as nx
-from mxframe import LazyFrame, col, gpu_stream, lit
-from mxframe.io_parquet import scan_parquet
-from mxframe.np_arrow import array as A
+import omxcore as mx
+import omxcore.native_exec as nx
+from omxcore import LazyFrame, col, gpu_stream, lit
+from omxcore.io_parquet import scan_parquet
+from omxcore.np_arrow import array as A
 
 HAS_GPU = gpu_stream.cuda_available()
 DEVICES = ["cpu", pytest.param("gpu", marks=pytest.mark.skipif(not HAS_GPU, reason="no CUDA GPU")),

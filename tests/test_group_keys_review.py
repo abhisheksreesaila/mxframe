@@ -4,8 +4,8 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-from mxframe import group_keys
-from mxframe.custom_ops import CustomOpsCompiler
+from omxcore import group_keys
+from omxcore.custom_ops import CustomOpsCompiler
 
 needs_lib = pytest.mark.skipif(not group_keys.available(), reason="libmxgroupkeys_cpu.so not built")
 
@@ -87,8 +87,8 @@ def test_dictionary_key_query_matches_duckdb_sf1():
     path = TPCH_DATA / "tpch_sf1" / "lineitem.parquet"
     if not path.exists():
         pytest.skip("TPC-H SF1 data not present")
-    import mxframe as mx
-    from mxframe import LazyFrame, col, lit
+    import omxcore as mx
+    from omxcore import LazyFrame, col, lit
     t = mx.read_parquet_table(path, dictionary="auto",
                               columns=["l_returnflag", "l_linestatus", "l_quantity", "l_extendedprice",
                                        "l_discount", "l_shipdate"])

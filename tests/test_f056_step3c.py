@@ -21,9 +21,9 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-import mxframe as mx
-from mxframe import col, gpu_stream
-from mxframe.io_parquet import scan_parquet
+import omxcore as mx
+from omxcore import col, gpu_stream
+from omxcore.io_parquet import scan_parquet
 
 from test_f056_streamed import close, prov, run, same
 
@@ -160,8 +160,8 @@ def test_an_existing_file_survives_a_failed_sink(big, tmp_path):
 SINK_PEAK = textwrap.dedent("""
     import json, sys
     import pyarrow as pa
-    from mxframe import col
-    from mxframe.io_parquet import scan_parquet
+    from omxcore import col
+    from omxcore.io_parquet import scan_parquet
 
     def status(key):
         with open("/proc/self/status") as f:
@@ -312,7 +312,7 @@ def test_sorting_the_groups_of_a_spilled_aggregate_without_limit(big, tmp_path, 
 
 
 def test_a_sort_leaves_no_spill_files_after_an_error(messy, messy_env, _env, monkeypatch, tmp_path):
-    from mxframe import extsort
+    from omxcore import extsort
     seen = {}
 
     def broken(self, i):
@@ -345,7 +345,7 @@ def test_ties_keep_the_order_of_the_file(messy, messy_env, tmp_path):
 SORT_PEAK = textwrap.dedent("""
     import json, sys
     import pyarrow as pa
-    from mxframe.io_parquet import scan_parquet
+    from omxcore.io_parquet import scan_parquet
 
     path, out = sys.argv[1], sys.argv[2]
     lf = scan_parquet(path).select("id", "f", "i", "v").sort("f", "i", "id", descending=[True, False, False])
@@ -502,8 +502,8 @@ def test_a_sink_of_count_distinct_writes_the_groups(dist, tmp_path):
 CD_PEAK = textwrap.dedent("""
     import json, sys
     import pyarrow as pa
-    import mxframe as mx
-    from mxframe.io_parquet import scan_parquet
+    import omxcore as mx
+    from omxcore.io_parquet import scan_parquet
 
     lf = mx.sql("SELECT g, count(DISTINCT x) AS nd FROM dist GROUP BY g", dist=scan_parquet(sys.argv[1]))
     lf.compute(device="cpu")
@@ -636,8 +636,8 @@ def test_count_distinct_with_sum_and_min_where_both_stages_spill_equals_duckdb_i
 SLICE_PEAK = textwrap.dedent("""
     import json, sys
     import pyarrow as pa
-    from mxframe import col
-    from mxframe.io_parquet import scan_parquet
+    from omxcore import col
+    from omxcore.io_parquet import scan_parquet
 
     lf = scan_parquet(sys.argv[1]).filter(col("id") % 100000 == 3).select("id", "v")
     lf.compute(device="cpu")
@@ -690,7 +690,7 @@ def test_threads_sinking_to_one_path_leave_one_complete_file(big, tmp_path):
 
 
 def test_a_write_that_fails_midway_keeps_the_old_file_and_leaves_no_partial(big, tmp_path, monkeypatch):
-    from mxframe import streamed
+    from omxcore import streamed
     out = str(tmp_path / "keep.parquet")
     pq.write_table(pa.table({"a": [1]}), out)
     real, calls = streamed.ParquetOut._write, []

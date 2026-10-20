@@ -5,7 +5,9 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mxframe"
 version = "0.6.0"
-description = "GPU-accelerated DataFrame engine with Python ergonomics and Mojo AOT kernels."
+# F-165: the distribution is still called `mxframe` (the PyPI name is the owner's call). It installs two import names:
+# `omxcore` (the engine) and `mxframe` (a forwarding module, compat/mxframe/, kept for one release).
+description = "omxcore: a compute engine (CPU and GPU) with persistence to open Parquet files. Python package with Mojo AOT kernels."
 readme = "README.md"
 requires-python = ">=3.12"
 license = "Apache-2.0"
@@ -20,7 +22,6 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Information Analysis",
-    "Topic :: Database",
 ]
 
 dependencies = [
@@ -47,19 +48,19 @@ dev     = [
 ]
 
 [project.urls]
-Homepage   = "https://github.com/abhisheksreesaila/mxframe"
-Repository = "https://github.com/abhisheksreesaila/mxframe"
+Homepage   = "https://github.com/abhisheksreesaila/omxcore"
+Repository = "https://github.com/abhisheksreesaila/omxcore"
 
 [tool.setuptools]
 # Declare the root package explicitly so setuptools does not treat docs/, scripts/
-# and llm-ctx/ as implicit namespace packages.
-package-dir = { "mxframe" = "." }
-packages = ["mxframe", "mxframe.kernels_aot"]
+# and llm-ctx/ as implicit namespace packages. The repo root is `omxcore`; `mxframe` is the forwarding module.
+package-dir = { "omxcore" = ".", "mxframe" = "compat/mxframe" }
+packages = ["omxcore", "omxcore.kernels_aot", "mxframe"]
 
 [tool.setuptools.package-data]
 # Ship the pre-compiled AOT .so files and the Mojo package.
-"mxframe" = [
+"omxcore" = [
     "kernels.mojoc",
 ]
-"mxframe.kernels_aot" = ["*.so"]
+"omxcore.kernels_aot" = ["*.so"]
 

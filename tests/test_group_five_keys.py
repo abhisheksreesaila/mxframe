@@ -5,7 +5,7 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-from mxframe import LazyFrame, col
+from omxcore import LazyFrame, col
 
 
 def _table(n_keys, groups=57, rows_per_group=7):

@@ -1,8 +1,8 @@
 """Test GPU kernels with shared memory privatization."""
 import pyarrow as pa
-from mxframe.lazy_expr import col
-from mxframe.lazy_frame import LazyFrame, Scan
-from mxframe.custom_ops import clear_cache
+from omxcore.lazy_expr import col
+from omxcore.lazy_frame import LazyFrame, Scan
+from omxcore.custom_ops import clear_cache
 
 clear_cache()
 

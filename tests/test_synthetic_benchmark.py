@@ -1,5 +1,5 @@
 """The synthetic-data benchmark (`benchmark_tpch.py main()`, `benchmark_all_22.py`, ...) still runs:
-every query's mxframe (cpu) and pandas version accepts the tables its `make_tpch_qN_tables`
+every query's omxcore (cpu) and pandas version accepts the tables its `make_tpch_qN_tables`
 produces and returns the same number of rows.  Row counts only; answers are checked against
 DuckDB on real TPC-H data in test_tpch_duckdb.py."""
 import sys

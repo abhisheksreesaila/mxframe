@@ -3,8 +3,8 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-import mxframe.auto_mode as am
-from mxframe import LazyFrame, col, lit
+import omxcore.auto_mode as am
+from omxcore import LazyFrame, col, lit
 
 
 class Calib:
@@ -142,7 +142,7 @@ def test_gpu_failure_falls_back_to_cpu_with_one_warning(monkeypatch):
     want = lf.compute(device="cpu")
     monkeypatch.setattr(am, "choose_device", lambda plan, **kw: am.AutoDecision("gpu", "forced by test", None))
 
-    import mxframe.lazy_frame as lfm
+    import omxcore.lazy_frame as lfm
     real = lfm._run_on_device
 
     def boom(plan, device, **kw):
@@ -232,7 +232,7 @@ def test_global_agg_copies_the_unfiltered_input(monkeypatch):
 
 
 def test_sticky_gpu_error_disables_gpu_for_the_process(monkeypatch):
-    import mxframe.custom_ops as co
+    import omxcore.custom_ops as co
     real = co.CustomOpsCompiler.compile_and_run
 
     def fail_on_gpu(self, plan, **kw):
@@ -242,7 +242,7 @@ def test_sticky_gpu_error_disables_gpu_for_the_process(monkeypatch):
 
     monkeypatch.setattr(co.CustomOpsCompiler, "compile_and_run", fail_on_gpu)
     am.forget_gpu_failures()
-    from mxframe import gpu_stream
+    from omxcore import gpu_stream
     if not gpu_stream.cuda_available():
         pytest.skip("needs a GPU to reach the GPU compiler")
     lf = LazyFrame(table(3000)).groupby("k").agg(col("v").sum().alias("s"))
@@ -294,7 +294,7 @@ def test_gpu_global_agg_is_blocked_while_listed(monkeypatch):
 
 
 def test_small_inputs_skip_calibration_entirely(monkeypatch):
-    import mxframe.calibration as cal
+    import omxcore.calibration as cal
 
     def boom():
         raise AssertionError("calibration loaded for a tiny query")

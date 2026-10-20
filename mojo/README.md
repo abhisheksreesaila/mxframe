@@ -1,11 +1,11 @@
 # The Mojo package (no Python)
 
-MX frame's Python-free API (`docs/mxframe-mojo-api.md`, brief `docs/briefs/mojo-api.md`).
+omxcore's Python-free API (`docs/omxcore-mojo-api.md`, brief `docs/briefs/mojo-api.md`).
 
-- **Source:** the API in `mojo/mxframe/`. The native kernels stay in `kernels_aot/` (the Python path builds its
-  `.so` files from them); `scripts/build_mojo_pkg.sh` copies them into the package as `mxframe/kernels/` with their
+- **Source:** the API in `mojo/omxcore/`. The native kernels stay in `kernels_aot/` (the Python path builds its
+  `.so` files from them); `scripts/build_mojo_pkg.sh` copies them into the package as `omxcore/kernels/` with their
   imports made package-relative. Edit kernels in `kernels_aot/`, never in `build/`.
-- **Build:** `pixi run bash scripts/build_mojo_pkg.sh` -> `build/mxframe.mojoc`. A program uses it with
+- **Build:** `pixi run bash scripts/build_mojo_pkg.sh` -> `build/omxcore.mojoc`. A program uses it with
   `mojo build app.mojo -I build`, plus `-Xlinker -lzstd -Xlinker -lsnappy` (Parquet codecs, C libraries) and their
   `-L` / `-rpath` (the pixi env's `lib/` here).
 - **Tests:** `pixi run mojo-test` builds the package, then builds and runs each `mojo/tests/test_*.mojo` (a `main()`
@@ -21,7 +21,7 @@ the `-I` path (a consumer then fails with "unable to locate module"), and a shar
 
 `sql(catalog, "SELECT ...")` runs a query over one table, a Frame or a Parquet scan registered by name (aggregates, or rows: `SELECT *`,
 expressions, `DISTINCT`, `ORDER BY`, `LIMIT` / `OFFSET`) and returns an owned `Table` plus the planner's notes and EXPLAIN
-(`docs/mxframe-mojo-api.md` section 8). The modules, in the order a query passes them: `sql.mojo` (lexer, parser, syntax tree), `bind.mojo`
+(`docs/omxcore-mojo-api.md` section 8). The modules, in the order a query passes them: `sql.mojo` (lexer, parser, syntax tree), `bind.mojo`
 (Catalog, typed tree, binder), `plan.mojo` (the logical plan: Scan, Filter, Aggregate, Project, Sort, Limit), `planner.mojo` (`Planner` trait,
 `RulePlanner`, `Stats`, `PlannerOptions`; the group strategy and the sink), `sqlprog.mojo` (the kernel program in SQL's mode), then the
 executor: `exec.mojo` (Sources: table, frame mask + delta, scan row groups; shared helpers), `sqlexec.mojo` (the aggregate Sinks: dense,
@@ -37,18 +37,18 @@ deliver, the queries around the join), `jfront.mojo` (the fused front stage for 
 `kernels_aot/hashjoin_cpu.mojo` (int64 pointers in, rows out; `libmxhashjoin_cpu.so` is its C ABI for the Python engine). Tests: `mojo/tests/test_hashjoin.mojo` (kernel against a
 brute-force loop), `test_join_api.mojo` (`Query.join`), `tests/test_mojo_join.py` (SQL against DuckDB: fused vs materialized, the build side, every key rule), `tests/test_hashjoin_lib.py`, `tests/test_mojo_outer_joins.py` (LEFT / SEMI / ANTI / subqueries against DuckDB), `mojo/tests/test_frame_merge.mojo` (edited Frames against their baked tables).
 F-155: three or more tables: the planner (`planner.mojo`: `JoinStats`, `JoinPlan`, `rule_join_order`, `Planner.join_order`), the join graph in the binder, the multi-way driver and the star in `sqlexec.mojo`, the star's front stage in `jfront.mojo`; tests `tests/test_mojo_multiway.py` (TPC-H Q3 / Q5 / Q7 / Q8 / Q9 / Q10 / Q19 shapes on dbgen SF 0.1 against DuckDB, every join order) and `mojo/tests/test_multiway.mojo`.
-Rules and paths: `docs/mxframe-mojo-api.md` section 8b.
+Rules and paths: `docs/omxcore-mojo-api.md` section 8b.
 
 ## FLOAT64 (F-157)
 
 `FLOAT` is a full column kind (float64 bits in the Int64 slot): Parquet DOUBLE / FLOAT, CSV exponents, the builder (`lit_float`, `Query.threads`,
-`QueryResult.floats`), SQL, Frames. The rules (NaN order, -0.0, the reproducible sum, the 32-bit column) are in `docs/mxframe-mojo-api.md`.
+`QueryResult.floats`), SQL, Frames. The rules (NaN order, -0.0, the reproducible sum, the 32-bit column) are in `docs/omxcore-mojo-api.md`.
 `mojo/tools/float_probe.mojo` runs builder plans for `tests/test_mojo_float_builder.py`; `mojo/tests/test_float.mojo` is the pure-Mojo test.
 `strtod` (libSystem) parses the digits a fast path cannot: `check_mac_link.sh` lists it for the app's stub.
 
 ## SQL expressions (F-156)
 
-CASE, COALESCE / NULLIF, IS DISTINCT FROM, CAST, LIKE, text functions, dates and intervals, IN lists of any length (rules and the table of what is supported: `docs/mxframe-mojo-api.md`,
+CASE, COALESCE / NULLIF, IS DISTINCT FROM, CAST, LIKE, text functions, dates and intervals, IN lists of any length (rules and the table of what is supported: `docs/omxcore-mojo-api.md`,
 "Expressions"). The parser (`sql.mojo`) and binder (`bind.mojo`, a marked section: types shared by the branches, derived TEXT dictionaries, the date and interval rules) make typed nodes;
 `sqlprog.mojo` emits them: a text function is evaluated **once per distinct dictionary word** (`DictAccess` holds the query's derived dictionaries in a shared `DerivedStore`; the kernel
 looks codes up with `OP_TAB`, predicates use `OP_IN_SET`), dates are integer civil-date arithmetic in the integer opcodes, a long `IN` is the kernel's hash set (`OP_ISET`), and a failing CAST sets
@@ -62,7 +62,7 @@ thousands of generated words, against DuckDB's TRY_CAST), `test_mx_exprs.py` (th
 
 `range_aggregate(source, [order,] cols, a, b)` (count / sum / mean / min / max of each column over positions a..b of a row list, exact at each column's scale) and
 `read_block(source, [order,] cols, a, b, values, nulls)` (the window's cells and null flags into the caller's buffers) in `blocks.mojo`; a `SharedTable`, a `Frame` with edits and a `Frame` over a Parquet
-file are all sources (rules, errors and timings: `docs/mxframe-mojo-api.md` section 6b). A column of the window is gathered into a dense buffer and reduced by tight loops, in morsels of 16,384 positions on every
+file are all sources (rules, errors and timings: `docs/omxcore-mojo-api.md` section 6b). A column of the window is gathered into a dense buffer and reduced by tight loops, in morsels of 16,384 positions on every
 core (a Frame over a file gathers on the calling thread through its chunk cache). Tests: `mojo/tests/test_blocks.mojo` (against the per-cell loop: tables, edited frames, scans with odd row groups, bounds, timings),
 `tests/test_mojo_range.py` (against DuckDB through `mojo/tools/range_probe.mojo`; the FLOAT sum's bits equal with one thread and many), `mojo/tools/range_bench.mojo` (the cost of edits). No app concept is in the module:
 it takes row numbers and a half-open range.
@@ -70,7 +70,7 @@ it takes row numbers and a half-open range.
 ## `mx`, the agent command line (F-151)
 
 `mojo/cli/mx.mojo` is `mx sql | explain | schema` over the SQL above: JSON in, JSON out, exit 1 for a query error and 2 for a usage error
-(`docs/mxframe-mojo-api.md`, "The `mx` command line"). `mojo/mxframe/output.mojo` writes a Table as JSON, JSON lines or CSV (exact decimals,
+(`docs/omxcore-mojo-api.md`, "The `mx` command line"). `mojo/omxcore/output.mojo` writes a Table as JSON, JSON lines or CSV (exact decimals,
 ISO dates). Build: `pixi run bash scripts/build_mx.sh` → `build/mx` (it fails if libpython or Mojo's Python interop is linked). tests/mx_oracle.py
 runs a SQL string through `build/mx` and DuckDB and compares typed values; tests/test_mx.py uses it.
 
@@ -79,7 +79,7 @@ runs a SQL string through `build/mx` and DuckDB and compares typed values; tests
 `compute_job`, `sql_job`, `read_csv_job`, `read_parquet_job`, `save_job` and `write_parquet_job` (`jobs.mojo`) run the plain call on a thread of its own and hand back a `Job[T]` (`job.mojo`): `poll()`, `wait()`,
 `result()`, `cancel()`, `progress()` and an optional completion callback. The work checks for a cancel between row ranges, windows, row groups, blocks and chunks and moves one atomic progress counter per block; a cancelled
 save keeps the old file; dropping a handle cancels and frees. Engine functions take `job: JobCtl = JobCtl()` (a plain call passes none; SQL carries it in `PlannerOptions.job`). The serial build runs a job inside its start call.
-Rules, what is checked where, and the tests: `docs/mxframe-mojo-api.md` section 8c; `mojo/tests/test_job.mojo`, `test_jobs.mojo`.
+Rules, what is checked where, and the tests: `docs/omxcore-mojo-api.md` section 8c; `mojo/tests/test_job.mojo`, `test_jobs.mojo`.
 
 ## Build switches (F-138b): the package on an app with no GPU, thread pool or codecs
 

@@ -1,6 +1,6 @@
 # F-176: how long a 50-row x 40-column block read takes from a Frame with many edited cells (the grid's per-frame cost).
 from std.time import perf_counter_ns
-from mxframe import Table, Frame, INT, DECIMAL, read_block, range_aggregate
+from omxcore import Table, Frame, INT, DECIMAL, read_block, range_aggregate
 
 
 def main() raises:

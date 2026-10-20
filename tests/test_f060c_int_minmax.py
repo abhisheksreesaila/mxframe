@@ -11,12 +11,12 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-import mxframe as mx
-import mxframe.native_exec as nx
-from mxframe import LazyFrame, col, gpu_stream, lit
-from mxframe.custom_ops import CustomOpsCompiler
-from mxframe.io_parquet import scan_parquet
-from mxframe.np_arrow import array as A
+import omxcore as mx
+import omxcore.native_exec as nx
+from omxcore import LazyFrame, col, gpu_stream, lit
+from omxcore.custom_ops import CustomOpsCompiler
+from omxcore.io_parquet import scan_parquet
+from omxcore.np_arrow import array as A
 
 HAS_GPU = gpu_stream.cuda_available()
 I64_MIN, I64_MAX = -(1 << 63), (1 << 63) - 1
@@ -320,7 +320,7 @@ def test_the_early_path_no_longer_reads_the_column_to_find_values_past_2_53(monk
 @pytest.mark.parametrize("fraction", [0.0, 0.3, 0.7, 1.0])
 @pytest.mark.parametrize("grouped", [True, False], ids=["grouped", "global"])
 def test_a_cpu_gpu_split_merges_the_int64_extremes(fraction, grouped):
-    import mxframe.coproc_fused as cf
+    import omxcore.coproc_fused as cf
     cf.clear_residency()
     t = _shape_table(600_000, 37)
 

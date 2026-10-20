@@ -9,10 +9,10 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-import mxframe.native_exec as nx
-from mxframe import LazyFrame, col, lit, when
-from mxframe.np_arrow import array as A
-from mxframe.pipeline_program import compile_pipeline
+import omxcore.native_exec as nx
+from omxcore import LazyFrame, col, lit, when
+from omxcore.np_arrow import array as A
+from omxcore.pipeline_program import compile_pipeline
 
 P52 = 1 << 52
 N = 3000
@@ -107,7 +107,7 @@ def test_small_integers_compile_to_int64_ops_when_the_type_could_overflow(monkey
 def test_the_types_decide_and_no_query_reads_column_data(monkeypatch):
     """int32 + int32, year(), int32 * a small literal and case_when stay float64 ops; int32 * int32 and int64 * int64
     are int64 ops. None of them reads the data (F-037 read it for the last two)."""
-    import mxframe.join_engine as je
+    import omxcore.join_engine as je
     reads = []
     real = je._minmax
     monkeypatch.setattr(je, "_minmax", lambda a: reads.append(len(a)) or real(a))
