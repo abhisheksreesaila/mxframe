@@ -65,6 +65,13 @@ thousands of generated words, against DuckDB's TRY_CAST), `test_mx_exprs.py` (th
 ISO dates). Build: `pixi run bash scripts/build_mx.sh` → `build/mx` (it fails if libpython or Mojo's Python interop is linked). tests/mx_oracle.py
 runs a SQL string through `build/mx` and DuckDB and compares typed values; tests/test_mx.py uses it.
 
+## Background jobs (F-175)
+
+`compute_job`, `sql_job`, `read_csv_job`, `read_parquet_job`, `save_job` and `write_parquet_job` (`jobs.mojo`) run the plain call on a thread of its own and hand back a `Job[T]` (`job.mojo`): `poll()`, `wait()`,
+`result()`, `cancel()`, `progress()` and an optional completion callback. The work checks for a cancel between row ranges, windows, row groups, blocks and chunks and moves one atomic progress counter per block; a cancelled
+save keeps the old file; dropping a handle cancels and frees. Engine functions take `job: JobCtl = JobCtl()` (a plain call passes none; SQL carries it in `PlannerOptions.job`). The serial build runs a job inside its start call.
+Rules, what is checked where, and the tests: `docs/mxframe-mojo-api.md` section 8c; `mojo/tests/test_job.mojo`, `test_jobs.mojo`.
+
 ## Build switches (F-138b): the package on an app with no GPU, thread pool or codecs
 
 Three compile-time switches, read when the app builds (`mojo build ... -D NAME`), not when the package is built. Each

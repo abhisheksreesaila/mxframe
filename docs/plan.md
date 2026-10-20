@@ -1675,8 +1675,9 @@ Owner: "if you want the absolute best performance, we ship Omarchy Linux with th
 
 ## App requests (omxplorer, GitHub issues #6-#18, 2026-10-20): generic engine features; app-only parts stay in the app or a plugin
 
-## F-175 Background queries: a handle, done / callback, cancel, progress [todo] (mxframe #6)
-- [ ] start a query (builder, SQL, scan, frame) off the caller's thread and get a handle: `poll()` / `wait()` / an optional completion callback, `cancel()` (checked between morsels / row groups / blocks, no partial result), `progress()` (rows done of rows, per stage); CSV / Parquet open and save as jobs too; cancelling frees everything (lifetime lint); equal results to the synchronous call
+## F-175 Background queries: a handle, done / callback, cancel, progress [review] (mxframe #6)
+- [x] start a query (builder, SQL, scan, frame) off the caller's thread and get a handle: `poll()` / `wait()` / an optional completion callback, `cancel()` (checked between morsels / row groups / blocks, no partial result), `progress()` (rows done of rows, per stage); CSV / Parquet open and save as jobs too; cancelling frees everything (lifetime lint); equal results to the synchronous call
+- Built: `job.mojo` (the handle, `JobCtl`), `jobs.mojo` (`compute_job`, `sql_job`, `read_csv_job`, `read_parquet_job`, `save_job`, `write_parquet_job`), checks and progress in query / sql / rows / csv / parquet / frame; `docs/mxframe-mojo-api.md` section 8c. Limits: a cancel is seen between ranges / blocks / chunks, so one kernel call over a whole table (hashed groups, a join) runs to its end after `cancel()` has already answered; a float64 sum over a table keeps its one call.
 
 ## F-176 Range aggregates and block reads over a sort order [todo] (mxframe #8, #9)
 - [ ] sum / count / mean / min / max over rows a..b of a permutation (or a row list) for a set of columns, exact at each column's scale, without per-cell calls

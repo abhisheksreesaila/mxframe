@@ -20,15 +20,22 @@ Memory ownership: the job's body (a struct, `JobBody`) owns its inputs; the cont
 counted by hand (`W_REFS`: the handle and the thread). A job holds no address of the caller's memory.
 
 Threads: a raw `pthread_create` thread per job (Linux). The serial build (`MXFRAME_SERIAL`, and every target but Linux,
-`kernels/_fpenv.mojo`) has no threads and no async runtime: the job runs to its end inside `compute_job` and the handle
-comes back done (or failed); `cancel()` then has nothing to stop. The completion callback runs on the job's thread (on the
+`kernels/_fpenv.mojo`) has no async runtime and, by default, no job threads: the job runs to its end inside `compute_job` and the handle
+comes back done (or failed); `cancel()` then has nothing to stop; `-D MXFRAME_JOB_THREADS` gives it threads anyway (see `THREADS`). The completion callback runs on the job's thread (on the
 caller's thread in the serial build) with the final state and the token given at the start; it is skipped when the handle was
 dropped first.
 """
 from std.atomic import Atomic
 from std.ffi import external_call, c_int
 from std.memory.alloc import unsafe_alloc
+from std.sys import is_defined
 from .kernels._fpenv import SERIAL, start_pool
+
+# A job gets a thread of its own on Linux (the default build). The serial build (an Apple target, or -D MXFRAME_SERIAL) runs a job inside its
+# start call, unless the app opts in with -D MXFRAME_JOB_THREADS: the job then gets a pthread whose kernels still run in a loop (no async
+# runtime), at the price of three libSystem calls the app's stub must list: pthread_create, pthread_join, pthread_detach.
+comptime JOB_STACK_BYTES = 16 * 1024 * 1024        # a job thread's stack
+comptime THREADS = (not SERIAL) or is_defined["MXFRAME_JOB_THREADS"]()
 
 comptime JOB_RUNNING = 0
 comptime JOB_DONE = 1
@@ -284,7 +291,7 @@ struct Job[T: Movable & Deinitable](Movable):
 
     def wait(mut self) -> Int:
         """Blocks until the job's thread has ended; returns the state. After `cancel()` it waits for the work to stop at its next check."""
-        comptime if not SERIAL:
+        comptime if THREADS:
             if self.threaded and not self.joined:
                 _ = external_call["pthread_join", c_int](self.tid, Int(0))
                 self.joined = True
@@ -322,7 +329,7 @@ struct Job[T: Movable & Deinitable](Movable):
         _A.store(w + W_ABANDONED, 1)
         var expect = Int64(CANCEL_NONE)
         _ = _A.compare_exchange(w + W_CANCEL, expect, CANCEL_ASKED)
-        comptime if not SERIAL:
+        comptime if THREADS:
             if self.threaded and not self.joined:
                 _ = external_call["pthread_detach", c_int](self.tid)
         _release[Self.T](self.words, self.out)
@@ -344,12 +351,20 @@ def start_job_then[B: JobBody, CB: JobDone](var body: B, var cb: CB) -> Job[B.Ou
     slot.unsafe_write(_Out[B.Out]())
     var task = unsafe_alloc[_Task[B, CB]](1)
     task.unsafe_write(_Task[B, CB](body^, Int(words), Int(slot), cb^))
-    comptime if SERIAL:
+    comptime if not THREADS:
         _run_task[B, CB](task)
         return Job[B.Out](Int(words), Int(slot), 0, False)
     else:
         var tid = Int(0)
-        var rc = external_call["pthread_create", c_int](Pointer(to=tid), Int(0), _entry[B, CB], Int(task))
+        # a stack of our own size: Apple's threads get 512 KB, and the SQL parser and the planner recurse
+        var attr = unsafe_alloc[UInt8](256)
+        for i in range(256):
+            attr[i] = 0
+        _ = external_call["pthread_attr_init", c_int](attr)
+        _ = external_call["pthread_attr_setstacksize", c_int](attr, Int(JOB_STACK_BYTES))
+        var rc = external_call["pthread_create", c_int](Pointer(to=tid), attr, _entry[B, CB], Int(task))
+        _ = external_call["pthread_attr_destroy", c_int](attr)
+        attr.free()
         if rc != 0:                                # no thread to be had: run it here
             _run_task[B, CB](task)
             return Job[B.Out](Int(words), Int(slot), 0, False)

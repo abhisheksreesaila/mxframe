@@ -49,6 +49,15 @@ if [ $# -eq 0 ]; then
     elif (cd "$rundir" && "$out/test_switches" "$out/switches-zstd.parquet" "$out/switches-snappy.parquet") > "$out/test_switches.log" 2>&1; then
       echo "ok   test_switches (no GPU, serial, no codecs)"
     else echo "FAIL test_switches"; tail -20 "$out/test_switches.log"; fail=1; fi
+    # F-175: the same build with job threads (-D MXFRAME_JOB_THREADS): a job on its own pthread whose kernels run in a loop
+    if mojo build --disable-warnings "$sw.mojo" -I "$root/build" -D MXFRAME_NO_GPU -D MXFRAME_SERIAL -D MXFRAME_NO_CODECS -D MXFRAME_JOB_THREADS \
+         -o "$out/test_switches_threads" > "$out/test_switches_threads.build.log" 2>&1; then
+      if nm "$out/test_switches_threads" | grep -E "ZSTD_|snappy_|AsyncRT_Device" > /dev/null; then
+        echo "FAIL test_switches_threads links a codec or GPU symbol"; fail=1
+      elif (cd "$rundir" && "$out/test_switches_threads" "$out/switches-zstd.parquet" "$out/switches-snappy.parquet") > "$out/test_switches_threads.log" 2>&1; then
+        echo "ok   test_switches_threads (serial kernels, jobs on threads)"
+      else echo "FAIL test_switches_threads"; tail -20 "$out/test_switches_threads.log"; fail=1; fi
+    else echo "FAIL (build) test_switches_threads"; tail -20 "$out/test_switches_threads.build.log"; fail=1; fi
   else echo "FAIL (build) test_switches"; tail -20 "$out/test_switches.build.log"; fail=1; fi
 fi
 # The README's Mojo example compiles, runs and prints what the README shows.

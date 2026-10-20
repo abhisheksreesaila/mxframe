@@ -9,8 +9,8 @@
 
 Each takes its inputs by value or copies them (the job owns what it works on): a `Query` is moved in, a `Catalog` and a `Frame`
 are snapshotted when the job starts, so the caller may go on editing the frame or the catalog's sources; a `SharedTable` is
-shared read only. The result of a job is what the plain call returns, value for value. Each also has a `*_then` form taking a
-`JobDone` callback (job.mojo).
+shared read only. The result of a job is what the plain call returns, value for value. Each takes a `JobDone` callback (job.mojo) as its
+last argument, `NoCallback()` by default. Docs: docs/mxframe-mojo-api.md section 8c.
 """
 from .job import Job, JobCtl, JobBody, JobDone, NoCallback, start_job_then
 from .query import Query, QueryResult, AUTO
@@ -137,7 +137,7 @@ struct SaveJob(JobBody):
 
     def run(mut self, ctl: JobCtl) raises -> Int:
         self.frame.save(self.path, self.metadata, self.compression, self.allow_narrowing, ctl)
-        return self.frame.rows()
+        return self.frame.rows() - len(self.frame.removed)               # (`rows()` keeps the numbers of removed rows)
 
 
 def save_job[CB: JobDone = NoCallback](frame: Frame, path: String, metadata: String = "", compression: Int = ZSTD,

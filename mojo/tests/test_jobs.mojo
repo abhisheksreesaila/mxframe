@@ -7,7 +7,7 @@ from mxframe import (Table, SharedTable, Frame, Query, QueryResult, col, lit, su
                      percentile, top_k, INT, DECIMAL, TEXT, FLOAT, write_parquet, read_parquet, scan_parquet, ParquetResult, ZSTD,
                      UNCOMPRESSED, CPU, AUTO, MORSELS_ON, MORSELS_OFF, Job, JOB_RUNNING, JOB_DONE, JOB_FAILED, JOB_CANCELLED,
                      compute_job, sql_job, read_csv_job, read_parquet_job, save_job, write_parquet_job, Catalog, PlannerOptions,
-                     GROUP_HASHED, sql, read_csv, CsvOptions)
+                     GROUP_HASHED, sql, read_csv, CsvOptions, SqlResult, DeviceTable, gpu_available, GPU)
 from std.os import listdir
 from mxframe.kernels._fpenv import SERIAL
 
@@ -257,6 +257,75 @@ def test_cancel_storm() raises:
         expect(cancelled > 20, "the cancels reached running jobs (" + String(cancelled) + ")")
 
 
+def test_cancel_under_load() raises:
+    """Eight jobs of every kind at once, a random half cancelled at random moments: the survivors answer exactly, the cancelled have no
+    result, and the memory after many rounds is the memory before."""
+    var t = big_table(3_000_000)
+    var path = DIR + "load.parquet"
+    write_parquet(path, t, "", UNCOMPRESSED, 250_000)
+    var cat = Catalog()
+    cat.add_table("t", t)
+    cat.add_scan("s", scan_parquet(path))
+    var want_q = agg_query(t).compute(CPU)
+    var want_s = scan_queries(path, MORSELS_ON, 0).compute(CPU)
+    var sql_text = "SELECT name, count(*), sum(v) FROM s GROUP BY name ORDER BY name"
+    var want_sql = sql(cat, sql_text)
+    var want_rows = sql(cat, "SELECT k, v FROM t WHERE v > 990 ORDER BY v DESC, k LIMIT 50")
+    var rng = Rng(21)
+    var base = 0
+    var survivors = 0
+    for round in range(30):
+        if round == 5:
+            base = rss_kb()
+        var jobs = List[Job[QueryResult]]()
+        var sqls = List[Job[SqlResult]]()
+        var reads = List[Job[ParquetResult]]()
+        for i in range(3):
+            jobs.append(compute_job(agg_query(t) if i % 2 == 0 else scan_queries(path, MORSELS_ON, 0), CPU))
+        sqls.append(sql_job(cat, sql_text))
+        sqls.append(sql_job(cat, "SELECT k, v FROM t WHERE v > 990 ORDER BY v DESC, k LIMIT 50"))
+        reads.append(read_parquet_job(path))
+        pause(rng.int(0, 3000))
+        for i in range(len(jobs)):
+            if rng.int(0, 1) == 1:
+                jobs[i].cancel()
+        for i in range(len(sqls)):
+            if rng.int(0, 1) == 1:
+                sqls[i].cancel()
+        if rng.int(0, 1) == 1:
+            reads[0].cancel()
+        for i in range(len(jobs)):
+            if jobs[i].wait() == JOB_DONE:
+                survivors += 1
+                var got = jobs[i].result()
+                expect(same_result(got, want_q if i % 2 == 0 else want_s), "a surviving query job answers exactly")
+            else:
+                expect(jobs[i].wait() == JOB_CANCELLED, "a job ends done or cancelled")
+        for i in range(len(sqls)):
+            if sqls[i].wait() == JOB_DONE:
+                survivors += 1
+                expect(same_table(sqls[i].result().table, (want_sql if i == 0 else want_rows).table), "a surviving sql job answers exactly")
+        if reads[0].wait() == JOB_DONE:
+            survivors += 1
+            expect(reads[0].result().table.rows() == 3_000_000, "a surviving read has every row")
+        else:
+            expect(reads[0].wait() == JOB_CANCELLED, "a read ends done or cancelled")
+    var grown = rss_kb() - base
+    print("cancel under load: 30 rounds of 6 jobs,", survivors, "survived, memory grew", grown, "KB after round 5")
+    expect(grown < 120_000, "memory grew " + String(grown) + " KB")
+
+
+def test_gpu_job() raises:
+    if not gpu_available():
+        return
+    var t = big_table(2_000_000)
+    var d = DeviceTable(t)
+    var plain = Query(t).on_device(d).where(col("v") > -900).group_by(col("k"), groups=7).agg(sum(col("v")), count()).compute(GPU)
+    var job = compute_job(Query(t).on_device(d).where(col("v") > -900).group_by(col("k"), groups=7).agg(sum(col("v")), count()), GPU)
+    _ = watch(job, "gpu")
+    expect(same_result(job.result(), plain), "a job on the GPU gives the plain call's answer")
+
+
 # ── SQL ──────────────────────────────────────────────────────────────────────────────────────────
 
 def sql_catalog(t: SharedTable, path: String) raises -> Catalog:
@@ -419,7 +488,7 @@ def test_save_equals_plain() raises:
     f.save(DIR + "plain.parquet", "{\"a\": 1}", UNCOMPRESSED)
     var job = save_job(f, DIR + "job.parquet", "{\"a\": 1}", UNCOMPRESSED)
     _ = watch(job, "save")
-    expect(job.result() == f.rows(), "the job's result is the rows written")
+    expect(job.result() == f.rows() - 1, "the job's result is the rows written (one row was removed)")
     expect(same_bytes(file_bytes(DIR + "plain.parquet"), file_bytes(DIR + "job.parquet")), "the saved file is the plain save's, byte for byte")
     # a frame over a file
     var path = DIR + "src.parquet"
@@ -432,7 +501,7 @@ def test_save_equals_plain() raises:
     var j2 = save_job(sf, DIR + "job2.parquet", "", UNCOMPRESSED)
     _ = watch(j2, "save over a file")
     var written = j2.result()
-    expect(written == sf.rows(), "rows written " + String(written) + " == " + String(sf.rows()))
+    expect(written == sf.rows() - 1 and written == read_parquet(DIR + "job2.parquet").table.rows(), "rows written " + String(written) + " are the saved file's rows")
     var p = j2.progress()
     expect(p.done == p.total and p.total >= 600_000, "progress ends at its total: " + String(p.done) + "/" + String(p.total))
     expect(same_bytes(file_bytes(DIR + "plain2.parquet"), file_bytes(DIR + "job2.parquet")), "a frame over a file: the plain save's bytes")
@@ -545,6 +614,8 @@ def main() raises:
     test_holistic_equals_plain()
     test_scan_equals_plain()
     test_cancel_storm()
+    test_cancel_under_load()
+    test_gpu_job()
     test_sql_equals_plain()
     test_csv_job()
     test_parquet_read_job()
