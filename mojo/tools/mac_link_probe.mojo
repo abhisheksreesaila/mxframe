@@ -6,7 +6,7 @@ from std.ffi import c_int
 from mxframe import (Table, SharedTable, Frame, INT, DECIMAL, TEXT, Query, col, sum, count, CPU, GPU, AUTO,
                      DeviceTable, gpu_available, read_csv, write_parquet, read_parquet, scan_parquet, UNCOMPRESSED, ZSTD,
                      count_distinct, median, percentile, top_k, Catalog, PlannerOptions, GROUP_HASHED, sql, range_aggregate, read_block,
-                     compute_job, sql_job, read_csv_job, read_parquet_job, save_job, write_parquet_job, JOB_DONE)
+                     compute_job, sql_job, read_csv_job, read_parquet_job, save_job, write_parquet_job, permutation_job, JOB_DONE)
 
 
 def run() raises:
@@ -86,6 +86,8 @@ def run() raises:
     var j4 = read_parquet_job("probe.parquet")
     var j5 = save_job(sf, "probe-job.parquet", "{}", ZSTD)
     var j6 = write_parquet_job(shared, "probe-job2.parquet", "{}", UNCOMPRESSED)
+    var j7 = permutation_job(sf, 0)
+    print(j7.wait(), j7.result().__len__())
     print(j1.wait() == JOB_DONE, j2.wait(), j3.wait(), j4.wait(), j5.wait(), j6.wait())
     print(j1.result().counts[0], j2.result().table.rows(), j3.result().rows, j4.result().table.rows(), j5.result(), j6.result(), j1.progress().stage)
 

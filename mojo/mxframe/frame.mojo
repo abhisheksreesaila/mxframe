@@ -22,7 +22,7 @@ would hold the file) and `save(path)` streams the edited file out, a row group a
 """
 from std.collections import Dict, Set
 from std.memory import ArcPointer
-from .job import JobCtl, STAGE_WRITE      # F-175
+from .job import JobCtl, STAGE_WRITE, STAGE_SORT      # F-175
 from .table import Table, SharedTable, Column, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT
 from .expr import (Expr, Node, col, least, greatest, N_COL, N_LIT, N_LITF, N_DIV, N_I2F, N_ADD, N_SUB, N_MUL, N_FLOORDIV, N_MOD, N_NEG,
                    N_LEAST, N_GREATEST, N_LT, N_LE, N_GT, N_GE, N_EQ, N_NE, N_AND, N_OR, N_NOT, N_BOOL2INT, N_SCALE_TO)
@@ -759,10 +759,13 @@ struct Frame(Movable):
 
     # ── sort ────────────────────────────────────────────────────────────────────────────────────────
 
-    def permutation(self, c: Int, descending: Bool = False) raises -> List[Int]:
+    def permutation(self, c: Int, descending: Bool = False, job: JobCtl = JobCtl()) raises -> List[Int]:
         """The live rows in the column's order, stable (ties keep row order); text alphabetical (ignoring ASCII case, bytes break ties; merges
         applied), nulls last either way. The data never moves. A radix sort over Int64 keys; a column with no edits
-        is read straight from the shared values."""
+        is read straight from the shared values. `job` (F-175, `permutation_job`): a cancel is seen every 1M rows of the key pass and of each
+        radix pass; progress counts the key pass's rows, then the sort's element steps."""
+        job.stage(STAGE_SORT)
+        job.add_total(self.rows())
         var n = self.nbase
         var text = c < self.stored() and self.base.kind(c) == TEXT
         var isfloat = self.kind(c) == FLOAT
@@ -777,6 +780,9 @@ struct Frame(Movable):
         if c >= self.stored():
             var prog = self.program(c)
             for row in range(self.rows()):
+                if row & (JOB_SORT_STEP - 1) == 0:
+                    job.check()
+                    job.advance(min(JOB_SORT_STEP, self.rows() - row))
                 if self.alive(row):
                     var v = self.evaluate(prog, row)
                     if v[1]:
@@ -811,6 +817,9 @@ struct Frame(Movable):
                 var some_nulls = tbl.null_count(tc) > 0
                 var vals = tbl.values(tc)
                 for row in range(lo, hi):
+                    if row & (JOB_SORT_STEP - 1) == 0:
+                        job.check()
+                        job.advance(min(JOB_SORT_STEP, hi - row))
                     if has_removed and row in self.removed:
                         continue
                     var raw: Int64
@@ -836,7 +845,7 @@ struct Frame(Movable):
                         raw = self.alias(c, raw)
                     keys.append(rank[Int(raw)] if text else float_key(raw) if isfloat else raw)
                     rows.append(row)
-        var out = _radix_order(keys, rows, descending)
+        var out = _radix_order_job(keys, rows, descending, job)
         out.extend(nulls^)
         return out^
 
@@ -1083,6 +1092,17 @@ def _text_less(a: String, b: String) -> Bool:
 
 
 def _radix_order(keys: List[Int64], rows: List[Int], descending: Bool) -> List[Int]:
+    """`_radix_order_job` for a plain call (no job: it cannot raise)."""
+    try:
+        return _radix_order_job(keys, rows, descending, JobCtl())
+    except:
+        return List[Int]()
+
+
+comptime JOB_SORT_STEP = 1 << 20      # F-175: elements a sort handles between two cancel checks (and one progress add)
+
+
+def _radix_order_job(keys: List[Int64], rows: List[Int], descending: Bool, job: JobCtl) raises -> List[Int]:
     """`rows` ordered by `keys` (same length), stable. LSD radix sort, 16 bits a pass, only the passes the keys'
     range needs; descending flips the keys, so equal keys still keep their order."""
     var n = len(keys)
@@ -1090,6 +1110,9 @@ def _radix_order(keys: List[Int64], rows: List[Int], descending: Bool) -> List[I
     var lo = UInt64.MAX
     var hi = UInt64(0)
     for i in range(n):
+        if i & (JOB_SORT_STEP - 1) == 0:
+            job.check()
+            job.advance(min(JOB_SORT_STEP, n - i))
         var k = keys[i].cast[DType.uint64]() ^ (UInt64(1) << 63)      # signed order as unsigned order
         if descending:
             k = ~k
@@ -1105,14 +1128,24 @@ def _radix_order(keys: List[Int64], rows: List[Int], descending: Bool) -> List[I
     var i2 = List[Int](length=n, fill=0)
     var counts = List[Int](length=65537, fill=0)
     var shift = 0
+    var passes = 0
+    while passes < 4 and (span >> UInt64(16 * passes)) != 0:
+        passes += 1
+    job.add_total(2 * n * passes)
     while shift < 64 and (span >> UInt64(shift)) != 0:
         for d in range(65537):
             counts[d] = 0
         for i in range(n):
+            if i & (JOB_SORT_STEP - 1) == 0:
+                job.check()
+                job.advance(min(JOB_SORT_STEP, n - i))
             counts[Int((u[i] >> UInt64(shift)) & 0xFFFF) + 1] += 1
         for d in range(65536):
             counts[d + 1] += counts[d]
         for i in range(n):
+            if i & (JOB_SORT_STEP - 1) == 0:
+                job.check()
+                job.advance(min(JOB_SORT_STEP, n - i))
             var d = Int((u[i] >> UInt64(shift)) & 0xFFFF)
             var at = counts[d]
             counts[d] = at + 1

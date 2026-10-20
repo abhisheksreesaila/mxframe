@@ -33,7 +33,7 @@ struct KernelRun(Movable):
     var ctl_const: Int                   # the constant that holds its address
     var repro: Bool
 
-    def __init__(out self, p: Program, set_bytes: List[UInt8], set_meta: List[Int64], t: SharedTable, mask_addr: Int, groups: Int = 1):
+    def __init__(out self, p: Program, set_bytes: List[UInt8], set_meta: List[Int64], t: SharedTable, mask_addr: Int, groups: Int = 1, row0: Int = 0, rows: Int = -1):
         self.code = List[Int32]()
         var header: List[Int] = [MAGIC, p.n_regs, 0, len(p.pred) // 5, len(p.body) // 5, len(p.aggs) // 5,
                                  p.pred_reg, len(p.cols), 0, 0, 0, 0, 0, 0, 0, 0]
@@ -56,7 +56,7 @@ struct KernelRun(Movable):
         self.set_meta = set_meta.copy()
         if len(self.set_meta) == 0:
             self.set_meta = [0, 0, 0]
-        self.tbl = _table_addresses(t, p, mask_addr)
+        self.tbl = _table_addresses(t, p, mask_addr, row0, rows)
         self.dtypes = p.dtypes.copy()
         if len(self.dtypes) == 0:
             self.dtypes.append(1)

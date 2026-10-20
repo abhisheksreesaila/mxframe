@@ -171,3 +171,24 @@ def write_parquet_job[CB: JobDone = NoCallback](table: SharedTable, path: String
                                                 row_group_rows: Int = DEFAULT_ROW_GROUP, var done: CB = NoCallback()) -> Job[Int]:
     """`write_parquet(path, table, ...)` on a thread of its own; a cancel leaves the old file; the result is the rows written."""
     return start_job_then(WriteJob(table, path, metadata, compression, row_group_rows), done^)
+
+
+struct PermutationJob(JobBody):
+    comptime Out = List[Int]
+    var frame: Frame
+    var column: Int
+    var descending: Bool
+
+    def __init__(out self, var frame: Frame, column: Int, descending: Bool):
+        self.frame = frame^
+        self.column = column
+        self.descending = descending
+
+    def run(mut self, ctl: JobCtl) raises -> List[Int]:
+        return self.frame.permutation(self.column, self.descending, ctl)
+
+
+def permutation_job[CB: JobDone = NoCallback](frame: Frame, column: Int, descending: Bool = False, var done: CB = NoCallback()) -> Job[List[Int]]:
+    """`frame.permutation(column, descending)` (a sort) on a thread of its own, over a snapshot of the frame taken now. The cancel checks
+    are inside the key pass and every radix pass (every 1M elements)."""
+    return start_job_then(PermutationJob(frame_snapshot(frame), column, descending), done^)

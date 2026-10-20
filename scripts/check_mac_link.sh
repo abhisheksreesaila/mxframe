@@ -77,7 +77,7 @@ mojo build --disable-warnings "$root/mojo/tools/mac_link_probe.mojo" -I "$root/b
   -o "$out/probe-threads.o" > "$out/probe-threads-build.log" 2>&1 || { tail -30 "$out/probe-threads-build.log"; echo "FAIL (probe build with job threads)"; exit 1; }
 added="$(comm -13 <(echo "$undefined") <(llvm-nm -u -j "$out/probe-threads.o" | grep -v ':$' | sort -u) | tr '\n' ' ')"
 for s in $added; do
-  case " _pthread_create _pthread_join _pthread_detach _pthread_attr_init _pthread_attr_setstacksize _pthread_attr_destroy " in *" $s "*) ;; *) echo "FAIL: job threads add $s"; exit 1 ;; esac
+  case " _pthread_create _pthread_join _pthread_detach _pthread_attr_init _pthread_attr_setstacksize _pthread_attr_destroy _sched_yield " in *" $s "*) ;; *) echo "FAIL: job threads add $s"; exit 1 ;; esac
 done
 echo; echo "with job threads (-D MXFRAME_JOB_THREADS) the app's libSystem stub and ALLOWED also need:"; echo "  $added"
 echo; echo "OK: the package links for $triple with no GPU, Python, async runtime or codec symbol"

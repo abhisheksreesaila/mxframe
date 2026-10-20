@@ -7,7 +7,7 @@ from std.os import getenv
 from mxframe import (Table, SharedTable, Frame, Query, QueryResult, INT, DECIMAL, col, sum, count, CPU, GPU, AUTO, DeviceTable,
                      gpu_available, read_csv, CsvOptions, write_parquet, read_parquet, scan_parquet, min_of, max_of, ZSTD, SNAPPY,
                      count_distinct, median, percentile, top_k, Catalog, PlannerOptions, GROUP_HASHED, GROUP_DENSE, sql,
-                     compute_job, sql_job, read_csv_job, read_parquet_job, save_job, write_parquet_job, JOB_DONE, JOB_FAILED, JOB_CANCELLED)
+                     compute_job, sql_job, read_csv_job, read_parquet_job, save_job, write_parquet_job, permutation_job, JOB_DONE, JOB_FAILED, JOB_CANCELLED)
 from mxframe.job import THREADS
 from mxframe.query import AUTO_GPU_MIN_ROWS
 from mxframe.kernels._fpenv import core_count
@@ -233,6 +233,8 @@ def main() raises:
     expect(jw.wait() == JOB_DONE and jw.result() == n, "write_parquet_job")
     var jrd = read_parquet_job(path + ".job")
     expect(jrd.wait() == JOB_DONE and jrd.result().table.rows() == n, "read_parquet_job")
+    var jperm = permutation_job(sframe, 0)
+    expect(jperm.wait() == JOB_DONE and jperm.result().__len__() == sframe.permutation(0).__len__(), "permutation_job")
     var jv = save_job(sframe, path + ".job-edited", "", ZSTD)
     var vstate = jv.wait()
     var vmsg = String()

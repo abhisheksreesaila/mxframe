@@ -20,20 +20,25 @@ from .sqleval import ValCol
 from .holistic import float_key
 
 
-def _table_addresses(t: SharedTable, p: Program, mask_addr: Int) -> List[Int64]:
+def _table_addresses(t: SharedTable, p: Program, mask_addr: Int, row0: Int = 0, rows: Int = -1) -> List[Int64]:
     """The program's column table: a pointer per program column. A column the table does not have (a join's build-side column, which the
     fused front stage supplies per block) is a placeholder 0."""
-    var tbl: List[Int64] = [0, Int64(t.rows())]
+    var tbl: List[Int64] = [0, Int64(t.rows() if rows < 0 else rows)]
     var n = t.columns()
+    # F-175: rows row0 .. row0 + rows of the table as a table of its own (a multiple of 8, so the bitmaps line up): the kernel's hashed
+    # aggregate has no start row, so a background job's ranges are views, not arguments
+    var vo = Int64(8 * row0)
+    var bo = Int64(row0 // 8)
     for c in p.cols:
         if c >= 0:
-            tbl.append(Int64(Int(t.values(c).unsafe_ptr())) if c < n else Int64(0))
+            tbl.append(Int64(Int(t.values(c).unsafe_ptr())) + vo if c < n else Int64(0))
         elif c == -1_000_000 or c == -5_000_000:
             tbl.append(0)
         elif c == -4_000_000:
-            tbl.append(Int64(mask_addr))
+            tbl.append(Int64(mask_addr) + (bo if mask_addr != 0 else 0))
         else:
-            tbl.append(Int64(t._table[].cols[-1 - c].validity_address()) if -1 - c < n else Int64(0))
+            var va = Int64(t._table[].cols[-1 - c].validity_address()) if -1 - c < n else Int64(0)
+            tbl.append(va + (bo if va != 0 else 0))
     return tbl^
 
 
