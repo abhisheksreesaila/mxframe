@@ -1593,6 +1593,7 @@ Needs: F-155 · Size: L
 - [ ] Frames on either side: mask + delta rows on the probe side; edits, appends, removes, merges and formulas on the build side
 - [ ] hashed GROUP BY over a scan: per-morsel partials merged across row groups (exact int64 sums)
 - [ ] equal to read_parquet + bake() and DuckDB; peak memory one build side + one row group per worker (measured)
+- Paused 2026-10-20 (owner: finish background jobs first). WIP on branch `worktree-agent-a27f985ecf9ff3560` at 4a9c93f, NOT mergeable: the Mojo compiler segfaults building `mx` after the streamed star probe (last good 5c2b4ab: join / outer / multiway suites green). Done there: 1M-group GROUP BY over a scan 1.85 s -> 0.56 s (256-way partitioned hashed merge; planner hashes big dense domains on scans); a scan or Frame streamed as a join's probe side (inner / left / semi / anti), peak 85 MB vs 387 MB in memory. Left: the compiler crash (bisect), tests vs read_parquet + bake() and DuckDB, build-side budget test, formulas on a Frame build side, row queries over a streamed probe, JobCtl in multi-way loops, timings and docs
 
 ## F-159 M8: CTEs, derived tables and subqueries [todo]
 Needs: F-155, F-156 · Size: L
