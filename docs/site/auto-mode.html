@@ -47,11 +47,11 @@ main, .grid > *, .card, .card-b { min-width: 0; }
 <div class="shell">
 <nav class="side"></nav>
 <main>
-  <div class="read"><b>What you're looking at</b>How <code>compute(device="auto")</code> picks the CPU, the GPU, or both, and what it has measured. <b style="margin-top:8px">How to read it</b>Part 1 replays the planner's rules in order. Change the inputs (query shape, size, GPU state, the gap between your queries) and watch which rule stops the search; every threshold in it is read from the code. Part 2 plots the benchmark files it came from, loaded in your browser. Part 3 lists what <code>auto</code> does not do yet.</div>
 
-  <span class="kick">// device="auto" · omxcore 0.6.0</span>
+  <span class="kick">device="auto" · omxcore 0.6.0</span>
   <h1>How <code style="font-size:.8em">device="auto"</code> decides</h1>
   <p>With a CPU and a GPU, <code>compute(device="auto")</code> chooses a device for the <b>whole query</b> from costs it has measured on your machine. It does not stream every query's rows to both devices: on this hardware the link from host memory to the GPU is slower than the CPU cores reading the data in place. Instead it runs the first scan of a table on the CPU, copies that table's columns to the GPU in the background, and once they are there, splits an aggregate's rows between the two.</p>
+  <div class="read"><b>What you're looking at</b>How <code>compute(device="auto")</code> picks the CPU, the GPU, or both, and what it has measured. <b style="margin-top:8px">How to read it</b>Part 1 replays the planner's rules in order. Change the inputs (query shape, size, GPU state, the gap between your queries) and watch which rule stops the search; every threshold in it is read from the code. Part 2 plots the benchmark files it came from, loaded in your browser. Part 3 lists what <code>auto</code> does not do yet.</div>
 
   <h2>1 · The decision, rule by rule</h2>
   <div class="card">

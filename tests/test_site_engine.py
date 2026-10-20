@@ -97,20 +97,17 @@ def test_svgs_render_on_github(name):
 
 def test_page_is_in_the_nav_and_reads_the_one_data_file():
     js = (ROOT / "docs" / "site" / "site.js").read_text()
-    assert '["engine.html", "The Mojo engine"]' in js
+    assert '["engine.html", "Engine"]' in js
     html = PAGE.read_text()
     assert '"bench/engine-informal.json"' in html
     assert "prefers-reduced-motion" in html
 
 
-def test_readme_shows_the_engine_art_and_links_the_page():
+def test_readme_links_the_engine_page():
+    """The README is a short front door (2026-10-20): it links the story, the engine page and its long form; the art
+    stays in docs/img for the site and the long-form docs."""
     readme = (ROOT / "README.md").read_text()
-    raw = "https://raw.githubusercontent.com/abhisheksreesaila/omxcore/main/docs/img/"
-    used = re.findall(re.escape(raw) + r"([\w.-]+\.svg)", readme)
-    assert "engine-hero.svg" in used and len(used) >= 2
-    for n in used:
-        assert (IMG / n).is_file(), n
-    assert "engine.html" in readme and "docs/mojo-engine.md" in readme
+    assert "engine.html" in readme and "docs/mojo-engine.md" in readme and "story.html" in readme
 
 
 BRIEF = (ROOT / "docs" / "briefs" / "positioning.md").read_text()
@@ -142,5 +139,3 @@ def test_agent_features_are_not_shown_as_done():
 def test_readme_names_omxcore_and_shows_the_roadmap():
     readme = (ROOT / "README.md").read_text()
     assert "omxcore" in readme and "docs/briefs/positioning.md" in readme
-    for n in ("engine-roadmap.svg", "engine-hood.svg", "engine-family.svg"):
-        assert f"docs/img/{n}" in readme, n

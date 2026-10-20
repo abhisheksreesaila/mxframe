@@ -64,7 +64,7 @@ def test_page_exists_and_opens_with_a_read_box():
     text = _page_text()
     assert '<html lang="en" data-theme="light">' in text
     assert 'href="site.css"' in text and 'src="site.js"' in text and '<nav class="side"></nav>' in text
-    assert re.search(r'<main>\s*<div class="read">', text), "the .read box is the first element in <main>"
+    assert text.index("<h1") < text.index('class="read"'), "calm first (2026-10-20): the title, then the how-to-read box"
 
 
 def test_every_bench_file_named_exists():

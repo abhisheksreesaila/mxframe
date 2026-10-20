@@ -87,7 +87,7 @@ def test_page_is_wired_like_the_others(page):
     html = PAGE.read_text()
     assert '<html lang="en" data-theme="light">' in html
     assert 'href="site.css"' in html and 'src="site.js"' in html and '<nav class="side"></nav>' in html
-    assert html.index('class="read"') < html.index("<h1"), "the how-to-read box opens the page"
+    assert html.index("<h1") < html.index('class="read"'), "calm first (2026-10-20): the title, then the how-to-read box"
 
 
 def test_layer_stack_has_the_seven_layers(page):

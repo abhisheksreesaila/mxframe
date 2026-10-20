@@ -51,11 +51,11 @@
 <div class="shell">
 <nav class="side"></nav>
 <main>
-  <div class="read"><b>What you're looking at</b>The path one query takes through the engine, for someone who wants to port it to another stack or add an operator. The numbered stack is clickable: pick a layer and the panel beside it shows what that layer does, its files, what goes in and out, when it says "not me" and which layer answers next, and how to see which one ran. Every file, function and environment variable named on this page exists in the repo, and a test checks that.</div>
 
-  <span class="kick">// behind the scenes · for porting</span>
+  <span class="kick">behind the scenes · for porting</span>
   <h1>How a query runs, layer by layer</h1>
   <p>A query is built lazily in Python and handed down a stack. What happens next depends on the shape of the plan. For an aggregate over a single table (a scan with filters, then group and aggregate), each of layers 04 to 06 either runs the whole plan or declines and lets the next one try: the first to accept it runs all of it. A plan with joins is not one piece: the joins run first, in the join engine (with native filter and gather calls), and the aggregate on top of the joined table then goes down the stack. A plan that is not an aggregate (a filter, sort, limit or distinct on its own) runs in layer 06, which calls the native helpers one operator at a time. Declining is cheap and silent; the answer is the same whichever path produced it.</p>
+  <div class="read"><b>What you're looking at</b>The path one query takes through the engine, for someone who wants to port it to another stack or add an operator. The numbered stack is clickable: pick a layer and the panel beside it shows what that layer does, its files, what goes in and out, when it says "not me" and which layer answers next, and how to see which one ran. Every file, function and environment variable named on this page exists in the repo, and a test checks that.</div>
 
   <h2 id="path">1. The path a query takes</h2>
   <div class="grid stackgrid">

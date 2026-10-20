@@ -1,6 +1,6 @@
 # omxcore API notes
 
-The quick reference is the [API reference tables in the README](../README.md#api-reference). Every example there is run by `tests/test_readme_api.py`. This page covers what the tables leave out: arguments, inspection, SQL limits, devices and the source layout.
+The quick reference is the [API reference tables](reference.md#api-reference). Every example there is run by `tests/test_readme_api.py`. This page covers what the tables leave out: arguments, inspection, SQL limits, devices and the source layout.
 
 ## Building a query
 

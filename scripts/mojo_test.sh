@@ -60,7 +60,7 @@ if [ $# -eq 0 ]; then
     else echo "FAIL (build) test_switches_threads"; tail -20 "$out/test_switches_threads.build.log"; fail=1; fi
   else echo "FAIL (build) test_switches"; tail -20 "$out/test_switches.build.log"; fail=1; fi
 fi
-# The README's Mojo example compiles, runs and prints what the README shows.
+# The Mojo example in docs/reference.md compiles, runs and prints what that page shows.
 if [ $# -eq 0 ]; then
   printf 'region,qty,revenue\nWest,3,12.50\nEast,1,4.00\nWest,5,20.25\nNorth,4,9.99\nEast,7,30.00\n' > "$out/readme-orders.csv"
   want=$'West 3275 2\nEast 3000 1\nNorth 999 1\nnet 14324 edits 2'
@@ -68,6 +68,6 @@ if [ $# -eq 0 ]; then
        -Xlinker -lsnappy -Xlinker -rpath="$lib" -o "$out/readme_example" > "$out/readme_example.build.log" 2>&1 \
      && [ "$("$out/readme_example" "$out/readme-orders.csv")" == "$want" ]; then
     echo "ok   readme_example"
-  else echo "FAIL readme_example (README.md shows its output)"; tail -5 "$out/readme_example.build.log"; fail=1; fi
+  else echo "FAIL readme_example (docs/reference.md shows its output)"; tail -5 "$out/readme_example.build.log"; fail=1; fi
 fi
 exit $fail

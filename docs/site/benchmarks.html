@@ -24,11 +24,11 @@
 <div class="shell">
 <nav class="side"></nav>
 <main>
-  <div class="read"><b>What you're looking at</b>First-run query times for omxcore, DuckDB and Polars on TPC-H, 22 queries, scale factor 1 and 10. Each run is one fresh process per query, the data already loaded, no warm-up: engine time only. Pick a scale factor, a row order and the engines; the totals, the dot plot and the speedup chart follow. In the dot plot, left is faster, and the scale is logarithmic, so one gridline step is ten times. Every number is computed in your browser from the files in <a href="bench/m2s-engine.csv">bench/</a>.</div>
 
-  <span class="kick">// benchmarks · run m2s · v0.6.0</span>
+  <span class="kick">benchmarks · run m2s · v0.6.0</span>
   <h1>TPC-H, query by query</h1>
   <p>Stored rows are the files as the TPC-H generator wrote them. Shuffled rows are the same data in random order, which takes away the order omxcore's sorted-run paths use.</p>
+  <div class="read"><b>What you're looking at</b>First-run query times for omxcore, DuckDB and Polars on TPC-H, 22 queries, scale factor 1 and 10. Each run is one fresh process per query, the data already loaded, no warm-up: engine time only. Pick a scale factor, a row order and the engines; the totals, the dot plot and the speedup chart follow. In the dot plot, left is faster, and the scale is logarithmic, so one gridline step is ten times. Every number is computed in your browser from the files in <a href="bench/m2s-engine.csv">bench/</a>.</div>
 
   <div class="btns" id="controls" role="group" aria-label="Choose a run"></div>
 

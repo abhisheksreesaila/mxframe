@@ -1,5 +1,6 @@
-"""README.md (F-048): every code sample runs as written, every API-table example evaluates against
-real data, and the headline numbers match the release benchmark files."""
+"""README.md and docs/reference.md (F-048; the README became a short front door that points to the story, and its
+API tables, release numbers and install moved to docs/reference.md): every code sample in both runs as written, every
+API-table example evaluates against real data, and the headline numbers match the release benchmark files."""
 import csv
 import re
 from pathlib import Path
@@ -13,11 +14,12 @@ from omxcore import LazyFrame, col, lit, when
 
 ROOT = Path(__file__).resolve().parent.parent
 README = (ROOT / "README.md").read_text()
+REFERENCE = (ROOT / "docs" / "reference.md").read_text()
 
 
 def _section(title):
-    m = re.search(rf"^## [^\n]*{re.escape(title)}[^\n]*\n(.*?)(?=^## |\Z)", README, re.S | re.M)
-    assert m, f"README has no '## {title}' section"
+    m = re.search(rf"^## [^\n]*{re.escape(title)}[^\n]*\n(.*?)(?=^## |\Z)", REFERENCE, re.S | re.M)
+    assert m, f"docs/reference.md has no '## {title}' section"
     return m.group(1)
 
 
@@ -42,11 +44,12 @@ def data(tmp_path, monkeypatch):
 
 
 def test_code_samples_run(data):
-    blocks = re.findall(r"```python\n(.*?)```", README, re.S)
-    assert blocks, "README has no python samples"
-    ns = {}
-    for code in blocks:
-        exec(compile(code, "README.md", "exec"), ns)
+    for name, text in (("README.md", README), ("docs/reference.md", REFERENCE)):
+        blocks = re.findall(r"```python\n(.*?)```", text, re.S)
+        assert blocks, f"{name} has no python samples"
+        ns = {}
+        for code in blocks:
+            exec(compile(code, name, "exec"), ns)
 
 
 def _examples():
@@ -91,8 +94,10 @@ def test_headline_numbers_match_bench_files(label, path, sf):
     assert shown == pytest.approx(want, abs=0.006), (label, shown, want)
 
 
-def test_readme_is_short():
-    assert len(README.splitlines()) <= 140
+def test_readme_is_short_and_points_to_the_story():
+    assert len(README.splitlines()) <= 60
+    assert "story.html" in re.split(r"^## ", README, flags=re.M)[0], "the story link comes before the first section"
+    assert "docs/reference.md" in README
 
 
 def _rows(path, engine, sf):
@@ -142,7 +147,7 @@ def test_api_example_results(data, name):
 def test_quickstart_runs_on_the_native_executor(data):
     """The README's numbers are the native executor's; its quickstart must take that path."""
     from omxcore import native_exec
-    code = re.findall(r"```python\n(.*?)```", README, re.S)[0]
+    code = re.findall(r"```python\n(.*?)```", REFERENCE, re.S)[0]
     ns = {}
     exec(compile(code, "README.md", "exec"), ns)
     assert native_exec.last_path() == "native", native_exec.last_decline()

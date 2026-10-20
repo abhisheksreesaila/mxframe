@@ -40,11 +40,11 @@
 <div class="shell">
 <nav class="side"></nav>
 <main>
-  <div class="read"><b>What you're looking at</b>The story of the CPU engine, one optimization at a time. The chart shows the total time of all 22 TPC-H queries after each milestone, with Polars and DuckDB as flat reference lines (lower is faster). Hover a dot for the milestone, its total and the benchmark file it came from; click it to jump to that optimization's card. Each card says what was slow, what the engine does now, the before and after numbers with where they come from, and whether the win relies on a Mojo feature or is ordinary engineering. Totals are computed in your browser from the CSV files in <a href="https://github.com/abhisheksreesaila/omxcore/tree/main/docs/bench">docs/bench</a>; numbers on the cards are quoted from <a href="https://github.com/abhisheksreesaila/omxcore/blob/main/docs/optimizations.md">docs/optimizations.md</a>.</div>
 
-  <span class="kick">// the optimization story</span>
+  <span class="kick">the optimization story</span>
   <h1>How omxcore got fast</h1>
   <p>The same 22 TPC-H queries, run again after every optimization: each in a fresh Python process, data already in memory, no warm-up, the clock covering only the query and its materialized result, every result checked against DuckDB. The page is also an argument that Mojo is a good language for a data engine, so each card says which Mojo feature it relies on, and says so plainly when the win is ordinary engineering that any language would get.</p>
+  <div class="read"><b>What you're looking at</b>The story of the CPU engine, one optimization at a time. The chart shows the total time of all 22 TPC-H queries after each milestone, with Polars and DuckDB as flat reference lines (lower is faster). Hover a dot for the milestone, its total and the benchmark file it came from; click it to jump to that optimization's card. Each card says what was slow, what the engine does now, the before and after numbers with where they come from, and whether the win relies on a Mojo feature or is ordinary engineering. Totals are computed in your browser from the CSV files in <a href="https://github.com/abhisheksreesaila/omxcore/tree/main/docs/bench">docs/bench</a>; numbers on the cards are quoted from <a href="https://github.com/abhisheksreesaila/omxcore/blob/main/docs/optimizations.md">docs/optimizations.md</a>.</div>
 
   <h2>Progress, milestone by milestone</h2>
   <div class="card">
