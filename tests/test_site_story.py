@@ -1,0 +1,41 @@
+"""The story page (docs/site/story.html): every image ships with the site and is described, the timeline is complete,
+and the claims keep their caveats."""
+import re
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+SITE = ROOT / "docs" / "site"
+PAGE = (SITE / "story.html").read_text()
+
+
+def test_every_image_is_in_the_site_and_has_alt_text():
+    imgs = re.findall(r"<img\b[^>]*>", PAGE)
+    assert len(imgs) >= 1
+    for tag in imgs:
+        src = re.search(r'src="([^"]+)"', tag).group(1)
+        assert (SITE / src).is_file(), src
+        alt = re.search(r'alt="([^"]*)"', tag)
+        assert alt and len(alt.group(1)) > 20, tag
+
+
+def test_the_page_has_its_sections_in_order_calm_to_detailed():
+    order = ['class="hero"', 'id="journey"', 'id="mojo"', 'id="agents"', 'id="unique"', 'id="read"']
+    at = [PAGE.index(k) for k in order]
+    assert at == sorted(at)
+    for when in ["April 2026", "0.5.0", "0.6.0", "October 20"]:
+        assert when in PAGE
+
+
+def test_claims_keep_their_caveats():
+    assert "informal timings" in PAGE and "quiet-machine scoreboard" in PAGE
+    soon = PAGE[PAGE.index("Coming soon"):]
+    assert "MCP server" in soon and "MCP server" not in PAGE[:PAGE.index("Coming soon")].split('id="agents"')[1], \
+        "the engine's MCP server is not built yet: it may only appear under Coming soon"
+    assert "validated on NVIDIA" in PAGE
+    assert "prefers-reduced-motion" in PAGE
+
+
+def test_no_gradients_glass_or_blur_on_chrome():
+    css = PAGE[PAGE.index("<style>"):PAGE.index("</style>")]
+    for banned in ["gradient(", "backdrop-filter", "blur("]:
+        assert banned not in css, banned
