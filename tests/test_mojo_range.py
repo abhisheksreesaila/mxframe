@@ -19,6 +19,7 @@ import datetime
 import fcntl
 import json
 import math
+import os
 import random
 import struct
 import subprocess
@@ -40,17 +41,27 @@ COLS = [("i", "int"), ("d2", "dec2"), ("d4", "dec4"), ("f", "float"), ("fs", "fl
 NAMES = [c for c, _ in COLS]
 
 
-@pytest.fixture(scope="session")
-def probe():
+def _build_probe(name, flags=""):
     BUILD.mkdir(exist_ok=True)
-    out = BUILD / "range_probe"
+    out = BUILD / name
     src = list((ROOT / "mojo/mxframe").glob("*.mojo")) + list((ROOT / "kernels_aot").glob("*.mojo")) + [ROOT / "mojo/tools/range_probe.mojo"]
     with open(BUILD / ".range_probe.lock", "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         if not out.exists() or out.stat().st_mtime < max(p.stat().st_mtime for p in src):
             subprocess.run(["bash", str(ROOT / "scripts/mojo_build.sh"), str(ROOT / "mojo/tools/range_probe.mojo"), str(out)],
-                           check=True, capture_output=True, text=True)
+                           check=True, capture_output=True, text=True, env={**os.environ, "MXFRAME_BUILD_FLAGS": flags})
     return out
+
+
+@pytest.fixture(scope="session")
+def probe():
+    return _build_probe("range_probe")
+
+
+@pytest.fixture(scope="session")
+def probe_serial():
+    """The same program built with `-D MXFRAME_SERIAL`: every task runs on the calling thread (what an Apple build gets)."""
+    return _build_probe("range_probe_serial", "-D MXFRAME_SERIAL")
 
 
 # ── data ─────────────────────────────────────────────────────────────────────────────────────────────
@@ -319,3 +330,16 @@ def test_out_of_range(probe, data):
     cmd = [str(probe), "--mode", "table", "--order", "none", "--a", "10", "--b", "70000", "--cols", "i", str(data["path"])]
     err = json.loads(subprocess.run(cmd, capture_output=True).stdout.decode())["error"]
     assert err == "the range 10..70000 goes past the end: there are 60000 rows"
+
+
+@pytest.mark.parametrize("order", ["none", "fs", "f:desc"])
+@pytest.mark.parametrize("a,b", [(0, 60_000), (7, 59_990), (1_000, 40_000)])
+def test_float_sums_do_not_depend_on_threads(probe, probe_serial, data, order, a, b):
+    """The FLOAT sum is added in morsels from the first position and folded in order: one thread and many give the same bits."""
+    cols = "f,fs,d2,i"
+    outs = []
+    for exe in (probe, probe_serial):
+        cmd = [str(exe), "--mode", "table", "--order", order, "--out", "agg", "--a", str(a), "--b", str(b), "--cols", cols, str(data["path"])]
+        outs.append(json.loads(subprocess.run(cmd, capture_output=True).stdout.decode())["columns"])
+    for x, y in zip(*outs):
+        assert (x["sum"], x["mean"], x["min"], x["max"]) == (y["sum"], y["mean"], y["min"], y["max"]), x["name"]

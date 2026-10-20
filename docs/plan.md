@@ -1678,9 +1678,18 @@ Owner: "if you want the absolute best performance, we ship Omarchy Linux with th
 ## F-175 Background queries: a handle, done / callback, cancel, progress [todo] (mxframe #6)
 - [ ] start a query (builder, SQL, scan, frame) off the caller's thread and get a handle: `poll()` / `wait()` / an optional completion callback, `cancel()` (checked between morsels / row groups / blocks, no partial result), `progress()` (rows done of rows, per stage); CSV / Parquet open and save as jobs too; cancelling frees everything (lifetime lint); equal results to the synchronous call
 
-## F-176 Range aggregates and block reads over a sort order [todo] (mxframe #8, #9)
-- [ ] sum / count / mean / min / max over rows a..b of a permutation (or a row list) for a set of columns, exact at each column's scale, without per-cell calls
-- [ ] read rows a..b (in a permutation) of n columns in one call: typed values and null flags into caller buffers
+## F-176 Range aggregates and block reads over a sort order [review] (mxframe #8, #9)
+- [x] sum / count / mean / min / max over rows a..b of a permutation (or a row list) for a set of columns, exact at each column's scale, without per-cell calls
+- [x] read rows a..b (in a permutation) of n columns in one call: typed values and null flags into caller buffers
+
+Built (2026-10-19, branch worktree-agent-a1d41ba957acddef1): `mojo/mxframe/blocks.mojo` (new, additive; `Frame` and the executor untouched): `range_aggregate(source, [order,] cols, a, b) -> RangeResult` and
+`read_block(source, [order,] cols, a, b, values, nulls)` over a `SharedTable` or a `Frame` (edits, appended and removed rows, merges, or a Frame over a Parquet file through its chunk cache); half-open ranges, an order is any row list (rows may repeat),
+no order means the rows themselves. A column of the window is gathered into a dense buffer and reduced by tight loops in morsels of 16,384 positions on every core (a scan frame on the calling thread, bucketed by row group so each chunk is fetched once);
+INT / DECIMAL sums exact (high and low halves per morsel, only a total outside int64 raises), the mean DuckDB's AVG bit for bit, FLOAT sums in a fixed morsel order (bit-identical with one thread and many), TEXT min / max in the case-insensitive order, nulls skipped,
+NaN / -0.0 as the engine's other aggregates. Errors are plain sentences. Rules, errors and timings: `docs/mxframe-mojo-api.md` section 6b.
+- Tests: `mojo/tests/test_blocks.mojo` (per-cell oracle: table, frame with 300 edits / appends / removes / a merge and again after undo, a 13-row-group scan frame, ranges empty / single / whole / across morsels and row groups, bad ranges and rows, int64 total checks, timings),
+  `tests/test_mojo_range.py` (DuckDB `row_number() OVER (ORDER BY ...)` oracle through `mojo/tools/range_probe.mojo`: 4 sources x 10 orders x 10 ranges, aggregates and blocks; float sums equal between a threaded and an `-D MXFRAME_SERIAL` build), `mojo/tools/range_bench.mojo` (cost of edits). `scripts/check_mac_link.sh` OK (the probe calls both).
+- Not done, on purpose: formula columns raise (`column `m` is a formula`; the work is per-row evaluation and belongs with F-179); the SQL path gives no row numbers, so an app that orders with `ORDER BY` passes the row ids of its own id column; a long range over a Frame with 300,000 edited cells pays ~120 ms to apply them.
 
 ## F-177 More aggregates and keys: stddev / variance, quantile bins, ISO week [todo] (mxframe #10, #11)
 - [ ] `stddev` / `stddev_pop` / `variance` / `var_pop` per group and whole column, as DuckDB (numerically stable, float result); quantile bins (`ntile`-style edges from exact quantiles) as group keys; ISO week and ISO year
