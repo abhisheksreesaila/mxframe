@@ -5,7 +5,7 @@
 from std.ffi import c_int
 from mxframe import (Table, SharedTable, Frame, INT, DECIMAL, TEXT, Query, col, sum, count, CPU, GPU, AUTO,
                      DeviceTable, gpu_available, read_csv, write_parquet, read_parquet, scan_parquet, UNCOMPRESSED, ZSTD,
-                     count_distinct, median, percentile, top_k, Catalog, PlannerOptions, GROUP_HASHED, sql)
+                     count_distinct, median, percentile, top_k, Catalog, PlannerOptions, GROUP_HASHED, sql, range_aggregate, read_block)
 
 
 def run() raises:
@@ -66,6 +66,18 @@ def run() raises:
         var j2 = sql(cat, "SELECT a.k, b.v FROM " + name + " a JOIN t b ON a.v = b.v WHERE a.k = 1 ORDER BY 2 LIMIT 3", nofuse)
         print(j1.table.rows(), j2.table.rows())
     print(Query(shared).join(shared, ["v"], ["v"]).agg(count()).compute(AUTO).counts[0])
+    # F-176: range aggregates and block reads over a table, a frame with edits and a frame over a streamed file
+    var rcols: List[Int] = [0, 1]
+    var rorder = sf.permutation(1)
+    var ra = range_aggregate(shared, rcols, 0, 10)
+    var rb = range_aggregate(f, rcols, 0, 10)
+    var rc = range_aggregate(sf, rorder, rcols, 0, len(rorder))
+    var bvals = List[Int64](length=20, fill=0)
+    var bnulls = List[UInt8](length=20, fill=0)
+    read_block(shared, rcols, 0, 10, bvals, bnulls)
+    read_block(f, rcols, 0, 10, bvals, bnulls)
+    read_block(sf, rorder, rcols, 0, len(rorder), bvals, bnulls)
+    print(ra.columns[1].sum, rb.columns[1].sum, rc.columns[1].sum, bvals[3])
 
 
 @export("mojo_entry")
