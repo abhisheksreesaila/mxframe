@@ -33,7 +33,7 @@ QUERIES = {
     21: ["nation", "supplier", "orders", "lineitem"], 22: ["customer", "orders"],
 }
 # The benchmark harness itself calls pyarrow.compute string kernels (no dictionary kernels
-# exist for match_substring) on the input tables in these queries, before mxframe runs.
+# exist for match_substring) on the input tables in these queries, before omxcore runs.
 HARNESS_RAW_ARROW = {2}
 ALL_TABLES = sorted({t for ts in QUERIES.values() for t in ts})
 
@@ -52,7 +52,7 @@ def plain_tables():
 
 @pytest.fixture(scope="module")
 def dict_tables():
-    import mxframe as mx
+    import omxcore as mx
     return {n: mx.read_parquet_table(SF1 / f"{n}.parquet", dictionary="auto") for n in ALL_TABLES}
 
 
@@ -104,7 +104,7 @@ def test_query_identical_with_dictionary_inputs(q, bm, plain_tables, dict_tables
 
 def _lazy_queries(bm):
     """Q1/Q3/Q6/Q12/Q14 rewritten over lazy sources (the harness versions take pa.Tables)."""
-    from mxframe import col, lit, when
+    from omxcore import col, lit, when
     D = "cpu"
 
     def q1(li):
@@ -157,8 +157,8 @@ def _lazy_queries(bm):
 @pytest.mark.parametrize("q", [1, 3, 6, 12, 14])
 def test_queries_through_scan_parquet(q, bm, plain_tables):
     """Genuinely lazy: column pruning + pushdown, compared with the same query on in-memory tables."""
-    import mxframe as mx
-    from mxframe import LazyFrame
+    import omxcore as mx
+    from omxcore import LazyFrame
     fn, names = _lazy_queries(bm)[q]
     got = fn(*[mx.scan_parquet(str(SF1 / f"{n}.parquet")) for n in names])
     exp = fn(*[LazyFrame(plain_tables[n]) for n in names])

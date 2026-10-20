@@ -11,9 +11,9 @@ def _fresh(code):
 def test_an_in_memory_query_does_not_import_streaming():
     out = _fresh(
         "import sys, pyarrow as pa\n"
-        "from mxframe import LazyFrame, col\n"
+        "from omxcore import LazyFrame, col\n"
         "LazyFrame(pa.table({'a': [1, 2, 2]})).groupby('a').agg(col('a').count().alias('n')).compute(device='cpu')\n"
-        "print('mxframe.streamed' in sys.modules, 'mxframe.spill' in sys.modules)\n")
+        "print('omxcore.streamed' in sys.modules, 'omxcore.spill' in sys.modules)\n")
     assert out == ["False", "False"]
 
 
@@ -24,8 +24,8 @@ def test_a_parquet_query_still_streams(tmp_path):
     out = _fresh(
         "import os, sys\n"
         "os.environ['MXFRAME_HOST_MEM_BUDGET'] = '2K'\n"
-        "import mxframe as mx\n"
-        "from mxframe import col\n"
+        "import omxcore as mx\n"
+        "from omxcore import col\n"
         f"lf = mx.scan_parquet({str(tmp_path / 't.parquet')!r}).groupby().agg(col('a').sum().alias('s'))\n"
         "t = lf.compute(device='cpu')\n"
         "print(t.column('s')[0].as_py(), lf.last_compile_provenance['path'])\n")
@@ -37,14 +37,14 @@ def test_a_cold_auto_query_is_not_priced_but_queues_the_gpu_warmup():
     calibration on its clock (~3 ms); the warm-up for later queries is still queued, after it returns."""
     out = _fresh(
         "import sys, time, numpy as np, pyarrow as pa\n"
-        "from mxframe import LazyFrame, col, auto_mode as am, coproc_fused as cf\n"
+        "from omxcore import LazyFrame, col, auto_mode as am, coproc_fused as cf\n"
         "cf.IDLE_BEFORE_BACKGROUND_S = 0.0\n"
         "seen = []\n"
         "am.start_gpu_warmup_if_any = lambda: seen.append('calibration' in sys.modules)\n"
         "t = pa.table({'k': np.arange(1_000_000) % 7, 'v': np.ones(1_000_000)})\n"
         "lf = LazyFrame(t).groupby('k').agg(col('v').sum().alias('s'))\n"
         "lf.compute(device='auto')\n"
-        "during = 'mxframe.calibration' in sys.modules\n"
+        "during = 'omxcore.calibration' in sys.modules\n"
         "time.sleep(0.3)\n"
         "print(lf.last_compile_provenance['auto_reason'].startswith('gpu not started'), during, len(seen))\n")
     assert out == ["True", "False", "1"]
@@ -52,7 +52,7 @@ def test_a_cold_auto_query_is_not_priced_but_queues_the_gpu_warmup():
 
 def test_the_cold_rates_bound_every_default_native_price():
     """The cold shortcut's per-operator rates must be at least the dearest default native fit of their kind."""
-    from mxframe import auto_mode as am, calibration as cal
+    from omxcore import auto_mode as am, calibration as cal
     fits = cal._DEFAULT_FITS
     dearest = lambda base: max(v[1] for k, v in fits.items() if k.split(":")[0] == base)       # noqa: E731
     r = am.COLD_NATIVE_MS_PER_MROW
@@ -65,7 +65,7 @@ def test_a_dear_plan_is_priced_even_with_a_cold_gpu():
     """Several dear operators over the same rows can cost more than the start-up: those are priced as before."""
     import numpy as np
     import pyarrow as pa
-    from mxframe import LazyFrame, col, auto_mode as am
+    from omxcore import LazyFrame, col, auto_mode as am
     n = 6_000_000
     t = pa.table({"k": np.arange(n) % 1_000_000, "v": np.ones(n)})
     cheap = LazyFrame(t).groupby().agg(col("v").sum().alias("s")).plan
@@ -77,7 +77,7 @@ def test_a_dear_plan_is_priced_even_with_a_cold_gpu():
 def test_no_gpu_stops_queueing_warmups():
     out = _fresh(
         "import numpy as np, pyarrow as pa\n"
-        "from mxframe import LazyFrame, col, auto_mode as am, calibration as cal\n"
+        "from omxcore import LazyFrame, col, auto_mode as am, calibration as cal\n"
         "class C: has_gpu = False\n"
         "cal.get_calibration = lambda: C()\n"
         "t = pa.table({'k': np.arange(1_000_000) % 7, 'v': np.ones(1_000_000)})\n"

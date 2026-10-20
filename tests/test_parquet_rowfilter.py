@@ -8,9 +8,9 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-import mxframe as mx
-from mxframe import col
-from mxframe import io_parquet as iop
+import omxcore as mx
+from omxcore import col
+from omxcore import io_parquet as iop
 
 
 def _table(n=6000, seed=3, with_nulls=False):
@@ -126,12 +126,12 @@ def test_filter_reading_does_not_import_pandas():
     root = Path(__file__).resolve().parent
     code = (f"import sys; sys.path.insert(0, {str(root)!r}); import conftest\n"
             "import tempfile, os, numpy as np, pyarrow as pa, pyarrow.parquet as pq\n"
-            "import mxframe as mx\n"
-            "from mxframe import col\n"
+            "import omxcore as mx\n"
+            "from omxcore import col\n"
             "d = tempfile.mkdtemp(); p = os.path.join(d, 't.parquet')\n"
-            "from mxframe.np_arrow import array as A\n"
+            "from omxcore.np_arrow import array as A\n"
             "pq.write_table(pa.table({'a': A(np.arange(4000, dtype=np.int64)), 'b': A(np.ones(4000, np.float32))}), p, row_group_size=500)\n"
-            "import mxframe.io_parquet as iop; iop.MIN_ROWS_FOR_ROW_FILTER = 0; iop._estimated_pass = lambda *a: 0.0\n"
+            "import omxcore.io_parquet as iop; iop.MIN_ROWS_FOR_ROW_FILTER = 0; iop._estimated_pass = lambda *a: 0.0\n"
             "r = mx.scan_parquet(p).filter(col('a') >= 100).select(col('b')).compute(device='cpu')\n"
             "assert r.num_rows == 3900\n"
             "assert iop._read_file(p, ['b'], [], (('a', 'ge', 100),)).num_rows >= 3900\n"

@@ -14,10 +14,10 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-import mxframe as mx
-from mxframe import gpu_stream
-from mxframe.custom_ops import CustomOpsCompiler
-import mxframe.native_exec as nx
+import omxcore as mx
+from omxcore import gpu_stream
+from omxcore.custom_ops import CustomOpsCompiler
+import omxcore.native_exec as nx
 
 GPU = gpu_stream.cuda_available()
 N = 200_000

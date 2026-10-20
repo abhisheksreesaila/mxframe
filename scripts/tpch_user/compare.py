@@ -91,7 +91,7 @@ def compare_tables(actual: pa.Table, expected: pa.Table, *, rtol: float = 1e-6,
 
 
 def _empty_aggregate(actual: pa.Table, expected: pa.Table):
-    """A one-row aggregate over no rows is NULL in SQL (DuckDB, mxframe) and 0 in pandas / Polars.
+    """A one-row aggregate over no rows is NULL in SQL (DuckDB, omxcore) and 0 in pandas / Polars.
     In a one-row result, `actual` 0 against a NULL reference in a float column is that convention:
     both become 0, and a note says so. Anything else is left for the normal comparison."""
     if actual.num_rows != 1 or expected.num_rows != 1 or actual.num_columns != expected.num_columns:

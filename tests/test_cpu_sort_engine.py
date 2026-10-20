@@ -4,8 +4,8 @@ import pyarrow as pa
 import pytest
 
 import conftest  # noqa: F401
-from mxframe import LazyFrame, col
-from mxframe.lazy_frame import Scan
+from omxcore import LazyFrame, col
+from omxcore.lazy_frame import Scan
 
 
 def _t(n=300_000, seed=0):
@@ -25,7 +25,7 @@ def test_sort_matches_stable_numpy(by, desc):
 
 
 def test_engine_calls_radix_sort(monkeypatch):
-    from mxframe import aot_kernels
+    from omxcore import aot_kernels
     calls = []
     real = aot_kernels.AOTKernels.sort_indices
 
@@ -39,7 +39,7 @@ def test_engine_calls_radix_sort(monkeypatch):
 
 
 def test_bad_radix_result_falls_back_to_argsort(monkeypatch):
-    from mxframe import aot_kernels
+    from omxcore import aot_kernels
     monkeypatch.setattr(aot_kernels.AOTKernels, "sort_indices",
                         lambda self, keys, *a, **k: np.arange(len(keys), dtype=np.int32)[::-1].copy())
     t = _t(100_000)

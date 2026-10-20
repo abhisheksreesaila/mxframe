@@ -1,7 +1,7 @@
 """Placement decisions for device="auto" (cost model over a calibration)."""
 import pytest
 
-from mxframe.auto_mode import GpuWarmup, Placer
+from omxcore.auto_mode import GpuWarmup, Placer
 
 
 class FakeCalib:

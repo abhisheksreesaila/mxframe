@@ -14,11 +14,11 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-import mxframe.custom_ops as co
-import mxframe.join_engine as je
-import mxframe.native_exec as nx
-from mxframe import LazyFrame, col, lit
-from mxframe.np_arrow import array as A
+import omxcore.custom_ops as co
+import omxcore.join_engine as je
+import omxcore.native_exec as nx
+from omxcore import LazyFrame, col, lit
+from omxcore.np_arrow import array as A
 
 pytestmark = pytest.mark.skipif(not nx.available(), reason="libmxexec_cpu.so not built")
 
@@ -230,9 +230,9 @@ def test_null_keys_never_match(seen):
 EXPLODE = """
 import resource, sys
 import numpy as np, pyarrow as pa
-import mxframe.native_exec as nx
-from mxframe import LazyFrame
-from mxframe.np_arrow import array as A
+import omxcore.native_exec as nx
+from omxcore import LazyFrame
+from omxcore.np_arrow import array as A
 n = 70_000                      # one key on both sides: 4.9e9 joined rows
 fact = pa.table({"id": A(np.arange(n, dtype=np.int64)), "k": A(np.zeros(n, np.int64))})
 dim = pa.table({"dk": A(np.zeros(n, np.int64)), "dv": A(np.arange(n, dtype=np.int32))})

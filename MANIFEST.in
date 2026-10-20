@@ -3,9 +3,10 @@ include setup.py
 include README.md
 include CHANGELOG.md
 include docs/vision-and-architecture.md
-# every module of the package (the repo root is the `mxframe` package); a hand-kept list went stale
+# every module of the package (the repo root is the `omxcore` package); a hand-kept list went stale
 include *.py
 include kernels.mojoc
+recursive-include compat *.py
 recursive-include kernels_aot *.py *.so
 prune llm-ctx
 prune scripts

@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import List, Tuple
 
 from .lazy_expr import Expr
-from mxframe.lazy_frame import (
+from omxcore.lazy_frame import (
     join_output_names,
     FILTERING_JOINS,
     LogicalPlan,
@@ -466,7 +466,7 @@ def _expr_columns(expr):
 
 def _output_columns(plan):
     """Ordered list of column names a subtree produces, or None when unknown."""
-    from mxframe.lazy_frame import ParquetScan
+    from omxcore.lazy_frame import ParquetScan
     if isinstance(plan, Scan):
         return list(plan.table.column_names)
     if isinstance(plan, ParquetScan):

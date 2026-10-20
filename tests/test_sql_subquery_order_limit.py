@@ -7,7 +7,7 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-import mxframe as mx
+import omxcore as mx
 
 
 def _t():

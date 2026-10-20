@@ -83,9 +83,9 @@ wheel = next(Path("dist").glob("mxframe-*.whl"))
 with ZipFile(wheel) as archive:
     names = set(archive.namelist())
 required = (
-    "mxframe/kernels.mojoc",
-    "mxframe/kernels_aot/libmxkernels_aot.so",
-    "mxframe/kernels_aot/libmxkernels_aot_gpu.so",
+    "omxcore/kernels.mojoc",
+    "omxcore/kernels_aot/libmxkernels_aot.so",
+    "omxcore/kernels_aot/libmxkernels_aot_gpu.so",
 )
 missing = [suffix for suffix in required if not any(name.endswith(suffix) for name in names)]
 if missing:
@@ -100,9 +100,9 @@ if $TAG_RELEASE; then
         exit 1
     fi
     command -v gh >/dev/null || { echo "gh CLI is required for --tag" >&2; exit 1; }
-    git tag -a "$TAG" -m "MXFrame ${TAG}"
+    git tag -a "$TAG" -m "omxcore ${TAG}"
     git push origin "$TAG"
-    gh release create "$TAG" dist/* --title "MXFrame ${TAG}" \
+    gh release create "$TAG" dist/* --title "omxcore ${TAG}" \
         --notes-file "RELEASE_NOTES_${VERSION}.md"
 fi
 

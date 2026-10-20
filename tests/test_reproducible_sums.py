@@ -11,9 +11,9 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-import mxframe.native_exec as nx
-from mxframe import LazyFrame, col, lit
-from mxframe.np_arrow import array as A
+import omxcore.native_exec as nx
+from omxcore import LazyFrame, col, lit
+from omxcore.np_arrow import array as A
 
 pytestmark = pytest.mark.skipif(not nx.available(), reason="libmxexec_cpu.so not built")
 
@@ -233,7 +233,7 @@ def test_a_cte_joined_to_itself_on_a_float_sum(calls):
     """A CTE used twice in FROM is still computed twice (only a scalar subquery over the outer plan's own
     aggregate shares one result): the two sums are the same bits with `reproducible=True`; in the default
     mode a self-join on the sum can miss rows."""
-    import mxframe as mx
+    import omxcore as mx
     t = _fact(2_000_000, 5_000)
     q = ("WITH a AS (SELECT s, SUM(p * (1.0 - d)) AS tot FROM t GROUP BY s) "
          "SELECT x.s FROM a x JOIN a y ON x.tot = y.tot AND x.s = y.s")
@@ -283,7 +283,7 @@ def test_a_view_compared_with_its_own_maximum_at_200k_groups_in_the_default_mode
 def test_cpu_group_and_masked_sums_of_the_kernel_library():
     """The per-call CPU kernels (the non-native path, GPU-session fallbacks) hand out morsels in a fixed
     order too: 8 workers, 30 runs, identical bits."""
-    from mxframe.aot_kernels import AOTKernels
+    from omxcore.aot_kernels import AOTKernels
     k = AOTKernels()
     r = np.random.default_rng(3)
     n = 6_000_000

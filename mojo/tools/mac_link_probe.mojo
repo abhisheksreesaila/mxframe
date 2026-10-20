@@ -3,7 +3,7 @@
 # linker sees every path an app uses (CSV import, queries on the CPU / AUTO / GPU, a frame's edits, Parquet save
 # and open). `mojo_entry` is the entry point the app's Mac build links with (`-e _mojo_entry`).
 from std.ffi import c_int
-from mxframe import (Table, SharedTable, Frame, INT, DECIMAL, TEXT, Query, col, sum, count, CPU, GPU, AUTO,
+from omxcore import (Table, SharedTable, Frame, INT, DECIMAL, TEXT, Query, col, sum, count, CPU, GPU, AUTO,
                      DeviceTable, gpu_available, read_csv, write_parquet, read_parquet, scan_parquet, UNCOMPRESSED, ZSTD,
                      count_distinct, median, percentile, top_k, Catalog, PlannerOptions, GROUP_HASHED, sql, range_aggregate, read_block,
                      compute_job, sql_job, read_csv_job, read_parquet_job, save_job, write_parquet_job, permutation_job, JOB_DONE)

@@ -29,9 +29,9 @@ MIN_ROWS = 1000
 
 def install():
     """Wrap the native hooks and pyarrow's compute dispatch; returns the shared log."""
-    import conftest  # noqa: F401  (import mxframe from this checkout)
+    import conftest  # noqa: F401  (import omxcore from this checkout)
     import pyarrow._compute as _c
-    import mxframe.native_exec as nx
+    import omxcore.native_exec as nx
     log = {"hooks": [], "arrow": []}
     for name in HOOKS:
         real = getattr(nx, name, None)
@@ -66,8 +66,8 @@ def install():
         note(name, args)
         return real_call(name, args, *rest, **kw)
     _c.call_function = call
-    # `pc.<fn>` (mxframe._lazy_pc) calls Function.call directly: wrap what it hands out
-    from mxframe import _lazy_pc
+    # `pc.<fn>` (omxcore._lazy_pc) calls Function.call directly: wrap what it hands out
+    from omxcore import _lazy_pc
     real_wrapper, real_real = _lazy_pc._wrapper, _lazy_pc._real
 
     def logged(name, f):
@@ -101,7 +101,7 @@ def one_sql(q, sf):
     from tpch_sql import run as R
     from tpch_sql.queries import SQL
     from tpch_user import provenance
-    import mxframe as mx
+    import omxcore as mx
     data = str(Path(os.environ.get("MXFRAME_TPCH_DATA", "/home/abhisheksreesaila/Projects/mxframe/data")) / f"tpch_sf{sf}")
     tables = R.load_tables(SQL[q], data)
     prov = provenance.install()

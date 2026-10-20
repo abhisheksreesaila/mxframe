@@ -1,4 +1,4 @@
-"""SQL frontend for MXFrame: SQL string → LogicalPlan via sqlglot.
+"""SQL frontend for omxcore: SQL string → LogicalPlan via sqlglot.
 
 Supports a large subset of TPC-H-style SQL:
   SELECT / FROM / WHERE / GROUP BY / ORDER BY / LIMIT
@@ -54,7 +54,7 @@ def sql(query: str, **tables) -> LazyFrame:
 
     Example::
 
-        import mxframe as mx
+        import omxcore as mx
         result = mx.sql(
             "SELECT l_returnflag, SUM(l_quantity) AS sum_qty "
             "FROM lineitem WHERE l_shipdate <= 10471 "
@@ -2263,7 +2263,7 @@ class _SQLTranslator:
         return c.like(pattern, escape, ignore)
 
     def _expr(self, node: sge.Expression) -> Expr:
-        """Translate a sqlglot expression to an MXFrame Expr."""
+        """Translate a sqlglot expression to an omxcore Expr."""
         if isinstance(node, sge.Subquery) and _date_of(node) is None:
             return self._scalar_subquery(node)
         if isinstance(node, sge.Exists) or (isinstance(node, sge.In) and node.args.get("query") is not None):

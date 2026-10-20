@@ -11,11 +11,11 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-import mxframe as mx
-import mxframe.native_exec as nx
-from mxframe import LazyFrame, col, gpu_stream, lit
-from mxframe.custom_ops import CustomOpsCompiler
-from mxframe.np_arrow import array as A
+import omxcore as mx
+import omxcore.native_exec as nx
+from omxcore import LazyFrame, col, gpu_stream, lit
+from omxcore.custom_ops import CustomOpsCompiler
+from omxcore.np_arrow import array as A
 
 HAS_GPU = gpu_stream.cuda_available()
 N = 300_000

@@ -18,10 +18,10 @@ PREFIX = "@@RESULT "
 
 
 def shim_dir() -> str:
-    """A dir with `mxframe` -> this checkout, so subprocesses import THIS checkout's code."""
+    """A dir with `omxcore` -> this checkout, so subprocesses import THIS checkout's code."""
     d = Path(tempfile.gettempdir()) / f"mxframe-bench-shim-{hashlib.sha1(str(REPO_ROOT).encode()).hexdigest()[:10]}"
     d.mkdir(exist_ok=True)
-    link = d / "mxframe"
+    link = d / "omxcore"
     if link.is_symlink() and Path(os.readlink(link)) != REPO_ROOT:
         link.unlink()
     if not link.exists():
@@ -119,12 +119,12 @@ def run_one(engine: str, query: int, data_dir: str, result_path: str, timeout: f
 
 
 def check_mxframe_path() -> str:
-    """Import mxframe the way a worker does and return where it came from (must be REPO_ROOT)."""
+    """Import omxcore the way a worker does and return where it came from (must be REPO_ROOT)."""
     r = subprocess.run([sys.executable, "-c",
-                        "import os, mxframe; print(os.path.dirname(os.path.abspath(mxframe.__file__)))"],
+                        "import os, omxcore; print(os.path.dirname(os.path.abspath(omxcore.__file__)))"],
                        capture_output=True, text=True, env=worker_env("-1"), cwd=str(REPO_ROOT), timeout=120)
     if r.returncode != 0:
-        raise RuntimeError(f"cannot import mxframe in a worker: {r.stderr.strip()[-300:]}")
+        raise RuntimeError(f"cannot import omxcore in a worker: {r.stderr.strip()[-300:]}")
     return r.stdout.strip().splitlines()[-1]
 
 

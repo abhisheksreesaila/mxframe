@@ -7,7 +7,7 @@
 #   rows EDGES[i] removed for i % 4 == 1
 # Usage: pq_edge_probe <path> <morsels: 0 off, 1 on, 2 auto> <block rows>
 from std.sys import argv
-from mxframe import Frame, Query, col, sum, count, scan_parquet, AUTO, MORSELS_AUTO, MORSELS_ON, MORSELS_OFF
+from omxcore import Frame, Query, col, sum, count, scan_parquet, AUTO, MORSELS_AUTO, MORSELS_ON, MORSELS_OFF
 
 
 def main() raises:

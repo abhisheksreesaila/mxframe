@@ -4,7 +4,7 @@
 # Usage: gpu_leak_probe <path of a file whose sum overflows> <N>      (tests/test_mojo_parquet.py)
 from std.sys import argv
 from std.time import sleep
-from mxframe import Query, col, sum, scan_parquet, GPU
+from omxcore import Query, col, sum, scan_parquet, GPU
 
 
 def main() raises:

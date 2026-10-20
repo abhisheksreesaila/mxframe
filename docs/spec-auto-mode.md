@@ -1,12 +1,12 @@
-# MXFrame Auto Mode — Research-Backed Spec
+# omxcore Auto Mode — Research-Backed Spec
 
 Sep 26, 2026 · @Abhishek Sreesaila
 
 ## Executive summary
 
-MXFrame will add `device="auto"`: the engine picks CPU, GPU, or both for each query and each operator, instead of the user choosing. The design is built from published database and LLM-inference research, not invented from scratch.
+omxcore will add `device="auto"`: the engine picks CPU, GPU, or both for each query and each operator, instead of the user choosing. The design is built from published database and LLM-inference research, not invented from scratch.
 
-**Why now.** MXFrame's own TPC-H runs show the problem. At 1M–10M rows the CPU path beats Polars on 21/22 and 18/22 queries; the GPU path on only 16/22 and 15/22. Copy and launch overhead often loses at small sizes, so a fixed "GPU mode" leaves speed on the table.
+**Why now.** omxcore's own TPC-H runs show the problem. At 1M–10M rows the CPU path beats Polars on 21/22 and 18/22 queries; the GPU path on only 16/22 and 15/22. Copy and launch overhead often loses at small sizes, so a fixed "GPU mode" leaves speed on the table.
 
 **The design in three layers.**
 
@@ -28,7 +28,7 @@ Two helpers sit around the layers: a **residency tracker** (knows which columns 
 4. **Phase 4 — Out-of-core:** data larger than GPU memory via streaming joins and spill (1.x, after 1.0).
 5. **Phase 5 — 1.0 hardening:** stable API, published cross-vendor benchmarks, `auto` as default.
 
-**What makes MXFrame different.** Every GPU engine we reviewed either picks one device per query, falls back to CPU only on failure, or is NVIDIA-only. MXFrame's Mojo kernels already run on NVIDIA, AMD, and Apple GPUs; adding true CPU+GPU co-processing on top is, to our knowledge, not offered by any open-source dataframe library today.
+**What makes omxcore different.** Every GPU engine we reviewed either picks one device per query, falls back to CPU only on failure, or is NVIDIA-only. omxcore's Mojo kernels already run on NVIDIA, AMD, and Apple GPUs; adding true CPU+GPU co-processing on top is, to our knowledge, not offered by any open-source dataframe library today.
 
 ## Research foundation: what we borrow and from whom
 
@@ -36,7 +36,7 @@ Each idea in auto mode traces to a paper or system below. Rows are grouped by th
 
 ### Database systems
 
-| Paper / system | Venue | What it showed | What MXFrame borrows |
+| Paper / system | Venue | What it showed | What omxcore borrows |
 | --- | --- | --- | --- |
 | [Morsel-Driven Parallelism](https://dl.acm.org/doi/10.1145/2588555.2610507) — Leis, Boncz, Kemper, Neumann (HyPer) | SIGMOD 2014 | Split input into small chunks ("morsels"); workers pull them and run a whole pipeline until the next pipeline breaker. Parallelism is decided at runtime, not baked into the plan. | The scheduler model: CPU threads and GPU workers pull morsels from one queue, so faster workers naturally take more work. |
 | [HetExchange](https://infoscience.epfl.ch/record/262531) — Chrysogelos et al. | PVLDB 12(5), 2019 | Wraps CPU/GPU heterogeneity in special "device-crossing" and "router" operators, so normal operators need no rewrite to run on both devices. | `DeviceCross` and `Router` nodes in the physical plan. |
@@ -50,7 +50,7 @@ Each idea in auto mode traces to a paper or system below. Rows are grouped by th
 
 ### LLM inference systems
 
-| System | Venue | Idea | What MXFrame borrows |
+| System | Venue | Idea | What omxcore borrows |
 | --- | --- | --- | --- |
 | [PowerInfer](https://arxiv.org/abs/2312.12456) — Song et al. | SOSP 2024 | "Hot" neurons live on GPU, "cold" ones computed on CPU, because moving cold data costs more than computing it; CPU and GPU executors pull from one operator queue. | Hot/cold column residency; shared ready-queue with per-device executors. |
 | [FlexGen](https://proceedings.mlr.press/v202/sheng23a/sheng23a.pdf) — Sheng et al. | ICML 2023 | Chooses GPU/CPU/disk placement by solving a small linear program over a cost model; overlaps load, store, and compute. | LP-based sizing for out-of-core plans; copy/compute overlap pattern. |
@@ -59,7 +59,7 @@ Each idea in auto mode traces to a paper or system below. Rows are grouped by th
 
 ### Hardware behaviour
 
-| Study | What it showed | What MXFrame borrows |
+| Study | What it showed | What omxcore borrows |
 | --- | --- | --- |
 | [Data movement on Grace Hopper](https://arxiv.org/abs/2408.11556) | Coherent CPU–GPU memory is fast but not free; placement still matters. | Keep a transfer term in the cost model even on unified-memory machines. |
 
@@ -78,9 +78,9 @@ No engine we reviewed combines all three of: a dataframe API, CPU+GPU working on
 | Theseus (Voltron) | GPU-native, distributed | Moves data while computing | Spills GPU → host → storage | NVIDIA |
 | SQL Server / Fabric (TQP → CoddSpeed) | CPU scans, GPU joins/aggregates | Yes | Streaming + partitioning, per-partition CPU fallback | Research / product-internal |
 | Maximus (ETH) | Per operator | Yes | Format conversion between Arrow and cuDF | NVIDIA |
-| **MXFrame (target)** | **Per operator, cost-based, calibrated** | **Yes (Phase 3)** | **Fragment fallback, then spill (Phase 4)** | **NVIDIA, AMD, Apple** |
+| **omxcore (target)** | **Per operator, cost-based, calibrated** | **Yes (Phase 3)** | **Fragment fallback, then spill (Phase 4)** | **NVIDIA, AMD, Apple** |
 
-**Claim for the README (defensible version).** "To our knowledge, MXFrame is the first open-source dataframe library that plans CPU and GPU work together per operator and runs on NVIDIA, AMD, and Apple GPUs from one kernel source." Keep "to our knowledge": Maximus and CoddSpeed already do CPU+GPU co-processing, just not as a portable dataframe library.
+**Claim for the README (defensible version).** "To our knowledge, omxcore is the first open-source dataframe library that plans CPU and GPU work together per operator and runs on NVIDIA, AMD, and Apple GPUs from one kernel source." Keep "to our knowledge": Maximus and CoddSpeed already do CPU+GPU co-processing, just not as a portable dataframe library.
 
 Not verified against primary sources in this pass: BlazingSQL, Spark RAPIDS, PG-Strom, Kinetica, SQream, BrytlytDB. Check before citing them.
 
@@ -109,12 +109,12 @@ The planner runs on every query and decides where operators may run; the schedul
 
 &#91;embedded content: auto-mode architecture · 3 layers + 2 helpers\]
 
-The logical plan and optimizer already exist in MXFrame (`lazy_frame.py`, `optimizer.py`, `compiler.py`). Auto mode adds everything from the planner down.
+The logical plan and optimizer already exist in omxcore (`lazy_frame.py`, `optimizer.py`, `compiler.py`). Auto mode adds everything from the planner down.
 
 ### 1. Calibration store
 
 - `mx.calibrate()` runs a microbenchmark grid once per machine: host→device and device→host bandwidth (pinned and pageable), kernel launch overhead, and per-row cost of each AOT kernel across row counts 10⁴–10⁸, key cardinalities, and selectivities.
-- Results are saved per `(device name, driver version, MXFrame version)` in a small local file (e.g. `~/.mxframe/calibration.json`).
+- Results are saved per `(device name, driver version, omxcore version)` in a small local file (e.g. `~/.mxframe/calibration.json`).
 - After each run, observed operator times refine the stored constants (simple regression, as in HyPE). Once a shape has enough samples, observed times beat the model.
 - No calibration file yet → use conservative built-in defaults and prefer CPU below a size threshold.
 
@@ -163,7 +163,7 @@ CPU threads take one of two roles from the same queue: **feeders** hand filtered
 `device="cpu"` and `device="gpu"` keep working as before, except that a GPU piece that does not fit the GPU's memory (or runs out of it) now reruns on the CPU with a `RuntimeWarning` instead of raising `MemoryError` (F-056; `strict=True` raises, `explain(include_runtime=True)` shows `gpu_pieces`); `"auto"` is additive. It becomes the default only at 1.0.
 
 ```python
-import mxframe as mx
+import omxcore as mx
 
 # one-time, per machine (also runs lazily on first auto query if missing)
 mx.calibrate()                     # quick (~seconds)
@@ -197,7 +197,7 @@ Aggregate[sum(price) by region]   gpu   est cpu=41ms gpu=6ms   reason: high-card
     Scan[lineitem]                 cpu
 ```
 
-The exact return types and names should follow MXFrame's existing API style; the implementer should check `docs/api.md`.
+The exact return types and names should follow omxcore's existing API style; the implementer should check `docs/api.md`.
 
 ## Phase 1 — Safe auto
 
@@ -209,7 +209,7 @@ The exact return types and names should follow MXFrame's existing API style; the
    - Measure H2D/D2H bandwidth with pinned and pageable host buffers, at sizes 1MB–1GB.
    - Measure empty-kernel launch overhead and MAX Graph cache-hit overhead.
    - For each AOT kernel (group sum/min/max, join build/probe, filter\_gather, unique\_mask, sort), time CPU and GPU at 4–6 row counts; fit `time = α + c·n` per kernel per device.
-   - Persist to JSON keyed by device name, driver, MXFrame version. Version the schema.
+   - Persist to JSON keyed by device name, driver, omxcore version. Version the schema.
 2. **Cost estimator**
    - Walk the physical plan bottom-up, estimate rows per operator from input sizes and simple selectivity defaults (filters 0.3, joins by key uniqueness if known).
    - Compute total CPU-only time and total GPU time (GPU time includes every non-resident input copy and the final result copy back).
@@ -322,7 +322,7 @@ The exact return types and names should follow MXFrame's existing API style; the
 
 ## Roadmap: what 1.0 means, and what comes after
 
-1.0 is a reliability release: anyone can `pip install` MXFrame, run it on NVIDIA, AMD, or Apple hardware (or CPU only), and `device="auto"` puts both CPU and GPU to work without tuning, the way llama.cpp does for models. Scale-up, scale-out, and the analytics layer come after.
+1.0 is a reliability release: anyone can `pip install` omxcore, run it on NVIDIA, AMD, or Apple hardware (or CPU only), and `device="auto"` puts both CPU and GPU to work without tuning, the way llama.cpp does for models. Scale-up, scale-out, and the analytics layer come after.
 
 &#91;embedded content: release roadmap · 4 stages, 1 gate\]
 
@@ -342,8 +342,8 @@ The exact return types and names should follow MXFrame's existing API style; the
 | --- | --- | --- | --- |
 | 1.x | Out-of-core | Phase 4: streaming and partitioned joins, tiered spill to host and NVMe, compressed transfer | Matters most on small-memory GPUs like Colab's |
 | 2.x | Scale up | NUMA-aware queues (one per socket, steal across when idle); feeders pinned to the GPU's socket; multi-GPU with replicated build-side hash tables; then hash-partitioned multi-GPU joins over NVLink / xGMI; topology discovery in calibration | The morsel design was built for multi-socket machines (Leis et al. 2014), so the scheduler extends rather than changes |
-| Later | Scale out | MXFrame as the per-node engine under Spark, Ray, or Dask, the way Velox (via Apache Gluten) and DataFusion (via Comet) plug into Spark | Compete on the node, not on the cluster framework |
-| Later | Analytics layer | GPU "visual aggregation" operators (M4 downsampling, density binning), Arrow IPC to the browser, Flint chart specs compiled to ECharts, AI question → query + chart | Early test: an MXFrame backend for Microsoft's Data Formulator |
+| Later | Scale out | omxcore as the per-node engine under Spark, Ray, or Dask, the way Velox (via Apache Gluten) and DataFusion (via Comet) plug into Spark | Compete on the node, not on the cluster framework |
+| Later | Analytics layer | GPU "visual aggregation" operators (M4 downsampling, density binning), Arrow IPC to the browser, Flint chart specs compiled to ECharts, AI question → query + chart | Early test: an omxcore backend for Microsoft's Data Formulator |
 
 ### Answering "why not just use Spark?"
 
@@ -361,14 +361,14 @@ Renaming is cheap now and expensive after 1.0. PyPI checked live on 2026-09-26:
 | Candidate | Theme | PyPI | Conflict to weigh |
 | --- | --- | --- | --- |
 | RocketFrame (`rocketframe`) | Space, rocket logo | Free | Generic; Rust's Rocket framework shares the word |
-| MachFrame (`machframe`) | Speed | Free | Keeps the "M" of MXFrame |
+| MachFrame (`machframe`) | Speed | Free | Keeps the "M" of omxcore |
 | Pronghorn (`pronghorn`) | Animal | Free | Small unrelated repos use the name |
 | CheetahFrame / CheetahDF | Animal | Free | `cheetah` itself is taken (template engine) |
 | LeopardFrame | Animal | Free | `leopard` taken; Mac OS X Leopard association |
 | CondorFrame | Animal | Free | `condor` taken; HTCondor is a known distributed-computing system |
 | Apogee | Space | Taken | — |
 | Liftoff | Space | Taken | — |
-| MXFrame (keep) | — | Yours | Already published and announced |
+| omxcore (keep) | — | Yours | Already published and announced |
 
 Run a trademark search on the shortlist before choosing.
 
@@ -383,7 +383,7 @@ Every performance claim is reported **cold** (data starts in host memory or Parq
 - H2O db-benchmark group-by and join at low and high key cardinality.
 - Break-even sweep: rows (10⁴–10⁸) × selectivity × key cardinality, per operator, to locate the CPU/GPU crossover on each machine.
 
-**Engines to compare:** pandas, Polars (in-memory and streaming), DuckDB, DataFusion, cudf.pandas, Polars GPU (in-memory and streaming), Sirius, HeavyDB (CPU and GPU modes), and MXFrame in `cpu`, `gpu`, and `auto`.
+**Engines to compare:** pandas, Polars (in-memory and streaming), DuckDB, DataFusion, cudf.pandas, Polars GPU (in-memory and streaming), Sirius, HeavyDB (CPU and GPU modes), and omxcore in `cpu`, `gpu`, and `auto`.
 
 **Hardware:** RTX 3090 (existing, PCIe 4), one PCIe 5 datacenter GPU, one AMD GPU (ROCm), one Apple M-series, and a Grace Hopper (GH200) if rentable.
 
@@ -426,12 +426,12 @@ Every performance claim is reported **cold** (data starts in host memory or Parq
 
 ## README snippet and references
 
-Paste-ready section for the MXFrame README:
+Paste-ready section for the omxcore README:
 
 ```markdown
 ## Coming next: `device="auto"`
 
-MXFrame already runs the same Mojo kernels on CPU and on NVIDIA, AMD, and Apple GPUs.
+omxcore already runs the same Mojo kernels on CPU and on NVIDIA, AMD, and Apple GPUs.
 Auto mode lets the engine decide per query, and eventually per operator, where work runs,
 and later run CPU and GPU on the same query at once.
 
@@ -468,4 +468,4 @@ CPU+GPU co-processing → out-of-core → 1.0 with `auto` as default.
 12. [MPK: A Compiler and Runtime for Mega-Kernelizing Tensor Programs](https://arxiv.org/abs/2512.22219). arXiv 2025.
 13. [Understanding Data Movement in Tightly Coupled Heterogeneous Systems: Grace Hopper](https://arxiv.org/abs/2408.11556). arXiv 2024.
 14. [llama.cpp: automation for GPU layers, tensor split, and overrides](https://github.com/ggml-org/llama.cpp/discussions/18049). GitHub discussion.
-15. [MXFrame on the Modular forum](https://forum.modular.com/t/mxframe-cross-vendor-gpu-dataframes-with-mojo-aot-kernels/3358) and [MXFrame API docs](https://github.com/abhisheksreesaila/mxframe/blob/main/docs/api.md) — current architecture and benchmark figures.
+15. [omxcore on the Modular forum](https://forum.modular.com/t/mxframe-cross-vendor-gpu-dataframes-with-mojo-aot-kernels/3358) and [omxcore API docs](https://github.com/abhisheksreesaila/omxcore/blob/main/docs/api.md) — current architecture and benchmark figures.

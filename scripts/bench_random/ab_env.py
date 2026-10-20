@@ -1,4 +1,4 @@
-"""A/B one environment switch on the random queries of one shape, MXFrame only, alternating runs.
+"""A/B one environment switch on the random queries of one shape, omxcore only, alternating runs.
 
     pixi run python scripts/bench_random/ab_env.py --shape select_distinct --env MXFRAME_DISTINCT_GROUPBY \
         --sf 1 --n 100 --reps 3

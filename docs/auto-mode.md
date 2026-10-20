@@ -1,11 +1,11 @@
 # How `device="auto"` works
 
-MXFrame can run a query on the CPU, on the GPU, or on both at once. With
+omxcore can run a query on the CPU, on the GPU, or on both at once. With
 `compute(device="auto")` the engine decides, per query, from numbers it measured on
 your machine. This page explains the algorithm we built during the auto-mode
 work and the measurements that shaped it.
 
-**Interactive version:** [How device="auto" decides](https://abhisheksreesaila.github.io/mxframe/auto-mode.html) on the docs site (the rules with live inputs, and the measured results).
+**Interactive version:** [How device="auto" decides](https://abhisheksreesaila.github.io/omxcore/auto-mode.html) on the docs site (the rules with live inputs, and the measured results).
 
 > **Status:** the measurements on this page are from 2026-10-12, before the native Mojo
 > executor. Since F-053, a CPU decision under `device="auto"` runs the native executor exactly as

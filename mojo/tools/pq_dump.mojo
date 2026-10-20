@@ -2,7 +2,7 @@
 # a first line {"columns": [[name, kind, scale], ...], "metadata": "..."}, then one line per row with the stored
 # Int64 values (TEXT as the word), null as null.
 from std.sys import argv
-from mxframe import read_parquet, TEXT
+from omxcore import read_parquet, TEXT
 
 
 def main() raises:

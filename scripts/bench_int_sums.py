@@ -50,7 +50,7 @@ def child(sf, name, repeat, device):
     import numpy as np
     import pyarrow as pa
     import pyarrow.parquet as pq
-    import mxframe as mx
+    import omxcore as mx
     t = pq.read_table(DATA / f"tpch_sf{sf}" / "lineitem.parquet")
     li = pa.table({
         "l_orderkey": t.column("l_orderkey"), "l_returnflag": t.column("l_returnflag"),

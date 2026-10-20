@@ -7,10 +7,10 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-from mxframe import LazyFrame, col, lit
-from mxframe import auto_mode as am
-from mxframe import calibration as cal
-from mxframe import coproc_fused as cf
+from omxcore import LazyFrame, col, lit
+from omxcore import auto_mode as am
+from omxcore import calibration as cal
+from omxcore import coproc_fused as cf
 
 
 def test_calibration_load_uses_proc_identity_without_cuinit(monkeypatch, tmp_path):
@@ -56,7 +56,7 @@ def test_background_work_waits_for_the_query(monkeypatch):
     w = FakeWarmup()
     monkeypatch.setattr(am, "get_gpu_warmup", lambda calib=None, start=True: w)
 
-    import mxframe.lazy_frame as lfm
+    import omxcore.lazy_frame as lfm
     real = lfm._run_on_device
 
     def run(plan, device, **kw):
@@ -136,7 +136,7 @@ def test_background_upload_yields_while_a_query_runs():
 
 
 def test_empty_dictionary_chunk_declines_to_old_path():
-    from mxframe import group_keys
+    from omxcore import group_keys
     ok = pa.DictionaryArray.from_arrays(pa.array([0, 1], type=pa.int8()), pa.array(["a", "b"]))
     bad = pa.DictionaryArray.from_arrays(pa.array([], type=pa.int8()), pa.array([], type=pa.string()))
     t = pa.table({"k": pa.chunked_array([ok, bad], type=ok.type)})

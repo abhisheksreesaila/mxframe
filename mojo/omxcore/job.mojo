@@ -1,4 +1,4 @@
-"""Background jobs (F-175, docs/mxframe-mojo-api.md "Background jobs"): run any query, read or save off the caller's thread.
+"""Background jobs (F-175, docs/omxcore-mojo-api.md "Background jobs"): run any query, read or save off the caller's thread.
 
 A `Job[T]` is the handle of one running piece of work that will produce a `T`:
 

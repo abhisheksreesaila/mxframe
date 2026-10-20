@@ -1,7 +1,7 @@
 # Brief: MX frame as a Mojo engine with a thin Python layer
 
 Status: approved (Abhishek, 2026-10-17: "m1-m7 first, m8 can wait"; "use small C libraries, it's ok"; planner decision left to me)
-Spec: `docs/mxframe-mojo-api.md` (from omxapp / omxplorer)
+Spec: `docs/omxcore-mojo-api.md` (from omxapp / omxplorer)
 
 ## Why
 MX frame is a Mojo engine driven by about 28k lines of Python. That ties every user to Python: omxplorer's Mac, iPhone

@@ -1,16 +1,16 @@
-# F-175: the real jobs (mojo/mxframe/jobs.mojo): every kind of query, read and save, run as a background job, gives exactly what the plain
+# F-175: the real jobs (mojo/omxcore/jobs.mojo): every kind of query, read and save, run as a background job, gives exactly what the plain
 # call gives; progress only grows and ends at the total; a cancel (at any point) returns no partial result, frees everything and
 # leaves a saved file as it was; several jobs run at once; a job over an edited Frame runs while the caller reads cells.
 from std.ffi import external_call, c_int
 from std.os import makedirs
-from mxframe import (Table, SharedTable, Frame, Query, QueryResult, col, lit, sum, count, mean, min_of, max_of, count_distinct, median,
+from omxcore import (Table, SharedTable, Frame, Query, QueryResult, col, lit, sum, count, mean, min_of, max_of, count_distinct, median,
                      percentile, top_k, INT, DECIMAL, TEXT, FLOAT, write_parquet, read_parquet, scan_parquet, ParquetResult, ZSTD,
                      UNCOMPRESSED, CPU, AUTO, MORSELS_ON, MORSELS_OFF, Job, JOB_RUNNING, JOB_DONE, JOB_FAILED, JOB_CANCELLED,
                      compute_job, permutation_job, sql_job, read_csv_job, read_parquet_job, save_job, write_parquet_job, Catalog, PlannerOptions,
                      GROUP_HASHED, sql, read_csv, CsvOptions, SqlResult, DeviceTable, gpu_available, GPU)
 from std.os import listdir
 from std.time import perf_counter_ns
-from mxframe.kernels._fpenv import SERIAL
+from omxcore.kernels._fpenv import SERIAL
 
 comptime DIR = "mxframe_jobs_test/"
 

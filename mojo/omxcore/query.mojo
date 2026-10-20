@@ -1,4 +1,4 @@
-"""Queries (docs/mxframe-mojo-api.md section 5), on a small plan representation lowered to the native kernel.
+"""Queries (docs/omxcore-mojo-api.md section 5), on a small plan representation lowered to the native kernel.
 
     var r = Query(table).where(col("region") == 2)
                         .group_by(col("carrier"), groups=7)       # a key expression with a known group count

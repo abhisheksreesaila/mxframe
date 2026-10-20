@@ -1,8 +1,8 @@
-# 📊 MXFrame — TPC-H Benchmarks
+# 📊 omxcore — TPC-H Benchmarks
 
 > **Current headline (2026-10-17, F-058):** engine-only first runs, [bench/f058-report.md](bench/f058-report.md).
-> TPC-H SF10: MXFrame `cpu` 2.67 s, `auto` 2.75 s, DuckDB 4.83 s, Polars 11.58 s; SF1 445 / 482 / 618 / 1,307 ms.
-> MXFrame is faster in total at every scale, but DuckDB still wins 12 of 22 queries at SF10 (multi-stage Q17, Q11,
+> TPC-H SF10: omxcore `cpu` 2.67 s, `auto` 2.75 s, DuckDB 4.83 s, Polars 11.58 s; SF1 445 / 482 / 618 / 1,307 ms.
+> omxcore is faster in total at every scale, but DuckDB still wins 12 of 22 queries at SF10 (multi-stage Q17, Q11,
 > Q22, Q20 and the lineitem x orders family). Random queries vs DuckDB (geo. mean): 0.99x SF1, 1.35x SF1 shuffled,
 > 1.38x SF10. Data bigger than memory: SF10 joins under a 512 MB budget finish and equal DuckDB (DuckDB runs out of
 > memory on one), 2-4x slower than DuckDB under the same limit. The 0.6.0 headline below is kept for history.
@@ -10,9 +10,9 @@
 > **Current headline (0.6.0, 2026-10-14):** engine-only first runs on a quiet machine, in
 > [bench/m2s-engine.md](bench/m2s-engine.md) (shuffled rows: [bench/m2s-engine-shuffled.md](bench/m2s-engine-shuffled.md);
 > random queries: [SF1](bench/random-sf1-m2s.md), [SF1 shuffled](bench/random-sf1-shuffled-m2s.md),
-> [SF10](bench/random-sf10-m2s.md)). SF10: MXFrame 3.15 s, DuckDB 5.08 s, Polars 14.40 s; without Q21
+> [SF10](bench/random-sf10-m2s.md)). SF10: omxcore 3.15 s, DuckDB 5.08 s, Polars 14.40 s; without Q21
 > DuckDB is lower (2.27 s vs 2.41 s) and it is faster on 12 of the 22 queries. Explore every query on the
-> [interactive benchmarks page](https://abhisheksreesaila.github.io/mxframe/benchmarks.html); the story is in
+> [interactive benchmarks page](https://abhisheksreesaila.github.io/omxcore/benchmarks.html); the story is in
 > [optimizations.md](optimizations.md). Loading data is staging, outside the clock. Everything below is earlier
 > and kept for history; DuckDB times before 2026-10-13 include its pyarrow import (about 70 ms).
 
@@ -21,7 +21,7 @@
 ## Method of the oldest runs (the 1M / 10M-row tables further down; history only)
 
 > **Hardware:** NVIDIA RTX 3090 (sm_86) · AMD 12-core CPU · Mojo 26.4 (1.0.0b2) AOT kernels
-> **Baselines:** Polars 1.29+ · Pandas 3.0 · MXFrame CPU path · MXFrame GPU path
+> **Baselines:** Polars 1.29+ · Pandas 3.0 · omxcore CPU path · omxcore GPU path
 > **Data:** TPC-H schema synthetic data (numpy RNG, fixed seed)
 > **Methodology:** 1 warmup run + **median of 3 timed runs**, per engine. Join-cache cleared between runs for join-heavy queries (Q5/Q7/Q8/Q10/Q13/Q19) so each run includes the full join cost.
 
@@ -71,7 +71,7 @@ Check `uptime` (load < 2) and `nvidia-smi` (no other GPU users) first.
 
 ## Engine-only scoreboard (2026-10-12, F-024)
 
-**What is measured:** the query engine alone. Same harness, data and machine as the user-felt run above, with one change: each engine first loads the columns its query uses into its own in-memory form, outside the clock. pandas and Polars get DataFrames, DuckDB gets in-memory tables, and MXFrame gets Arrow tables under a `LazyFrame`. The clock then covers query + materialized result only. It is still a fresh process per (engine, query) with no warm-up run. This run separates engine speed from file reading. (Since 2026-10-13 engine-only is the headline measure and user-felt is secondary; the current numbers are in [bench/m2l-engine.md](bench/m2l-engine.md).) One thing favours MXFrame and one works against it; the reports say so. The CPU warm-up thread that `import mxframe` starts finishes during the untimed load. Against that, MXFrame still combines Arrow chunks, and on the GPU uploads them, inside the clock.
+**What is measured:** the query engine alone. Same harness, data and machine as the user-felt run above, with one change: each engine first loads the columns its query uses into its own in-memory form, outside the clock. pandas and Polars get DataFrames, DuckDB gets in-memory tables, and omxcore gets Arrow tables under a `LazyFrame`. The clock then covers query + materialized result only. It is still a fresh process per (engine, query) with no warm-up run. This run separates engine speed from file reading. (Since 2026-10-13 engine-only is the headline measure and user-felt is secondary; the current numbers are in [bench/m2l-engine.md](bench/m2l-engine.md).) One thing favours omxcore and one works against it; the reports say so. The CPU warm-up thread that `import omxcore` starts finishes during the untimed load. Against that, omxcore still combines Arrow chunks, and on the GPU uploads them, inside the clock.
 Run started 09:15 on a quiet machine (load1 under 2 for 3 minutes). As in the user-felt run, the engines' own threads raised load1 to a median of 3.0 at SF1 and 6.7 at SF10. The run used commit 302cc70; the engine code is the same as the user-felt run's.
 Full tables: [SF1](bench/engine-sf1.md) · [SF10](bench/engine-sf10.md).
 
@@ -95,8 +95,8 @@ SF10 is summed over the 21 queries with a valid result from every engine (Polars
 **What it says:**
 
 - **About half of mx-auto's gap to Polars is the engine, and half is the Parquet read.** Q12 and Q19 are left out here. At SF10 they run slower engine-only than user-felt (next bullets), which would inflate the engine side. At SF1 they don't, but they are left out at both scales for consistency. Over the other queries, mx-auto against Polars, summed, is 2.09x user-felt and 1.78x engine-only at SF1 (20 queries), and 1.91x against 1.60x at SF10 (19 queries). The engine is about 51% of the gap in milliseconds at SF1 and 54% at SF10. So a faster reader (F-021) is worth about as much as engine work. With Q12 and Q19 included, the sums read 2.22x/2.00x at SF1 (engine about 56% of the gap) and 1.89x/1.85x at SF10.
-- **The read does cost MXFrame more than Polars.** Loading the same columns takes 13.4 s for mx at SF10 against 6.7 s for Polars (2.0x) and 9.8 s for DuckDB. That is PyArrow decoding against Polars' own reader, with no filter pushdown on either side.
-- **Q12 and Q19 are slower on in-memory tables than through `scan_parquet`.** SF10 mx-cpu Q12 takes 1,827 ms engine-only against 954 ms user-felt, read included; Q19 takes 2,271 ms against 654 ms. The repeat runs are just as slow, so this is not first-run cost. The cause is not profiled yet. One candidate: in a Parquet scan MXFrame pushes Q12's `l_receiptdate` range and Q19's conditions into the reader, so the engine sees far fewer rows, while engine-only it gets all 60M rows, and mx's Q12 plan joins before it filters. This is ticket **F-025**. It matters for anyone who hands MXFrame an Arrow table rather than a Parquet path.
+- **The read does cost omxcore more than Polars.** Loading the same columns takes 13.4 s for mx at SF10 against 6.7 s for Polars (2.0x) and 9.8 s for DuckDB. That is PyArrow decoding against Polars' own reader, with no filter pushdown on either side.
+- **Q12 and Q19 are slower on in-memory tables than through `scan_parquet`.** SF10 mx-cpu Q12 takes 1,827 ms engine-only against 954 ms user-felt, read included; Q19 takes 2,271 ms against 654 ms. The repeat runs are just as slow, so this is not first-run cost. The cause is not profiled yet. One candidate: in a Parquet scan omxcore pushes Q12's `l_receiptdate` range and Q19's conditions into the reader, so the engine sees far fewer rows, while engine-only it gets all 60M rows, and mx's Q12 plan joins before it filters. This is ticket **F-025**. It matters for anyone who hands omxcore an Arrow table rather than a Parquet path.
 - **Where the engine is already fast.** Q1's fused aggregate runs in 145 ms at SF10, against 2,879 ms for Polars (which also accumulates in float32 and is 5.5% off) and 223 ms for DuckDB. mx also beats Polars on Q6, Q7, Q13 and Q22 at SF10.
 - **The joins are still the big engine loss.** At SF10 engine-only, mx-auto stays 2.6x–5.0x behind Polars on Q2, Q3, Q8, Q10, Q16, Q17 and Q20. That is **F-007**.
 
@@ -173,9 +173,9 @@ Called via ctypes — no MAX Graph session, cold start ≈ 0 ms.
 
 ## 1 M rows — hot median of 3 runs *(v0.2.3, July 10 2026)*
 
-> ⚠️ **Not a fair comparison; kept only as history.** MXFrame's result caches (joins, group encodings, input conversions) were cleared between queries but not between the warm-up and the timed runs, so the timed runs reused work done in the warm-up (hence Q9 in 0.6 ms); Polars and pandas recomputed every run. The data came from our own synthetic generator, with some tables smaller than the label. Use the user-felt and engine-only scoreboards above.
+> ⚠️ **Not a fair comparison; kept only as history.** omxcore's result caches (joins, group encodings, input conversions) were cleared between queries but not between the warm-up and the timed runs, so the timed runs reused work done in the warm-up (hence Q9 in 0.6 ms); Polars and pandas recomputed every run. The data came from our own synthetic generator, with some tables smaller than the label. Use the user-felt and engine-only scoreboards above.
 
-All times in **milliseconds · lower is better**. 🟢 = faster than Polars baseline; **bold** = MXFrame wins.
+All times in **milliseconds · lower is better**. 🟢 = faster than Polars baseline; **bold** = omxcore wins.
 
 Q1, Q3, Q5–Q8, Q10, Q13, Q19 re-measured July 10 2026 (v0.2.3, join-cache cleared per run);
 Q2/Q4/Q9/Q11/Q12/Q14–Q18/Q20–Q22 from July 7 2026 (v0.2.0) — same hardware and methodology.
@@ -218,7 +218,7 @@ Headline GPU wins: **Q9 6.0×**, **Q12 6.8×**, **Q20 5.4×**, **Q3 2.7×**.
 
 ## 10 M rows — hot median of 3 runs *(April 20 2026)*
 
-> ⚠️ **Not a fair comparison; kept only as history.** MXFrame's result caches (joins, group encodings, input conversions) were cleared between queries but not between the warm-up and the timed runs, so the timed runs reused work done in the warm-up (hence Q9 in 0.6 ms); Polars and pandas recomputed every run. The data came from our own synthetic generator, with some tables smaller than the label. Use the user-felt and engine-only scoreboards above.
+> ⚠️ **Not a fair comparison; kept only as history.** omxcore's result caches (joins, group encodings, input conversions) were cleared between queries but not between the warm-up and the timed runs, so the timed runs reused work done in the warm-up (hence Q9 in 0.6 ms); Polars and pandas recomputed every run. The data came from our own synthetic generator, with some tables smaller than the label. Use the user-felt and engine-only scoreboards above.
 
 All times in **milliseconds · lower is better**. At 10 M rows the join-heavy queries show the biggest wins.
 
@@ -260,7 +260,7 @@ At 10 M, Q4/Q6/Q13/Q21 show Polars' strength on pure CPU-vectorised operations �
 - **Coverage ✅** — every TPC-H query has a CPU AOT path; all group aggs, masked aggs, joins, and sort/top-k have GPU AOT paths; no MAX Graph session required for any hot-path operation.
 - **No JIT tax** — CPU has no JIT at all. GPU dispatches directly to AOT ctypes for every hot operator.
 - **Why GPU doesn't always win** — GPU wins scale with data size. At 1 M rows, PCIe upload cost can exceed GPU kernel savings. At 10 M rows, GPU crushes Polars on join-heavy queries (Q8/Q9/Q12). Where GPU loses at any scale: ops still routing through PyArrow fallback (Q4, Q13, Q21) — Phase 6 targets.
-- **Where MXFrame loses** — Q4, Q6, Q13, Q21 fall back to PyArrow compute or do extra passes. Focus of next milestone.
+- **Where omxcore loses** — Q4, Q6, Q13, Q21 fall back to PyArrow compute or do extra passes. Focus of next milestone.
 
 ### Why the benchmarks are honest
 
@@ -277,7 +277,7 @@ The 3 timed runs measure pure kernel dispatch + GPU execution — steady-state p
 
 ## Current Limitations
 
-MXFrame is **not 100% Mojo end-to-end** — a deliberate, documented trade-off.
+omxcore is **not 100% Mojo end-to-end** — a deliberate, documented trade-off.
 The computational hot path (aggregation, joins, sort, gather) is fully Mojo-compiled.
 Certain orchestration steps still use PyArrow or NumPy:
 

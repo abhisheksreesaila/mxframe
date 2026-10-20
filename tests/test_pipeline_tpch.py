@@ -12,8 +12,8 @@ import pyarrow.parquet as pq
 import pytest
 
 from conftest import TPCH_DATA
-from mxframe import custom_ops
-from mxframe import pipeline_kernels as pk
+from omxcore import custom_ops
+from omxcore import pipeline_kernels as pk
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 import benchmark_tpch as bm  # noqa: E402
@@ -114,8 +114,8 @@ def test_q6_matches_duckdb(tpch, device, fused_calls):
 
 @pytest.mark.parametrize("device", DEVICES)
 def test_q6_written_with_between_matches_duckdb(tpch, device, fused_calls):
-    from mxframe.lazy_expr import col, lit
-    from mxframe.lazy_frame import LazyFrame, Scan
+    from omxcore.lazy_expr import col, lit
+    from omxcore.lazy_frame import LazyFrame, Scan
     _, T, con = tpch
     got = (LazyFrame(Scan(T["lineitem"]))
            .filter((col("l_shipdate") >= lit(bm.Q6_DATE_LO)) & (col("l_shipdate") < lit(bm.Q6_DATE_HI))

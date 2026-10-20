@@ -3,9 +3,9 @@
 # block cell by cell. Sources: a table, a Frame with edits / appended rows / removed rows / a merge, and a Frame over a Parquet file with
 # row groups of an odd size (a range crosses them). DuckDB checks the aggregates in tests/test_mojo_range.py.
 from std.time import perf_counter_ns
-from mxframe import (Table, SharedTable, Frame, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT, write_parquet, scan_parquet, ZSTD,
+from omxcore import (Table, SharedTable, Frame, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT, write_parquet, scan_parquet, ZSTD,
                      range_aggregate, read_block, RangeResult, MORSEL)
-from mxframe.frame import text_ranks
+from omxcore.frame import text_ranks
 
 
 struct Rng(Movable):

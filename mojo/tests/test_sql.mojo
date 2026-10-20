@@ -2,7 +2,7 @@
 # planner's notes (which path ran), EXPLAIN and the error messages. (tests/test_mojo_sql.py compares many more queries with
 # DuckDB on generated data.)
 from std.sys import argv
-from mxframe import (Table, SharedTable, Frame, Catalog, PlannerOptions, GROUP_HASHED, GROUP_DENSE, sql, sql_with, SqlResult, INT, DECIMAL, TEXT,
+from omxcore import (Table, SharedTable, Frame, Catalog, PlannerOptions, GROUP_HASHED, GROUP_DENSE, sql, sql_with, SqlResult, INT, DECIMAL, TEXT,
                      DATE, BOOL, FLOAT, write_parquet, scan_parquet, ZSTD, Planner, RulePlanner, PhysicalPlan, Stats, BoundQuery)
 
 

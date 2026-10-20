@@ -11,8 +11,8 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-import mxframe as mx
-import mxframe.native_exec as nx
+import omxcore as mx
+import omxcore.native_exec as nx
 
 pytestmark = pytest.mark.skipif(not nx.available(), reason="libmxexec_cpu.so not built")
 
@@ -223,7 +223,7 @@ def test_tpch_sql_q8_q14_q17_equal_duckdb_and_aggregate_natively(q, hooks):
 
 
 def test_float_arithmetic_over_the_groups_does_not_touch_arrow_compute(hooks, monkeypatch):
-    import mxframe.custom_ops as co
+    import omxcore.custom_ops as co
 
     def boom(*a, **k):
         raise AssertionError("the per-group arithmetic went through Arrow's checked kernels")
@@ -239,7 +239,7 @@ def test_a_literal_column_next_to_a_computed_one_still_broadcasts(hooks):
 
 
 def test_a_dictionary_column_passes_through_a_float_project_decoded():
-    from mxframe.custom_ops import _np_float_project
+    from omxcore.custom_ops import _np_float_project
     t = pa.table({"k": pa.array(["a", "b"]).dictionary_encode(), "y": pa.array([1.5, 2.5], pa.float64())})
     got = _np_float_project([mx.col("k"), (mx.col("y") * 2.0).alias("d")], t)
     assert got.schema.field("k").type == pa.string()

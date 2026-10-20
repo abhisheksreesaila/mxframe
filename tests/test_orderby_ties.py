@@ -11,8 +11,8 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-from mxframe import LazyFrame, col, lit
-from mxframe.np_arrow import array as A
+from omxcore import LazyFrame, col, lit
+from omxcore.np_arrow import array as A
 
 
 def _table(n=4000, seed=7):

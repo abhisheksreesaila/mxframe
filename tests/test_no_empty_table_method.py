@@ -14,7 +14,7 @@ def test_no_module_of_the_package_calls_empty_table():
 
 
 def test_np_arrow_empty_keeps_the_schema_and_has_no_rows():
-    from mxframe import np_arrow
+    from omxcore import np_arrow
     schema = pa.schema([("a", pa.int64()), ("b", pa.string()), ("c", pa.dictionary(pa.int32(), pa.string()))])
     t = np_arrow.empty(schema)
     assert t.num_rows == 0 and t.schema == schema

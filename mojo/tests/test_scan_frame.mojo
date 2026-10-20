@@ -4,7 +4,7 @@
 # undoing them. The oracle is the in-memory Frame, whose own correctness F-136 checks against `bake()`.
 from std.os import getenv, makedirs
 from std.time import perf_counter_ns
-from mxframe import (Table, SharedTable, Frame, Query, QueryResult, col, sum, count, mean, min_of, max_of,
+from omxcore import (Table, SharedTable, Frame, Query, QueryResult, col, sum, count, mean, min_of, max_of,
                      count_distinct, median, percentile, top_k, INT, DECIMAL, TEXT, DATE, BOOL, write_parquet,
                      read_parquet, scan_parquet, ParquetWriter, ZSTD, SNAPPY, UNCOMPRESSED, MORSELS_AUTO, MORSELS_ON, MORSELS_OFF)
 

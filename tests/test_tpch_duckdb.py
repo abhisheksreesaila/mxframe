@@ -3,7 +3,7 @@ pandas / Polars baseline versions at SF1).
 
 The reference is DuckDB running the official TPC-H SQL over the very same Parquet files
 (day-number dates and float32 decimals are turned back into DATE and DECIMAL(15,2) by
-views, see tpch_duckdb_sql.py).  The mxframe side is ``scripts/benchmark_tpch.py``
+views, see tpch_duckdb_sql.py).  The omxcore side is ``scripts/benchmark_tpch.py``
 ``run_qN_mxframe`` on tables from ``mx.read_parquet_table``, run in a fresh process per
 query so a GPU fault fails one test instead of the session.
 
@@ -198,7 +198,7 @@ def test_baseline_engine_matches_duckdb(engine, q, duck, tmp_path, request):
             request.applymarker(pytest.mark.xfail(strict=True, reason="Polars accumulates float32 sums in float32"))
     want = reference(duck, "1", q)
     got = run_mxframe("1", q, engine, tmp_path)
-    if q == 14:            # the baselines return the TPC-H ratio only, mxframe also the two sums it is made of
+    if q == 14:            # the baselines return the TPC-H ratio only, omxcore also the two sums it is made of
         want = want.select(["promo_pct"])
     assert_matches_duckdb(got, want, ref.REFERENCE[q][1], check_names=False, q=q)
 

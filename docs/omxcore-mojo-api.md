@@ -1,6 +1,6 @@
-# MX frame: the Mojo API omxapp needs
+# omxcore: the Mojo API omxapp needs
 
-**For:** the MX frame project. **From:** omxapp (the framework) and omxplorer (the Numbers-style data app), as of goal 15 (2026-10-17).
+**For:** the omxcore project. **From:** omxapp (the framework) and omxplorer (the Numbers-style data app), as of goal 15 (2026-10-17).
 **Replaces:** the goal 8–9 wish list that was here (items 1–22, kept in git history). Everything in it is folded in below.
 
 ## Why
@@ -12,7 +12,7 @@ reads and writes Parquet). It is checked against an independent pass over the CS
 - it's capped at 16 columns, int32 on the GPU, no nulls, one table;
 - it's the app's own engine, not the product's.
 
-The switch to MX frame should be **one layer**: the components (DataGrid, PivotTable, ChartView, KpiView, the
+The switch to omxcore should be **one layer**: the components (DataGrid, PivotTable, ChartView, KpiView, the
 sheet and report pages) don't change. Only `Frame`, `GpuFrame`, `group_sum`, `read_csv` and `save_omx/open_omx`
 change, and they're shaped like the API below on purpose.
 
@@ -25,11 +25,11 @@ change, and they're shaped like the API below on purpose.
 ## 1. Tables and columns
 
 ```mojo
-from mxframe import Table, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL
+from omxcore import Table, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL
 
 var t = Table.empty()                              # "New blank sheet"
 t.add_column("revenue", DECIMAL, scale=2)          # values stored as int64 hundredths
-t.add_column("region", TEXT)                       # dictionary-encoded: codes + a string table (MX frame stores the codes as Int64, like every value)
+t.add_column("region", TEXT)                       # dictionary-encoded: codes + a string table (omxcore stores the codes as Int64, like every value)
 t.rows(); t.columns(); t.name(c); t.kind(c); t.scale(c); t.index("region") -> Int  # -1 if absent
 t.get(c, row) -> Int64                             # the stored value (a code for TEXT, days for DATE)
 t.is_null(c, row) -> Bool
@@ -105,7 +105,7 @@ f.save(path, metadata="", compression=ZSTD)          # the edited rows to a new 
 |---|---|
 | Sparse cell edits, appended rows and removed rows over a read-only base | many sessions share one 100M-row table |
 | One undo log covering sets, appends, removes and merges | the toolbar's Undo |
-| **Edits visible to GPU aggregations without re-uploading** | today: the GPU sums the base, then the CPU applies each changed row as an exact delta (`group_sum` in `frame_gpu.mojo`). MX frame can do this its own way (patch kernel, dirty columns), as long as results include edits. |
+| **Edits visible to GPU aggregations without re-uploading** | today: the GPU sums the base, then the CPU applies each changed row as an exact delta (`group_sum` in `frame_gpu.mojo`). omxcore can do this its own way (patch kernel, dirty columns), as long as results include edits. |
 
 ### Editing a file bigger than memory (F-147)
 
@@ -228,11 +228,11 @@ int64 (informal, F-138a). Next: multi-column sort.
 ## 6b. Ranges and blocks over an order (F-176)
 
 A grid shows a window of a sorted view; a status bar totals a selection of it. Both are "positions a..b of an order", and both used to cost a `get` / `is_null` per cell
-(about 1,000 calls a scroll frame; a 100,000-cell cap on a total). Two calls read the window in bulk (`mojo/mxframe/blocks.mojo`). The engine knows nothing of grids or
+(about 1,000 calls a scroll frame; a 100,000-cell cap on a total). Two calls read the window in bulk (`mojo/omxcore/blocks.mojo`). The engine knows nothing of grids or
 status bars: it takes a list of row numbers and a half-open range.
 
 ```mojo
-from mxframe import range_aggregate, read_block, RangeResult, RangeAgg
+from omxcore import range_aggregate, read_block, RangeResult, RangeAgg
 
 var order = f.permutation(cost)                     # any list of row numbers: Frame.permutation, the rows of an ORDER BY, a selection; rows may repeat
 var cols: List[Int] = [cost, region, day]
@@ -297,7 +297,7 @@ the ticket asked about is under 1 ms for one column and a few milliseconds for s
 ## 7. GPU memory
 - A device copy of a table, **uploaded once per process**, shared by every session; `release()` to give it back when a document closes.
 - Values over 32 bits must not break it (today the stand-in uploads int32 and refuses to upload otherwise; a single amount over $21.4M, stored in cents, doesn't fit).
-- Share the app's `DeviceContext` so the app's own kernels (charts, point clouds) and MX frame's use the same device memory.
+- Share the app's `DeviceContext` so the app's own kernels (charts, point clouds) and omxcore's use the same device memory.
 - `compute(AUTO)` falls back to the CPU only when the device cannot hold the query's buffers or the kernel declines the program; `QueryResult.fallback_reason` says which ("" when it ran where it was sent). `compute(GPU)` never falls back.
 - A build without a GPU (every non-Linux target, or `-D MXFRAME_NO_GPU`): `gpu_available()` is False, `DeviceTable(...)` and `compute(GPU)` raise "no GPU on this build", AUTO is the CPU (see `mojo/README.md`, build switches).
 - Later: data bigger than GPU or host memory (chunked, streamed); Apple GPUs (Metal) without Python.
@@ -338,7 +338,7 @@ of no non-null value are NULL, `COUNT` is 0; `x // 0` and `x % 0` are NULL and b
 Text order everywhere (`ORDER BY`, `MIN` / `MAX`, `QUANTILE_DISC`, `<` and `BETWEEN` against a literal) is alphabetical ignoring ASCII case, with byte order breaking ties; `=` and `IN` compare bytes.
 
 **Differences from DuckDB, on purpose**: a `SUM` (or any int64 arithmetic) past int64 raises `a sum or an expression passed the int64 range (about 9.2e18)` where DuckDB
-widens to HUGEINT (decimal `*` too); `MEDIAN` of TEXT is the lower middle word (DuckDB's, in the text order), `MEDIAN` of a DATE raises (DuckDB's is a TIMESTAMP, a kind MX frame does not have; use `quantile_disc(d, 0.5)`), `MEDIAN` of a DECIMAL is exact at one more decimal place (DuckDB rounds to the column's scale; the median of integers is a FLOAT, as DuckDB's DOUBLE);
+widens to HUGEINT (decimal `*` too); `MEDIAN` of TEXT is the lower middle word (DuckDB's, in the text order), `MEDIAN` of a DATE raises (DuckDB's is a TIMESTAMP, a kind omxcore does not have; use `quantile_disc(d, 0.5)`), `MEDIAN` of a DECIMAL is exact at one more decimal place (DuckDB rounds to the column's scale; the median of integers is a FLOAT, as DuckDB's DOUBLE);
 `%` on a FLOAT raises (F-156: `//` of a DECIMAL or FLOAT is DuckDB's, a division with NULL for a zero divisor); the text order above; FLOAT64 in SQL follows the section below.
 
 **How a query runs.** The statement is parsed (`sql.mojo`), bound to a typed tree (`bind.mojo`: types, scales, which expressions run per row and which after aggregation), turned into a
@@ -373,11 +373,11 @@ by key (`holistic: a second pass ...`). `ORDER BY` with `LIMIT + OFFSET <= 4096`
 **Limits**: joins: inner, left, semi, anti over two tables, inner over three or more (see 8b); `DISTINCT` only without aggregates; expressions as in "Expressions (F-156)"; CPU only;
 at most 48 registers (about 20 aggregates over different expressions, fewer when an expression is long: `the query needs more than 48 registers`) and 64 distinct constants in one program, said as an SQL error when passed; an AVG whose exact sum passes int64 raises like SUM.
 
-Informal timings (F-150; 12-core Ryzen 9 5900X under a load average of about 6 from other jobs, so read them as rough; 5,000,000 rows generated with 8 / 10,000 / 1,000,000 groups; MX frame is
+Informal timings (F-150; 12-core Ryzen 9 5900X under a load average of about 6 from other jobs, so read them as rough; 5,000,000 rows generated with 8 / 10,000 / 1,000,000 groups; omxcore is
 `sql()` on a table already in memory, best of 3 in one process, which includes planning and, the first time, the pass that finds a key's range; DuckDB 1.5.1 on a table it loaded, best of 3, its result
 fetched into Python; neither is a quiet-machine benchmark). Every result was checked against DuckDB first.
 
-| query | MX frame SQL | DuckDB | group strategy |
+| query | omxcore SQL | DuckDB | group strategy |
 |---|---|---|---|
 | `count(*), sum(v), avg(d), min(dt)` | 7 ms | 5 ms | none (one result row) |
 | 8 groups, 4 aggregates | 8 ms | 6 ms | dense |
@@ -418,9 +418,9 @@ ran: `text: 2 per-word tables over 11 dictionary words in 0.23 ms (each text fun
 words, and the `LIKE` shapes `lit`, `lit%`, `%lit`, `%lit%` need no backtracking: 3,610,733 distinct comments are searched for `%special%` in 20 ms.
 
 **Differences from DuckDB, on purpose** (each raises or is documented, none answers differently):
-- `date + INTERVAL` and `date_trunc` give a DATE (DuckDB: a TIMESTAMP at midnight; MX frame has no timestamp kind). The oracle casts them to DATE. Intervals in hours, minutes or seconds raise.
+- `date + INTERVAL` and `date_trunc` give a DATE (DuckDB: a TIMESTAMP at midnight; omxcore has no timestamp kind). The oracle casts them to DATE. Intervals in hours, minutes or seconds raise.
 - `%` on a FLOAT raises (the kernel's remainder is floored and stepped back, not C's fmod: exact only below 2^53 quotients); `//` on REAL (32-bit) raises.
-- `reverse` of a word with combining marks, joiners, variation selectors, regional indicators or an Indic script raises: DuckDB reverses by grapheme clusters, MX frame by code points, which agree only for words whose every character stands alone.
+- `reverse` of a word with combining marks, joiners, variation selectors, regional indicators or an Indic script raises: DuckDB reverses by grapheme clusters, omxcore by code points, which agree only for words whose every character stands alone.
 - A text word that DuckDB reads by a quirk this engine does not (`infinity`, `epoch`, `now` and their abbreviations as dates; BC dates; years past 9999; an exponent on a DECIMAL, whose rounding is odd; a long mantissa with an exponent) is an error in a CAST *and* a TRY_CAST (never a NULL or a guess); `tests/test_mojo_cast_fuzz.py` bounds how many such words there are.
 - A computed date before year 1 (e.g. `DATE '0001-01-01' - INTERVAL '1' MONTH`) prints in results as `0000-12-01` (ISO 8601 astronomical years: year 0 is 1 BC); DuckDB prints the same day as `0001-12-01 (BC)`.
 - `CAST(expr AS VARCHAR)` needs a column of INT, DECIMAL or DATE (or a BOOLEAN): the words come from the column's range; a date before year 1 or after year 9999 is an error where a row holds it.
@@ -428,11 +428,11 @@ words, and the `LIKE` shapes `lit`, `lit%`, `%lit`, `%lit%` need no backtracking
 - An integer overflow or a failing CAST in a branch the row does not take: the conversion flags are gated by the branch, but an int64 overflow is not (it raises as it always did).
 - DuckDB's own wrong answer: it treats `INTERVAL '30' DAY` and `INTERVAL '1' MONTH` as equal in its common-subexpression elimination, so a SELECT holding both gives the month's result for the day's column; the test oracle turns the optimizer off.
 
-Informal timings (F-156; the 12-core Ryzen 9 5900X under a load average of 6 to 10 from other jobs, so rough; MX frame is `sql()` on a table in memory, best of 3 runs in one process, planning included; DuckDB 1.5.1 on
+Informal timings (F-156; the 12-core Ryzen 9 5900X under a load average of 6 to 10 from other jobs, so rough; omxcore is `sql()` on a table in memory, best of 3 runs in one process, planning included; DuckDB 1.5.1 on
 a table it loaded, best of 3, its result fetched into Python; every result was checked against DuckDB first). 5,000,000 generated rows (a DATE over 9,000 days, 400 words with case and accents, 1,000,003 distinct words, a number as text),
 and TPC-H SF1 `lineitem` (6,001,215 rows):
 
-| query | MX frame | DuckDB |
+| query | omxcore | DuckDB |
 |---|---|---|
 | `EXTRACT(year FROM dt)` group, count, sum | 4.9 ms | 3.6 ms |
 | `date_trunc('month', dt)` group | 4.3 ms | 20.6 ms |
@@ -471,10 +471,10 @@ arithmetic expression over INT / DECIMAL / DATE columns, a comparison or logical
 
 **Row order on an edited frame.** A query with no `ORDER BY` lists a frame's rows as the frame holds them: a row the session changed stays where it was (the shared row is masked out and its new values come from the delta chunk, merged back by row number), an appended row comes last, a removed row is gone. Equal sort keys and a `LIMIT` follow the same order, so a preview after an edit does not reorder the sheet. The merge is linear (two ascending runs), not a sort; a `LIMIT` with no `ORDER BY` reads the changed rows first (they are few) and the shared rows until `n + offset` of them are in hand.
 
-Informal timings (F-152; the same 12-core Ryzen 9 5900X under a load average of about 5 from other jobs, so rough; the F-150 test generator's table of 1,200,000 rows and 9 columns written to Parquet; MX frame is the in-process
+Informal timings (F-152; the same 12-core Ryzen 9 5900X under a load average of about 5 from other jobs, so rough; the F-150 test generator's table of 1,200,000 rows and 9 columns written to Parquet; omxcore is the in-process
 `sql()` time reported by `mx` (the file read apart), best of 3 fresh processes, the result a Table; DuckDB 1.5.1 on a table it loaded, best of 3, the result an Arrow table; every result is checked against DuckDB in `tests/test_mojo_rows.py`):
 
-| query | rows out | MX frame | DuckDB |
+| query | rows out | omxcore | DuckDB |
 |---|---|---|---|
 | `SELECT id, x, d FROM t WHERE x > 500` | 275,347 | 12 ms | 9 ms |
 | `SELECT * FROM t` | 1,200,000 | 114 ms | 59 ms |
@@ -640,7 +640,7 @@ A save writes a temporary file and renames it; `cancel()` before the rename remo
 **Saves and files.** Every writer has a temporary file of its own (`path.<pid>.<allocation address>.<clock>.tmp`), so two saves to one path, or a cancelled save still unwinding beside the one that replaced it, never touch each other's file; the last
 rename wins and the file is always exactly one of the inputs. A save survives a cancel and a `kill -9` (the old file stays) but not a power loss: there is no `fsync` before the rename. A killed process leaves its temporary file behind (the name says whose it was).
 
-**Handles and callbacks.** A handle dropped while its callback is running does not stop the callback: the app must not free what the callback touches on drop (a callback that posts an event to a long-lived queue is safe). `JOBS_ARE_THREADED` (`mxframe`, `mxframe.job`) is
+**Handles and callbacks.** A handle dropped while its callback is running does not stop the callback: the app must not free what the callback touches on drop (a callback that posts an event to a long-lived queue is safe). `JOBS_ARE_THREADED` (`omxcore`, `omxcore.job`) is
 the build's answer to "do jobs run on threads?"; an app can assert it. When it is False a job runs, and its callback is called, inside the start call: the callback runs **before** the handle is returned.
 
 **A scan shared with a job.** The file's TEXT dictionaries are built once, behind a lock, by whichever of the job and the caller asks first (the flag that says "built" is an atomic release store, read with an acquire load, so a core with a weak memory order such as arm64 sees the words
@@ -673,7 +673,7 @@ chunks for a time machine and branches; TPC-H through SQL.
 
 ## Done means
 omxplorer imports a CSV, edits, adds formulas, sorts, builds charts, pivots and a filtered Report, and saves and
-reopens a `.omx`, with `from mxframe import …` in place of `mojoui/frame*.mojo`, `csvio.mojo` and `omxfile.mojo`;
+reopens a `.omx`, with `from omxcore import …` in place of `mojoui/frame*.mojo`, `csvio.mojo` and `omxfile.mojo`;
 `scripts/check` passes with the same numbers; and `scripts/build.sh omxplorer mac` links with no libpython.
 
 

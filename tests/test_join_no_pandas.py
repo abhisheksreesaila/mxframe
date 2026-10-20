@@ -10,8 +10,8 @@ SCRIPT = textwrap.dedent("""
     import sys
     import numpy as np
     import pyarrow as pa
-    from mxframe.np_arrow import array as na
-    from mxframe import LazyFrame, col, lit
+    from omxcore.np_arrow import array as na
+    from omxcore import LazyFrame, col, lit
 
     n = 200_000
     a = pa.table({"k": na(np.arange(n, dtype=np.int32)), "g": na((np.arange(n) % 7).astype(np.int32)),
@@ -33,7 +33,7 @@ def test_joins_do_not_import_pandas():
     import os
     env = dict(os.environ)
     tmp = Path(__file__).resolve().parent.parent.parent
-    # run against this checkout: the repo root is the `mxframe` package (see conftest.py's shim)
+    # run against this checkout: the repo root is the `omxcore` package (see conftest.py's shim)
     from conftest import _shim
     env["PYTHONPATH"] = str(_shim) + os.pathsep + env.get("PYTHONPATH", "")
     r = subprocess.run([sys.executable, "-c", SCRIPT], capture_output=True, text=True, env=env, timeout=300)

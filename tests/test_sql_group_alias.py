@@ -6,8 +6,8 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-import mxframe as mx
-from mxframe.np_arrow import array as A
+import omxcore as mx
+from omxcore.np_arrow import array as A
 
 
 def _t(n=20_000, seed=5):

@@ -8,11 +8,11 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-import mxframe as mx
-from mxframe import col
-from mxframe.io_parquet import resolve_plan
-from mxframe.lazy_frame import Scan, _resolve_scalars
-from mxframe.optimizer import optimize_plan
+import omxcore as mx
+from omxcore import col
+from omxcore.io_parquet import resolve_plan
+from omxcore.lazy_frame import Scan, _resolve_scalars
+from omxcore.optimizer import optimize_plan
 
 
 def _devices():

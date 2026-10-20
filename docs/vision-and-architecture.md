@@ -1,15 +1,15 @@
-# 🔭 MXFrame — Vision & Architecture
+# 🔭 omxcore — Vision & Architecture
 
 > This is the original design document, kept for its reasoning. For how the engine works today
 > (the native Mojo executor, the fused pipeline, the per-operator AOT path, and which one answers
-> a query), see [Behind the scenes](https://abhisheksreesaila.github.io/mxframe/internals.html) and
+> a query), see [Behind the scenes](https://abhisheksreesaila.github.io/omxcore/internals.html) and
 > [api.md](api.md#source-layout).
 
 ---
 
 ## 1. Vision
 
-**MXFrame is a GPU-native DataFrame library built on MAX Graph and Mojo.**
+**omxcore is a GPU-native DataFrame library built on MAX Graph and Mojo.**
 
 It aims to be as easy to use as pandas/polars, but with a fundamentally different engine: every operation compiles to optimized Mojo code that runs on CPU *or* GPU — no CUDA, no Rapids retrofit, no Python interpreter in the hot path.
 
@@ -18,19 +18,19 @@ It aims to be as easy to use as pandas/polars, but with a fundamentally differen
 | Belief | What it means |
 |--------|--------------|
 | **Mojo does all the work** | Python is the API surface. Mojo is the compute engine. MAX Graph is the translation layer that bridges the two. |
-| **GPU-native, not GPU-retrofitted** | Unlike Rapids/cuDF which bolt GPU onto pandas, MXFrame is designed GPU-first. CPU is the fallback, not the other way around. |
+| **GPU-native, not GPU-retrofitted** | Unlike Rapids/cuDF which bolt GPU onto pandas, omxcore is designed GPU-first. CPU is the fallback, not the other way around. |
 | **Lazy by default** | Users build a logical plan (like Polars). The plan is compiled into a MAX Graph, optimized, then executed in one shot. No row-by-row Python. |
-| **Prove it with benchmarks** | TPC-H benchmarks are the yardstick. If MXFrame can run TPC-H competitively, it's useful for real workloads. |
-| **Developer-friendly** | Clean API, great docs, small notebooks, emoji-rich explanations. If someone can use pandas, they can use MXFrame. |
+| **Prove it with benchmarks** | TPC-H benchmarks are the yardstick. If omxcore can run TPC-H competitively, it's useful for real workloads. |
+| **Developer-friendly** | Clean API, great docs, small notebooks, emoji-rich explanations. If someone can use pandas, they can use omxcore. |
 
 ### Differentiators vs. Existing Libraries
 
-| Library | How MXFrame differs |
+| Library | How omxcore differs |
 |---------|-------------------|
-| **pandas** | pandas is eager, single-threaded, CPU-only. MXFrame is lazy, compiled, GPU-capable. |
-| **Polars** | Polars is Rust-based, CPU-only (GPU via cudf-polars plugin). MXFrame is Mojo-based, GPU-native from day one. |
-| **cuDF / Rapids** | cuDF requires NVIDIA Rapids ecosystem, CUDA toolkit, complex setup. MXFrame uses MAX/Mojo — single `pixi install`. |
-| **Spark** | Spark is distributed, JVM-heavy, high latency. MXFrame is single-node, zero-overhead, instant compilation. |
+| **pandas** | pandas is eager, single-threaded, CPU-only. omxcore is lazy, compiled, GPU-capable. |
+| **Polars** | Polars is Rust-based, CPU-only (GPU via cudf-polars plugin). omxcore is Mojo-based, GPU-native from day one. |
+| **cuDF / Rapids** | cuDF requires NVIDIA Rapids ecosystem, CUDA toolkit, complex setup. omxcore uses MAX/Mojo — single `pixi install`. |
+| **Spark** | Spark is distributed, JVM-heavy, high latency. omxcore is single-node, zero-overhead, instant compilation. |
 
 ---
 
@@ -105,8 +105,8 @@ frontend built the plan — they see identical plan trees either way.
 │   - group_count         - sort_kernel                   │
 │   - scatter / gather    - hash_join                     │
 │                                                         │
-│   Files: mxframe/kernels/*.mojo                         │
-│   Built to: mxframe/kernels.mojoc                       │
+│   Files: omxcore/kernels/*.mojo                         │
+│   Built to: omxcore/kernels.mojoc                       │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -207,7 +207,7 @@ MAX Graph provides:
 ### 3.1 Syntax — Polars-Inspired, Simplified
 
 ```python
-import mxframe as mx
+import omxcore as mx
 
 # Read data
 df = mx.read_csv("data.csv")          # returns LazyFrame

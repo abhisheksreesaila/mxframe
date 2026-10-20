@@ -162,7 +162,7 @@ def test_every_token_in_the_text_exists(page):
 
 
 def test_github_links_point_at_the_blob_path(page):
-    base = "https://github.com/abhisheksreesaila/mxframe/blob/main/"
+    base = "https://github.com/abhisheksreesaila/omxcore/blob/main/"
     html = PAGE.read_text()
     assert base in html or "BLOB" in html
     assert "const BLOB" in html and base in html

@@ -8,7 +8,7 @@ import numpy as np
 import pyarrow as pa
 import duckdb
 
-import mxframe as mx
+import omxcore as mx
 
 PASS = 0
 FAIL = 0

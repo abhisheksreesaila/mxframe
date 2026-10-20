@@ -22,8 +22,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from mxframe import col, gpu_stream
-from mxframe.io_parquet import scan_parquet
+from omxcore import col, gpu_stream
+from omxcore.io_parquet import scan_parquet
 
 from test_f056_streamed import close, prov, run, same
 
@@ -205,7 +205,7 @@ def test_a_partition_that_is_still_too_big_is_split_again(tmp_path, monkeypatch,
 
 
 def test_splitting_past_the_depth_limit_raises_a_memory_error_and_cleans_up(tmp_path, monkeypatch, _env):
-    from mxframe import streamed
+    from omxcore import streamed
     lf, _ = tiny_state(tmp_path, monkeypatch)
     monkeypatch.setattr(streamed._spill, "MAX_DEPTH", 1)
     with pytest.raises(MemoryError, match=r"too big to merge in the host memory budget .* after splitting the groups 1 times"):
@@ -214,7 +214,7 @@ def test_splitting_past_the_depth_limit_raises_a_memory_error_and_cleans_up(tmp_
 
 
 def test_the_spill_directory_is_removed_after_a_keyboard_interrupt(big, _env, monkeypatch):
-    from mxframe import streamed
+    from omxcore import streamed
 
     def interrupt(*a, **k):
         raise KeyboardInterrupt
@@ -226,7 +226,7 @@ def test_the_spill_directory_is_removed_after_a_keyboard_interrupt(big, _env, mo
 
 
 def test_a_full_disk_is_reported_as_a_spill_failure_naming_the_directory(big, _env, monkeypatch):
-    from mxframe import spill
+    from omxcore import spill
     real = pa.ipc.new_stream
     calls = []
 
@@ -242,7 +242,7 @@ def test_a_full_disk_is_reported_as_a_spill_failure_naming_the_directory(big, _e
 
 
 def test_too_little_free_space_is_reported_before_writing(big, _env, monkeypatch):
-    from mxframe import spill
+    from omxcore import spill
     monkeypatch.setattr(spill.shutil, "disk_usage", lambda p: type("U", (), {"free": 1000})())
     with pytest.raises(spill.SpillError, match=rf"not enough disk space to spill group state: {_env}/mxframe-spill-.* has 1,000 bytes free, [\d,]+ are needed"):
         run(light_groups(big), "cpu")
@@ -250,7 +250,7 @@ def test_too_little_free_space_is_reported_before_writing(big, _env, monkeypatch
 
 
 def test_an_unwritable_spill_directory_is_reported(big, monkeypatch, tmp_path):
-    from mxframe import spill
+    from omxcore import spill
     blocker = tmp_path / "file"
     blocker.write_text("x")
     monkeypatch.setenv("MXFRAME_SPILL_DIR", str(blocker / "sub"))
@@ -259,7 +259,7 @@ def test_an_unwritable_spill_directory_is_reported(big, monkeypatch, tmp_path):
 
 
 def test_the_default_spill_directory_is_on_disk_not_tmpdir(monkeypatch, tmp_path):
-    from mxframe import spill
+    from omxcore import spill
     monkeypatch.delenv("MXFRAME_SPILL_DIR")
     monkeypatch.setenv("TMPDIR", str(tmp_path / "tmpfs"))
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
@@ -269,7 +269,7 @@ def test_the_default_spill_directory_is_on_disk_not_tmpdir(monkeypatch, tmp_path
 
 
 def test_a_spill_directory_in_ram_warns(big, _env, monkeypatch):
-    from mxframe import spill
+    from omxcore import spill
     monkeypatch.setattr(spill, "ram_backed", lambda path: "tmpfs")
     with pytest.warns(RuntimeWarning, match=rf"spill directory {_env} is on tmpfs \(RAM\).*MXFRAME_SPILL_DIR"):
         lf = light_groups(big)
@@ -277,7 +277,7 @@ def test_a_spill_directory_in_ram_warns(big, _env, monkeypatch):
 
 
 def test_ram_backed_reads_the_mount_table(tmp_path, monkeypatch):
-    from mxframe import spill
+    from omxcore import spill
     here = str(tmp_path.resolve())
     table = f"/dev/sda1 / ext4 rw 0 0\ntmpfs {here} tmpfs rw 0 0\n"
     import builtins
@@ -290,7 +290,7 @@ def test_ram_backed_reads_the_mount_table(tmp_path, monkeypatch):
 def test_spill_folders_of_dead_processes_of_this_host_are_removed_and_the_rest_kept(big, _env):
     """Only folders made by this host and pid namespace are swept: in a cache shared by several machines or containers
     another one's pid cannot be looked up here, so its folder may belong to a live query."""
-    from mxframe import spill
+    from omxcore import spill
     dead = subprocess.Popen([sys.executable, "-c", "pass"])
     dead.wait()
     mine = spill._owner()
@@ -308,7 +308,7 @@ def test_spill_folders_of_dead_processes_of_this_host_are_removed_and_the_rest_k
 
 
 def test_the_folder_name_carries_the_host_and_pid_namespace(big, _env, monkeypatch):
-    from mxframe import spill
+    from omxcore import spill
     seen = []
     real = spill.Partitioned.finish
     monkeypatch.setattr(spill.Partitioned, "finish", lambda self: (seen.extend(os.listdir(_env)), real(self))[1])
@@ -317,7 +317,7 @@ def test_the_folder_name_carries_the_host_and_pid_namespace(big, _env, monkeypat
 
 
 def test_a_deleted_partition_file_is_an_error_not_missing_groups(big, _env, monkeypatch):
-    from mxframe import spill
+    from omxcore import spill
     real = spill.Partitioned.finish
 
     def finish_then_delete_one(self):
@@ -332,7 +332,7 @@ def test_a_deleted_partition_file_is_an_error_not_missing_groups(big, _env, monk
 
 
 def test_a_truncated_partition_file_is_an_error(big, _env, monkeypatch):
-    from mxframe import spill
+    from omxcore import spill
     real = spill.Partitioned.finish
 
     def finish_then_truncate_one(self):
@@ -348,7 +348,7 @@ def test_a_truncated_partition_file_is_an_error(big, _env, monkeypatch):
 
 
 def test_an_error_while_finishing_the_partition_files_is_a_spill_error(big, _env, monkeypatch):
-    from mxframe import spill
+    from omxcore import spill
 
     class Broken:
         def __init__(self, w):
@@ -375,7 +375,7 @@ def test_an_error_while_finishing_the_partition_files_is_a_spill_error(big, _env
 
 
 def test_the_spill_directory_is_removed_after_an_error(big, _env, monkeypatch):
-    from mxframe import streamed
+    from omxcore import streamed
     seen = {}
 
     def broken(*a, **k):
@@ -392,8 +392,8 @@ def test_the_spill_directory_is_removed_after_an_error(big, _env, monkeypatch):
 PEAK = textwrap.dedent("""
     import json, sys
     import pyarrow as pa
-    from mxframe import col
-    from mxframe.io_parquet import scan_parquet
+    from omxcore import col
+    from omxcore.io_parquet import scan_parquet
 
     def status(key):
         with open("/proc/self/status") as f:
@@ -454,7 +454,7 @@ def test_order_by_limit_streams_a_running_top_k(big, device, offset):
 
 
 def test_order_by_limit_in_sql_streams_and_equals_duckdb(big):
-    import mxframe as mx
+    import omxcore as mx
     q = "SELECT id, v * 2 AS w, g FROM big WHERE g % 3 = 0 ORDER BY w DESC, id LIMIT 9 OFFSET 2"
     lf = mx.sql(q, big=scan_parquet(big))
     got = lf.compute(device="cpu")
@@ -593,7 +593,7 @@ def test_peak_memory_of_a_row_group_bigger_than_the_budget_is_bounded(one_group,
 def test_a_slice_read_out_of_step_with_the_batch_loop_raises(one_group, monkeypatch):
     """The slice iterator and the batch loop count slices separately; a plan that read the streamed file twice in a
     batch would silently skip rows, so it raises."""
-    from mxframe import io_parquet
+    from omxcore import io_parquet
     monkeypatch.setenv("MXFRAME_HOST_MEM_BUDGET", "3M")
     real = io_parquet._next_slice
     seen = []
@@ -612,7 +612,7 @@ def test_a_slice_read_out_of_step_with_the_batch_loop_raises(one_group, monkeypa
 def test_memory_held_elsewhere_lowers_the_size_at_which_a_merge_spills(_env):
     """The same partials merge in memory with nothing held and spill when resident tables / the sink hold most of the
     budget: the merge trigger counts what the query already holds."""
-    from mxframe import spill, streamed
+    from omxcore import spill, streamed
     n = 20_000
     tab = pa.table({"k": np.arange(n, dtype=np.int64), "v": np.ones(n)})
     path = os.path.join(str(_env), "h.parquet")

@@ -12,7 +12,7 @@
 # bits, `mean` is always the bits of a float64.
 from std.sys import argv
 from std.time import perf_counter_ns
-from mxframe import (Frame, Table, SharedTable, read_parquet, scan_parquet, range_aggregate, read_block, RangeResult, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT)
+from omxcore import (Frame, Table, SharedTable, read_parquet, scan_parquet, range_aggregate, read_block, RangeResult, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT)
 
 
 def hex_digit(d: Int) -> String:

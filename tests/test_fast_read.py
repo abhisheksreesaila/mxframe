@@ -7,8 +7,8 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-import mxframe as mx
-from mxframe import col, lit
+import omxcore as mx
+from omxcore import col, lit
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -31,8 +31,8 @@ def _write(tmp_path, n=100_000, row_group_size=10_000):
 def test_scan_and_read_do_not_import_pandas(tmp_path):
     p, _ = _write(tmp_path)
     out = _fresh(f"""
-import mxframe as mx
-from mxframe import col, lit
+import omxcore as mx
+from omxcore import col, lit
 t = mx.read_parquet_table({str(p)!r}, columns=["d", "v"])
 r = mx.scan_parquet({str(p)!r}).filter(col("d") < lit(500)).groupby().agg(col("v").sum()).compute(device="cpu")
 print("pandas" in sys.modules, "pyarrow.dataset" in sys.modules)
@@ -59,7 +59,7 @@ def test_pushdown_by_row_group_stats_is_exact(tmp_path):
 
 
 def test_row_groups_are_skipped(tmp_path):
-    from mxframe import io_parquet
+    from omxcore import io_parquet
     p, _ = _write(tmp_path)
     groups = io_parquet._row_groups_for(pq.ParquetFile(p), (("d", "lt", 25_000),))
     assert groups == [0, 1, 2]

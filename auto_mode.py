@@ -252,7 +252,7 @@ class GpuWarmup:
 import logging
 import warnings
 
-_log = logging.getLogger("mxframe.auto")
+_log = logging.getLogger("omxcore.auto")
 
 FILTER_SELECTIVITY = 0.3      # spec default until statistics exist
 JOIN_GPU_SAFETY = 1.15        # measured GPU join estimate runs 5-30% low under load (F-003 review)
@@ -706,7 +706,7 @@ def warn_fallback_once(plan, err: BaseException) -> None:
         return
     if k is not None:
         _warned_shapes.add(k)
-    warnings.warn(f"mxframe auto: GPU execution failed ({type(err).__name__}: {err}); "
+    warnings.warn(f"omxcore auto: GPU execution failed ({type(err).__name__}: {err}); "
                   f"fell back to CPU. This query shape will plan CPU from now on.",
                   RuntimeWarning, stacklevel=3)
 

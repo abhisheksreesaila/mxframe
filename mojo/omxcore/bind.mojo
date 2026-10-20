@@ -1586,7 +1586,7 @@ struct _Binder(Movable):
             prec = x.b if x.b >= 0 else 18
             scale = x.c if x.c >= 0 else (3 if x.b < 0 else 0)
             if prec < 1 or prec > 18:
-                raise self.err(ast, "DECIMAL(" + String(prec) + ", " + String(scale) + "): MX frame stores a decimal in an int64, so the precision is 1 to 18")
+                raise self.err(ast, "DECIMAL(" + String(prec) + ", " + String(scale) + "): omxcore stores a decimal in an int64, so the precision is 1 to 18")
             if scale > prec:
                 raise self.err(ast, "DECIMAL(" + String(prec) + ", " + String(scale) + "): the scale is more than the precision")
         elif tname == "DOUBLE":
@@ -1623,9 +1623,9 @@ struct _Binder(Movable):
             ok = kind == BOOL.value or kind == INT.value or kind == DECIMAL.value or kind == FLOAT.value or kind == TEXT.value
         if not ok:
             raise self.err(ast, "cannot cast " + kind_name(fk, ax.scale) + " to " + tname + (" (DuckDB refuses it too)" if fk == DATE.value or kind == DATE.value else
-                           (": a float's text is its shortest form per row, which MX frame does not make" if fk == FLOAT.value and kind == TEXT.value else "")))
+                           (": a float's text is its shortest form per row, which omxcore does not make" if fk == FLOAT.value and kind == TEXT.value else "")))
         if kind == TEXT.value and fk != TEXT.value and fk != BOOL.value and ax.op != B_COL:
-            raise self.err(ast, "CAST(... AS VARCHAR) of " + kind_name(fk, ax.scale) + " needs a column, not an expression: MX frame writes the text of every value between the column's lowest and highest once, and knows that range for a column only")
+            raise self.err(ast, "CAST(... AS VARCHAR) of " + kind_name(fk, ax.scale) + " needs a column, not an expression: omxcore writes the text of every value between the column's lowest and highest once, and knows that range for a column only")
         if fk == kind and kind != DECIMAL.value and (kind != INT.value or bits >= 64) and (kind != FLOAT.value):      # the same type: nothing to do
             return a
         if fk == BOOL.value and kind == BOOL.value:
@@ -2186,7 +2186,7 @@ struct _Binder(Movable):
                 rkind = TEXT.value
                 src = a.src
             elif func == F_MEDIAN and a.kind == DATE.value:
-                raise self.err(x.items[0], "median() of a DATE is a TIMESTAMP in DuckDB (the middle of two dates can be half a day), which MX frame has no kind for yet (F-157): use quantile_disc(" +
+                raise self.err(x.items[0], "median() of a DATE is a TIMESTAMP in DuckDB (the middle of two dates can be half a day), which omxcore has no kind for yet (F-157): use quantile_disc(" +
                                self.st.render(x.items[0]) + ", 0.5)")
             elif func == F_MEDIAN:
                 if not _is_num(a.kind):

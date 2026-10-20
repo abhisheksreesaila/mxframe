@@ -2,9 +2,9 @@
 import pyarrow as pa
 import pytest
 
-from mxframe import LazyFrame, col, lit
-from mxframe.lazy_frame import Filter, Join, Scan
-from mxframe.optimizer import optimize_plan
+from omxcore import LazyFrame, col, lit
+from omxcore.lazy_frame import Filter, Join, Scan
+from omxcore.optimizer import optimize_plan
 
 
 def _i32(a):
@@ -55,7 +55,7 @@ def _write(tmp_path, name, table):
 
 
 def _leaves(plan):
-    from mxframe.lazy_frame import ParquetScan
+    from omxcore.lazy_frame import ParquetScan
     if isinstance(plan, ParquetScan):
         yield plan
     elif isinstance(plan, Join):
@@ -66,8 +66,8 @@ def _leaves(plan):
 
 
 def test_with_columns_after_a_join_reads_only_the_columns_the_aggregate_needs(tmp_path):
-    import mxframe as mx
-    from mxframe.io_parquet import resolve_plan
+    import omxcore as mx
+    from omxcore.io_parquet import resolve_plan
     fact = pa.table({"k": _i32([1, 2, 3, 4]), "d": _i32([10, 20, 30, 40]), "x": pa.array([1.0, 2.0, 3.0, 4.0]),
                      "pad1": pa.array(["a"] * 4), "pad2": pa.array([1.5] * 4)})
     dim = pa.table({"k": _i32([1, 2, 3, 4]), "name": pa.array(["p", "q", "p", "q"]),

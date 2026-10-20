@@ -1,7 +1,7 @@
 # F-131: the native kernels run from the package, with no Python: an exact int64 SUM and COUNT under a filter,
 # and the overflow flag when a total passes int64.
 from std.memory.alloc import unsafe_alloc
-from mxframe.kernels.pipeline_cpu import pipeline_plain, E_OVERFLOW
+from omxcore.kernels.pipeline_cpu import pipeline_plain, E_OVERFLOW
 
 
 def sum_where_ge3(w: Int, v: Int, n: Int) raises -> Tuple[Int, Int64, Int64]:

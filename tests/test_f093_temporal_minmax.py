@@ -6,8 +6,8 @@ import duckdb
 import pyarrow as pa
 import pytest
 
-import mxframe as mx
-from mxframe import LazyFrame, col
+import omxcore as mx
+from omxcore import LazyFrame, col
 
 DEVICES = ["cpu", "gpu"]
 D = dt.date

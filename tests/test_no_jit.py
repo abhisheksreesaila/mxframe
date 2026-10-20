@@ -9,10 +9,10 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-from mxframe import LazyFrame, col, lit, when
-from mxframe.lazy_frame import Scan
-import mxframe.custom_ops as custom_ops
-from mxframe.aot_kernels import AOT_AVAILABLE, GPU_AOT_AVAILABLE
+from omxcore import LazyFrame, col, lit, when
+from omxcore.lazy_frame import Scan
+import omxcore.custom_ops as custom_ops
+from omxcore.aot_kernels import AOT_AVAILABLE, GPU_AOT_AVAILABLE
 
 pytestmark = pytest.mark.skipif(not AOT_AVAILABLE, reason="libmxkernels_aot.so not built")
 
@@ -122,7 +122,7 @@ def test_query_shape_compiles_no_graph(device, shape, jit_counter):
 
 def test_cpu_device_never_initialises_the_gpu(monkeypatch):
     """device='cpu' must not create a CUDA context, load the GPU library or ask MAX for a GPU."""
-    import mxframe.aot_kernels as ak
+    import omxcore.aot_kernels as ak
     monkeypatch.setattr(ak, "_cuda_driver", None)
     monkeypatch.setattr(ak, "_aot_gpu_singleton", None)
     touched = []

@@ -8,9 +8,9 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-import mxframe.native_exec as nx
-from mxframe import col, lit
-from mxframe.np_arrow import array as A
+import omxcore.native_exec as nx
+from omxcore import col, lit
+from omxcore.np_arrow import array as A
 
 pytestmark = pytest.mark.skipif(not nx.available(), reason="libmxexec_cpu.so not built")
 
@@ -24,7 +24,7 @@ def star_scan(monkeypatch):
 
 @pytest.fixture
 def comp(monkeypatch):
-    import mxframe.custom_ops as co
+    import omxcore.custom_ops as co
     monkeypatch.setenv("MXFRAME_NATIVE", "1")
     return co.CustomOpsCompiler(device="cpu")
 
@@ -173,8 +173,8 @@ def test_unsupported_keys_decline(comp):
 
 # ── plans: a join tree runs as one scan of its largest Filter*(Scan) leaf ────────────────────
 
-from mxframe import LazyFrame  # noqa: E402
-import mxframe.join_engine as je  # noqa: E402
+from omxcore import LazyFrame  # noqa: E402
+import omxcore.join_engine as je  # noqa: E402
 
 
 def _tables(n=120_000):
@@ -277,7 +277,7 @@ def _same(got, old):
 
 @pytest.mark.parametrize("name", list(STAR_PLANS))
 def test_star_plans_match_the_leaf_by_leaf_join(star_scan, monkeypatch, name):
-    import mxframe.custom_ops as co
+    import omxcore.custom_ops as co
     t = _tables()
     star = []
     real = je._execute_star
@@ -291,7 +291,7 @@ def test_star_plans_match_the_leaf_by_leaf_join(star_scan, monkeypatch, name):
 
 def test_star_with_duplicate_partner_keys_expands(monkeypatch):
     """A partner whose join key repeats (one-to-many) is expanded by the star scan, as the leaf-by-leaf join does."""
-    import mxframe.custom_ops as co
+    import omxcore.custom_ops as co
     t = _tables()
     dup = pa.concat_tables([t["supp"], t["supp"]])
     plan = lambda t: (LazyFrame(t["li"]).filter(col("l_qty") < lit(10))
@@ -378,7 +378,7 @@ SEMI_PLANS = {
 
 @pytest.mark.parametrize("name", list(SEMI_PLANS))
 def test_semi_plans_match_and_skip_the_distinct(star_scan, monkeypatch, name):
-    import mxframe.custom_ops as co
+    import omxcore.custom_ops as co
     t = _tables()
     semis, star = [], []
     real = je._semi_partner
@@ -394,7 +394,7 @@ def test_semi_plans_match_and_skip_the_distinct(star_scan, monkeypatch, name):
 
 
 def test_distinct_of_more_than_the_keys_is_not_a_semi_join(monkeypatch):
-    import mxframe.custom_ops as co
+    import omxcore.custom_ops as co
     t = _tables()
     plan = lambda t: (LazyFrame(t["orders"])
                       .join(LazyFrame(t["li"]).filter(col("l_qty") < lit(3)).select("l_order", "l_qty").distinct(),
@@ -413,7 +413,7 @@ def test_a_selected_partner_is_filtered_natively_on_its_dictionary(monkeypatch):
     """Q17's `part.filter(brand, container).select(p_partkey)`: the Project only narrows the columns,
     so the partner is still a Filter*(Scan) leaf: its predicate runs in `mx_filter` on the
     dictionary codes (not decoded first, not evaluated in Python). F-032 (M2g)."""
-    import mxframe.custom_ops as co
+    import omxcore.custom_ops as co
     t = _tables()
     seen = []
     real = nx.try_filter
@@ -437,8 +437,8 @@ def test_a_selected_partner_read_from_parquet_keeps_its_strings_encoded(monkeypa
     read as a dictionary, filtered on its codes, and never decoded; a second select on top is not
     seen through (one Project, as in the join engine) and still answers the same."""
     import pyarrow.parquet as pq
-    import mxframe as mx
-    import mxframe.custom_ops as co
+    import omxcore as mx
+    import omxcore.custom_ops as co
     t = _tables()
     for n in ("li", "orders", "cust"):
         pq.write_table(t[n], tmp_path / f"{n}.parquet")
@@ -479,7 +479,7 @@ def test_a_filtered_string_also_selected_after_the_join_stays_encoded_in_its_lea
     """Q16's part: `p_brand != ...` in the leaf's filter and `p_brand` selected after the join. A bare
     projected column is decoded after the join's gather, so it does not force decoding the whole
     leaf first (io_parquet `bad_expr`): the leaf is filtered natively on its codes (M2h)."""
-    import mxframe.custom_ops as co
+    import omxcore.custom_ops as co
     t = _tables()
     seen = []
     real = nx.try_filter
@@ -507,7 +507,7 @@ def test_a_condition_inside_a_nested_star_partner(star_scan, monkeypatch):
     """Q8's shape with a condition inside the partner subtree (M2h review): orders -> customer runs
     as a star of its own (a nested `_execute_star`) with the condition applied there, and the answer
     equals the leaf-by-leaf join's."""
-    import mxframe.custom_ops as co
+    import omxcore.custom_ops as co
     t = _tables()
     calls = []
     real = je._execute_star

@@ -15,9 +15,9 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-import mxframe as mx
-import mxframe.native_exec as nx
-from mxframe import gpu_stream
+import omxcore as mx
+import omxcore.native_exec as nx
+from omxcore import gpu_stream
 
 GPU = gpu_stream.cuda_available()
 NAN = float("nan")

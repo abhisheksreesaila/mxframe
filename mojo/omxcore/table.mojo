@@ -1,4 +1,4 @@
-"""Tables and columns (docs/mxframe-mojo-api.md section 1).
+"""Tables and columns (docs/omxcore-mojo-api.md section 1).
 
 Every value is an Int64 underneath, column-major and contiguous, so the app borrows a column as `Span[Int64]` and
 the kernels read it as an int64 column with no conversion:

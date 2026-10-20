@@ -36,7 +36,7 @@ SHAPES = {
 def data(n):
     import numpy as np
     import pyarrow as pa
-    from mxframe.np_arrow import array as A
+    from omxcore.np_arrow import array as A
     r = np.random.default_rng(1)
     wide = r.integers(-2**62, 2**62, 1_000_000)
     k = r.integers(0, 5000, n)
@@ -57,9 +57,9 @@ def data(n):
 
 
 def one(shape, n, repeat):
-    import conftest  # noqa: F401  (import mxframe from this checkout)
-    import mxframe as mx
-    import mxframe.native_exec as nx
+    import conftest  # noqa: F401  (import omxcore from this checkout)
+    import omxcore as mx
+    import omxcore.native_exec as nx
     t, d = data(n)
     sql = SHAPES[shape]
     mx.sql(sql, t=t, d=d).compute(device="cpu")                     # warm-up (library load, plan)

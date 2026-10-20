@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Behind the scenes: how a query runs in MXFrame</title>
-<meta name="description" content="The path a MXFrame query takes from LazyFrame or SQL to the native Mojo executor, where each layer declines and who answers next, how to add an operator, and how to build the Mojo libraries.">
+<title>Behind the scenes: how a query runs in omxcore</title>
+<meta name="description" content="The path a omxcore query takes from LazyFrame or SQL to the native Mojo executor, where each layer declines and who answers next, how to add an operator, and how to build the Mojo libraries.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="site.css">
@@ -111,7 +111,7 @@
   <p>The Mojo sources compile ahead of time into shared libraries that ship in the wheel; nothing compiles at run time. You need <code>pixi</code> (the Mojo compiler comes from its environment).</p>
 <pre class="cmd"><span class="c"># once</span>
 pixi install
-pixi run setup-mxframe
+pixi run setup-omxcore
 
 <span class="c"># the CPU pipeline, the native executor and the GPU pipeline (scripts/build_pipeline.sh)</span>
 bash scripts/build_pipeline.sh            <span class="c"># all three</span>
@@ -137,6 +137,7 @@ pixi run test                             <span class="c"># pytest on tests/, fr
     <tr><td><code data-env="MXFRAME_FUSED_PIPELINE">MXFRAME_FUSED_PIPELINE</code></td><td>on</td><td><code>0</code> turns the fused pipeline off (A/B timing against the kernel path).</td><td><code data-path="pipeline_exec.py">pipeline_exec.py</code></td></tr>
     <tr><td><code data-env="MXFRAME_REPRODUCIBLE">MXFRAME_REPRODUCIBLE</code></td><td>off</td><td>1: float SUM / MEAN on every native CPU path are added in one defined order (per 65,536-row morsel in row order, then the morsels in order), bit-identical from run to run whatever the number of groups. Default: that order only for global aggregates and fused joins with 16,384 or more groups; every other group-by keeps the previous faster code. Read in Python as the default of <code>compute(reproducible=...)</code>; the native call gets it as a plan flag. <code>compute(reproducible=True)</code> sets it for one call.</td><td><code data-path="lazy_frame.py">lazy_frame.py</code>, <code data-path="kernels_aot/pipeline_cpu.mojo">kernels_aot/pipeline_cpu.mojo</code></td></tr>
     <tr><td><code data-env="MXFRAME_CPU_THREADS">MXFRAME_CPU_THREADS</code></td><td>native executor and fused pipeline: one per physical core, fewer for a small input (one per 128k rows); AOT kernels: every core in the process's affinity mask, hyperthreads included</td><td>Worker threads for the Mojo kernels. One value sets all three.</td><td><code data-path="pipeline_kernels.py">pipeline_kernels.py</code>, <code data-path="aot_kernels.py">aot_kernels.py</code></td></tr>
+    <tr><td><code data-env="MXFRAME_JOB_THREADS">MXFRAME_JOB_THREADS</code></td><td>Linux: on; macOS and serial builds: off</td><td>A build switch, not a variable: <code>mojo build -D MXFRAME_JOB_THREADS</code> runs each background job (<code>compute_job</code>, <code>sql_job</code>, …) on its own thread where the default is to run it inside the start call. <code>JOBS_ARE_THREADED</code> says which one was built.</td><td><code data-path="mojo/omxcore/job.mojo">mojo/omxcore/job.mojo</code></td></tr>
     <tr><td><code data-env="MXFRAME_EXEC_CPU_LIB">MXFRAME_EXEC_CPU_LIB</code></td><td>kernels_aot/</td><td>Path to a <code>libmxexec_cpu.so</code> to load instead of the shipped one (your own build).</td><td><code data-path="native_exec.py">native_exec.py</code></td></tr>
     <tr><td><code data-env="MXFRAME_PIPELINE_CPU_LIB">MXFRAME_PIPELINE_CPU_LIB</code></td><td>kernels_aot/</td><td>Path override for <code>libmxpipeline_cpu.so</code>.</td><td><code data-path="pipeline_kernels.py">pipeline_kernels.py</code></td></tr>
     <tr><td><code data-env="MXFRAME_PIPELINE_GPU_LIB">MXFRAME_PIPELINE_GPU_LIB</code></td><td>kernels_aot/</td><td>Path override for <code>libmxpipeline_gpu.so</code>.</td><td><code data-path="pipeline_kernels.py">pipeline_kernels.py</code></td></tr>
@@ -153,18 +154,18 @@ pixi run test                             <span class="c"># pytest on tests/, fr
     <tr><td><code data-env="MXFRAME_RUNTIME_JOIN_FILTER">MXFRAME_RUNTIME_JOIN_FILTER</code></td><td>auto</td><td><code>0</code> never cuts a large join partner to the keys the fact table's filter keeps before indexing it; <code>1</code> does whenever the row counts allow (partner over twice the surviving fact rows, fact keeps at most half); auto also needs the partner's map to be larger than the last-level cache.</td><td><code data-path="join_engine.py">join_engine.py</code></td></tr>
     <tr><td><code data-env="MXFRAME_GPU_MEM_BUDGET">MXFRAME_GPU_MEM_BUDGET</code></td><td>the GPU's free memory</td><td>Test knob: caps the GPU memory the pre-check counts (<code>512M</code>, or <code>0:512M,1:2G</code> per GPU), so a small GPU can be faked and the out-of-memory fallback exercised.</td><td><code data-path="gpu_budget.py">gpu_budget.py</code></td></tr>
     <tr><td><code data-env="MXFRAME_HOST_MEM_BUDGET">MXFRAME_HOST_MEM_BUDGET</code></td><td>70% of free RAM</td><td>Host memory a query may use (<code>64M</code>, <code>2G</code>). A <code>scan_parquet</code> query whose columns (times 3) are bigger than this runs in batches of row groups with merged partial aggregates, so memory is one batch plus the group state. Also a test knob: a small budget makes a small file "bigger than memory".</td><td><code data-path="streamed.py">streamed.py</code></td></tr>
-    <tr><td><code data-env="MXFRAME_SPILL_DIR">MXFRAME_SPILL_DIR</code></td><td><code>~/.cache/mxframe/spill</code></td><td>Where a streamed aggregate whose group state is bigger than the memory budget writes its hash partitions (Arrow IPC files, in a <code>mxframe-spill-&lt;pid&gt;-*</code> folder removed when the query ends or fails; folders of dead processes are removed at the next spill). Never <code>$TMPDIR</code> by default: that is often tmpfs, i.e. RAM, and mxframe warns when the directory is RAM-backed. Spilling raises a clear error naming the directory when the disk is full or too small.</td><td><code data-path="spill.py">spill.py</code></td></tr>
+    <tr><td><code data-env="MXFRAME_SPILL_DIR">MXFRAME_SPILL_DIR</code></td><td><code>~/.cache/mxframe/spill</code></td><td>Where a streamed aggregate whose group state is bigger than the memory budget writes its hash partitions (Arrow IPC files, in a <code>mxframe-spill-&lt;pid&gt;-*</code> folder removed when the query ends or fails; folders of dead processes are removed at the next spill). Never <code>$TMPDIR</code> by default: that is often tmpfs, i.e. RAM, and omxcore warns when the directory is RAM-backed. Spilling raises a clear error naming the directory when the disk is full or too small.</td><td><code data-path="spill.py">spill.py</code></td></tr>
     <tr><td><code data-env="MXFRAME_STREAM">MXFRAME_STREAM</code></td><td>1</td><td><code>0</code> turns streamed execution off: a file bigger than the budget is read whole, as before.</td><td><code data-path="streamed.py">streamed.py</code></td></tr>
     <tr><td><code data-env="MXFRAME_COPROC">MXFRAME_COPROC</code></td><td>on</td><td><code>0</code> turns off CPU+GPU co-processing of fused aggregates under <code>device="auto"</code>.</td><td><code data-path="coproc_fused.py">coproc_fused.py</code></td></tr>
-    <tr><td><code data-env="MXFRAME_WARM">MXFRAME_WARM</code></td><td>on</td><td><code>0</code> disables the CPU warm-up thread that <code>import mxframe</code> starts (loads the Mojo runtime in the background).</td><td><code data-path="__init__.py">__init__.py</code></td></tr>
+    <tr><td><code data-env="MXFRAME_WARM">MXFRAME_WARM</code></td><td>on</td><td><code>0</code> disables the CPU warm-up thread that <code>import omxcore</code> starts (loads the Mojo runtime in the background).</td><td><code data-path="__init__.py">__init__.py</code></td></tr>
     <tr><td><code data-env="MXFRAME_READ_THREADS">MXFRAME_READ_THREADS</code></td><td>half the cores, 2 to 8</td><td>Parquet decode threads.</td><td><code data-path="io_parquet.py">io_parquet.py</code></td></tr>
     <tr><td><code data-env="MXFRAME_CALIBRATION">MXFRAME_CALIBRATION</code></td><td>~/.mxframe/calibration.json</td><td>Where auto mode keeps its measured constants.</td><td><code data-path="calibration.py">calibration.py</code></td></tr>
     <tr><td><code data-env="MXFRAME_GPU_GATHER_MIN_ROWS">MXFRAME_GPU_GATHER_MIN_ROWS</code></td><td>never (gathers stay on the CPU)</td><td>Row count above which a join's gather runs on the GPU.</td><td><code data-path="join_engine.py">join_engine.py</code></td></tr>
     <tr><td><code data-env="MXFRAME_JOIN_TRACE">MXFRAME_JOIN_TRACE</code></td><td>off</td><td>Any value prints one line per join step to stderr.</td><td><code data-path="join_engine.py">join_engine.py</code></td></tr>
     <tr><td><code data-env="MXFRAME_BUILD_FLAGS">MXFRAME_BUILD_FLAGS</code></td><td>unset</td><td>Extra <code>mojo build</code> flags for <code>scripts/mojo_build.sh</code> (tests and bench tools), e.g. <code>-D MXFRAME_SERIAL</code> to build a program against the serial package.</td><td><code data-path="scripts/mojo_build.sh">scripts/mojo_build.sh</code></td></tr>
-    <tr><td><code data-env="MXFRAME_NO_GPU">MXFRAME_NO_GPU</code></td><td>off (Linux)</td><td>Mojo build define (<code>mojo build -D MXFRAME_NO_GPU</code>), not an environment variable: compiles the Mojo package without its GPU code, as every non-Linux target is. <code>DeviceTable</code> and <code>compute(GPU)</code> raise "no GPU on this build" and AUTO is the CPU.</td><td><code data-path="mojo/mxframe/gpu.mojo">mojo/mxframe/gpu.mojo</code></td></tr>
+    <tr><td><code data-env="MXFRAME_NO_GPU">MXFRAME_NO_GPU</code></td><td>off (Linux)</td><td>Mojo build define (<code>mojo build -D MXFRAME_NO_GPU</code>), not an environment variable: compiles the Mojo package without its GPU code, as every non-Linux target is. <code>DeviceTable</code> and <code>compute(GPU)</code> raise "no GPU on this build" and AUTO is the CPU.</td><td><code data-path="mojo/omxcore/gpu.mojo">mojo/omxcore/gpu.mojo</code></td></tr>
     <tr><td><code data-env="MXFRAME_SERIAL">MXFRAME_SERIAL</code></td><td>off (Linux)</td><td>Mojo build define: the CPU kernels run their tasks in a plain loop and link no Mojo async runtime (the default on every non-Linux target).</td><td><code data-path="kernels_aot/_fpenv.mojo">kernels_aot/_fpenv.mojo</code></td></tr>
-    <tr><td><code data-env="MXFRAME_NO_CODECS">MXFRAME_NO_CODECS</code></td><td>off (Linux)</td><td>Mojo build define: the Mojo package links no zstd or snappy. Parquet saves UNCOMPRESSED and refuses a zstd or snappy file with an error naming the column (the default on every non-Linux target).</td><td><code data-path="mojo/mxframe/parquet.mojo">mojo/mxframe/parquet.mojo</code></td></tr>
+    <tr><td><code data-env="MXFRAME_NO_CODECS">MXFRAME_NO_CODECS</code></td><td>off (Linux)</td><td>Mojo build define: the Mojo package links no zstd or snappy. Parquet saves UNCOMPRESSED and refuses a zstd or snappy file with an error naming the column (the default on every non-Linux target).</td><td><code data-path="mojo/omxcore/parquet.mojo">mojo/omxcore/parquet.mojo</code></td></tr>
   </table></div></div>
   <h3>Test suite only</h3>
   <div class="card"><div class="tablewrap"><table class="t">
@@ -218,7 +219,7 @@ pixi run test                             <span class="c"># pytest on tests/, fr
   "seam_out": "An output block of buffer addresses in a Mojo-owned arena, wrapped without copying into a pyarrow Table.",
   "declines": "Returns None, and records the reason, when (for example): the plan is not an aggregate; its input is not a scan of one table (a join has been materialised by then, so a join's aggregate is a scan of the joined table); the device is not cpu (a GPU session's own fallback is the exception); a CPU+GPU co-processing policy is active; the library is not built; the input is empty; a column has nulls or an unsupported type; a filter or aggregate expression is outside the bytecode compiler; a derived group key is not a small integer range; a HAVING is anything but AND-ed aggregate-versus-number comparisons; a sort is by an expression or by something that is not a key or an aggregate; an int64 value is past 2^53; or the executor returns a negative code. It also declines when MXFRAME_NATIVE=0. native_exec.last_decline() gives the exact reason.",
   "next": "Layer 05, the fused pipeline, for the same aggregate.",
-  "see": "<code>lf.last_compile_provenance[\"path\"]</code> is <code>\"native\"</code>. When it is not, <code>mxframe.native_exec.last_decline()</code> says why.",
+  "see": "<code>lf.last_compile_provenance[\"path\"]</code> is <code>\"native\"</code>. When it is not, <code>omxcore.native_exec.last_decline()</code> says why.",
   "switch": "MXFRAME_NATIVE", "switch_off": "0",
   "labels": ["native"]},
  {"id": "fused", "name": "Fused pipeline", "short": "Filter + group + aggregate in one pass.",
@@ -255,7 +256,7 @@ pixi run test                             <span class="c"># pytest on tests/, fr
 ]}
 </script>
 <script>
-const BLOB = "https://github.com/abhisheksreesaila/mxframe/blob/main/";
+const BLOB = "https://github.com/abhisheksreesaila/omxcore/blob/main/";
 const DATA = JSON.parse(document.getElementById("layers-data").textContent);
 const stack = document.getElementById("stack"), detail = document.getElementById("detail");
 

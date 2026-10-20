@@ -1,4 +1,4 @@
-"""import mxframe starts a CPU-only warm-up thread (kernel libraries + engine modules)."""
+"""import omxcore starts a CPU-only warm-up thread (kernel libraries + engine modules)."""
 import subprocess
 import sys
 from pathlib import Path
@@ -15,18 +15,18 @@ def _run(code, env_extra=None):
 
 def test_warm_loads_cpu_libraries_without_touching_the_gpu():
     out = _run("""
-import mxframe, time
-assert mxframe._warm_thread is not None
-mxframe._warm_thread.join(30)
+import omxcore, time
+assert omxcore._warm_thread is not None
+omxcore._warm_thread.join(30)
 maps = open('/proc/self/maps').read()
 print('libmxkernels_aot.so' in maps, 'libmxpipeline_cpu.so' in maps, 'libcuda' in maps,
-      'mxframe.custom_ops' in sys.modules, 'pandas' in sys.modules)
+      'omxcore.custom_ops' in sys.modules, 'pandas' in sys.modules)
 """)
     assert out.split() == ["True", "True", "False", "True", "False"]
 
 
 def test_warm_can_be_disabled():
-    out = _run("import mxframe; print(mxframe._warm_thread is None, 'mxframe.custom_ops' in sys.modules)",
+    out = _run("import omxcore; print(omxcore._warm_thread is None, 'omxcore.custom_ops' in sys.modules)",
                {"MXFRAME_WARM": "0"})
     assert out.split() == ["True", "False"]
 
@@ -35,7 +35,7 @@ def test_read_parquet_does_not_import_pandas(tmp_path):
     import pyarrow as pa, pyarrow.parquet as pq
     p = tmp_path / "a.parquet"
     pq.write_table(pa.table({"x": [1, 2, 3]}), p)
-    out = _run(f"import mxframe as mx; mx.read_parquet({str(p)!r}, columns=['x']).compute(device='cpu'); print('pandas' in sys.modules)",
+    out = _run(f"import omxcore as mx; mx.read_parquet({str(p)!r}, columns=['x']).compute(device='cpu'); print('pandas' in sys.modules)",
                {"MXFRAME_WARM": "0"})
     assert out == "False"
 
@@ -44,8 +44,8 @@ def test_fork_right_after_import_does_not_deadlock():
     out = _run("""
 import os, signal, time
 import numpy as np, pyarrow as pa
-import mxframe
-from mxframe import LazyFrame, col
+import omxcore
+from omxcore import LazyFrame, col
 ok = 0
 for delay in (0.001, 0.005, 0.01, 0.02):
     pid = os.fork()
@@ -62,7 +62,7 @@ print(ok)
 
 
 def test_import_defers_heavy_modules():
-    out = _run("import mxframe; print(*[m in sys.modules for m in "
+    out = _run("import omxcore; print(*[m in sys.modules for m in "
                "('sqlglot', 'pyarrow.parquet', 'pyarrow.csv', 'pyarrow.compute', 'pandas')])",
                {"MXFRAME_WARM": "0"})
     assert out.split() == ["False"] * 5

@@ -1,6 +1,6 @@
 # F-148: the holistic states (count distinct, percentiles, top-k) on (group, value) pairs, against a plain oracle:
 # per group, collect the values, sort them (a merge sort written here), and read the answers off the sorted list.
-from mxframe.holistic import HolStates, HolSpec, HolResult, A_DISTINCT, A_PCT, A_TOPK, A_MEDIAN
+from omxcore.holistic import HolStates, HolSpec, HolResult, A_DISTINCT, A_PCT, A_TOPK, A_MEDIAN
 
 
 struct Rng(Movable):

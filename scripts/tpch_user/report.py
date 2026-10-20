@@ -227,7 +227,7 @@ def render_markdown(rows: list[dict], meta: dict, engines: list[str], queries: l
               "order (lineitem by order key, ...).\n")
         a("**Engine-only:** a fresh Python process; each engine first loads the columns the query uses "
           "from Parquet into its own in-memory form (pandas / Polars DataFrame, DuckDB table, Arrow table "
-          "under an MXFrame LazyFrame), outside the clock; the clock then covers *query + materialized "
+          "under an omxcore LazyFrame), outside the clock; the clock then covers *query + materialized "
           "result* only. No warm-up run. Loading data is staging; this is the headline measure (since 2026-10-13). The user-felt "
           "scoreboard (clock around read + query) is the secondary number. "
           "Load and `import` times are reported separately. "
@@ -244,7 +244,7 @@ def render_markdown(rows: list[dict], meta: dict, engines: list[str], queries: l
       "verified; it never counts as fastest or as a win), `TIMEOUT` / `CRASH` / `ERR` = did not produce a result "
       f"(timeout {meta['timeout']:.0f}s per subprocess). `outside mx` = the mx engines do part of that query with "
       "PyArrow/NumPy because the LazyFrame API cannot express it (details under Query semantics); every other "
-      "mx query is pure mxframe.\n")
+      "mx query is pure omxcore.\n")
 
     for sf in sfs:
         srows = [r for r in rows if r["sf"] == sf]
@@ -288,7 +288,7 @@ def render_markdown(rows: list[dict], meta: dict, engines: list[str], queries: l
                 lost = losses_vs(rows, sf, queries, mxs)
                 if lost and (label == "mx-auto" or len(mxs) > 1):
                     a(f"### Where {label} loses to Polars at SF{sf} (worst first)\n")
-                    a(_table(["query", "engine", "MXFrame ms", "Polars ms", "slower by"],
+                    a(_table(["query", "engine", "omxcore ms", "Polars ms", "slower by"],
                              [[f"Q{q} {spec.TITLES[q]}", e, fmt_ms(m), fmt_ms(p), f"{r:.1f}x"]
                               for r, q, e, m, p in lost]))
                     a("")
@@ -302,12 +302,12 @@ def render_markdown(rows: list[dict], meta: dict, engines: list[str], queries: l
         body.append([f"**sum ({nq} queries)**"] + [f"**{fmt_ms(tot[e])}**" for e in eng])
         a(_table(["query"] + [NAMES[e] for e in eng], body))
         if mx_shown and engine_only:
-            a("\n> `import mxframe` starts a background thread that warms the CPU kernel libraries. In this "
+            a("\n> `import omxcore` starts a background thread that warms the CPU kernel libraries. In this "
               "mode it finishes during the untimed load, so the mx first runs start with warm kernel "
               "libraries; the other engines' loads also start their thread pools / connections, but have "
               "no equivalent of that thread.\n")
         elif mx_shown:
-            a("\n> `import mxframe` starts a background thread that warms the CPU kernel libraries while "
+            a("\n> `import omxcore` starts a background thread that warms the CPU kernel libraries while "
               "the user's code runs. Its cost is in neither `import` (it returns immediately) nor the headline "
               "unless it contends with the query for cores; the other engines have no equivalent.\n")
 
@@ -316,7 +316,7 @@ def render_markdown(rows: list[dict], meta: dict, engines: list[str], queries: l
             body = [[f"Q{q}"] + [fmt_ms((by.get((e, q)) or {}).get("load_ms")) for e in eng] for q in queries]
             a(_table(["query"] + [NAMES[e] for e in eng], body))
             a("\n> Each engine reads only the columns the query uses, but no engine can skip row groups "
-              "with the query's filters here (Polars, DuckDB and MXFrame push filters into the reader in "
+              "with the query's filters here (Polars, DuckDB and omxcore push filters into the reader in "
               "the user-felt run).\n")
 
         a(f"### SF{sf}: repeat run in the same process, ms (secondary: warm caches / JIT / result caches)\n")
@@ -396,23 +396,23 @@ def render_markdown(rows: list[dict], meta: dict, engines: list[str], queries: l
         a("- **Loading** (untimed): every engine is given the columns the query uses. pandas "
           "`pd.read_parquet(columns=...)`, Polars `pl.read_parquet(columns=...)`, DuckDB "
           "`CREATE TABLE ... AS SELECT <columns> FROM read_parquet(...)` (its native in-memory storage), "
-          "MXFrame `mx.read_parquet_table(columns=..., dictionary=\"auto\")` (the `scan_parquet` reader; "
+          "omxcore `mx.read_parquet_table(columns=..., dictionary=\"auto\")` (the `scan_parquet` reader; "
           "low-cardinality strings as dictionaries).")
         a("- **Engines**: pandas, Polars (`df.lazy()` + `collect()`), DuckDB (the same SQL over the loaded "
-          "tables, also the correctness reference), MXFrame `device=\"cpu\"|\"gpu\"|\"auto\"` through the "
+          "tables, also the correctness reference), omxcore `device=\"cpu\"|\"gpu\"|\"auto\"` through the "
           "public `LazyFrame` API over the loaded Arrow tables; multi-stage queries `.compute()` a small "
           "intermediate and wrap it with `mx.LazyFrame(table)`. Work the API cannot express is done with "
           "PyArrow/NumPy inside the timed region and listed per query below.")
-        a("- **What \"loaded\" means for MXFrame**: the Arrow tables stay as read (chunked, in host memory). "
-          "Inside the clock MXFrame still combines chunks, hands buffers to its kernels and, on the GPU, "
+        a("- **What \"loaded\" means for omxcore**: the Arrow tables stay as read (chunked, in host memory). "
+          "Inside the clock omxcore still combines chunks, hands buffers to its kernels and, on the GPU, "
           "uploads them; the other engines start from their own native in-memory format.")
     else:
         a("- **Column pruning**: nobody passes a column list. Polars (`scan_parquet`), DuckDB "
-          "and MXFrame (`mx.scan_parquet`, one lazy scan per table; low-cardinality strings are read as "
+          "and omxcore (`mx.scan_parquet`, one lazy scan per table; low-cardinality strings are read as "
           "dictionaries) prune to the columns each query references; pandas uses "
           "`pd.read_parquet(columns=...)` with the columns the query uses (it has no lazy reader).")
         a("- **Engines**: pandas (eager), Polars (lazy `scan_parquet` + `collect()`), DuckDB "
-          "(SQL over `read_parquet`, also the correctness reference), MXFrame `device=\"cpu\"|\"gpu\"|\"auto\"` "
+          "(SQL over `read_parquet`, also the correctness reference), omxcore `device=\"cpu\"|\"gpu\"|\"auto\"` "
           "through the public `LazyFrame` API; multi-stage queries `.compute()` a small intermediate and wrap it "
           "with `mx.LazyFrame(table)`. Work the API cannot express is done with PyArrow/NumPy inside the timed "
           "region and listed per query below.")
@@ -420,13 +420,13 @@ def render_markdown(rows: list[dict], meta: dict, engines: list[str], queries: l
       "float columns at 1e-6 relative, matched by key columns; LIMIT queries tolerate rows that tie at the "
       "cutoff within 1e-6) and then checked to be in the query's ORDER BY order. Inputs are float32; an "
       "engine that accumulates in float32 drifts on large sums (`†`), DuckDB sums in double. "
-      "A one-row aggregate over no rows is NULL in SQL (DuckDB, MXFrame) and 0 in pandas and Polars; "
+      "A one-row aggregate over no rows is NULL in SQL (DuckDB, omxcore) and 0 in pandas and Polars; "
       "for pandas and Polars the comparison counts their 0 as the same answer (it happens only on tiny data).")
     a(f"- **Hardware**: {meta['cpu']} ({meta['cores']} cores); GPU: {meta['gpu']} "
       f"({meta['gpu_desc']}; the workers get `CUDA_VISIBLE_DEVICES=<that UUID>`, so it is the same "
       f"card nvidia-smi calls by that index). **The machine was shared with other jobs during this run "
       f"({load_txt}load average at report time: {meta['loadavg']}), so timings are indicative.**")
-    a(f"- **Versions**: " + ", ".join(f"{k} {x}" for k, x in v.items()) + f"; mxframe at git `{meta['git']}`. "
+    a(f"- **Versions**: " + ", ".join(f"{k} {x}" for k, x in v.items()) + f"; omxcore at git `{meta['git']}`. "
       f"Last invocation took {meta['elapsed_min']:.0f} min. Data root: `{meta['data_root']}`.")
     a("\n### Query semantics\n")
     a("All engines and the DuckDB reference compute the same query. Where it differs from the official "
@@ -434,8 +434,8 @@ def render_markdown(rows: list[dict], meta: dict, engines: list[str], queries: l
     for q, text in sorted(spec.DEVIATIONS.items()):
         a(f"- Q{q}: {text}")
     a("")
-    a("**Work the mx engines do outside mxframe** (PyArrow / NumPy inside the timed region; all other "
-      "queries are pure mxframe):\n")
+    a("**Work the mx engines do outside omxcore** (PyArrow / NumPy inside the timed region; all other "
+      "queries are pure omxcore):\n")
     for q, text in sorted(spec.OUTSIDE_MX.items()):
         a(f"- Q{q}: {text}")
     a("")

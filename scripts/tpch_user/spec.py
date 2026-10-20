@@ -179,8 +179,8 @@ ORDER_BY: dict[int, list[tuple[int, bool]]] = {
     22: [(0, False)],
 }
 
-# Work the mx engines do OUTSIDE mxframe (PyArrow / NumPy on the timed path), per query; the
-# report prints it. Queries not listed are pure mxframe (scan_parquet -> LazyFrame -> compute,
+# Work the mx engines do OUTSIDE omxcore (PyArrow / NumPy on the timed path), per query; the
+# report prints it. Queries not listed are pure omxcore (scan_parquet -> LazyFrame -> compute,
 # plus reading a scalar back out of a small computed table). Implemented in q_mx.py.
 OUTSIDE_MX: dict[int, str] = {
     13: "PyArrow: appends the zero-order customer row (customers minus customers with orders); no left join: "

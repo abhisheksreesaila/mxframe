@@ -1,4 +1,4 @@
-"""Calibration store for MXFrame auto mode (F-003).
+"""Calibration store for omxcore auto mode (F-003).
 
 Measures, persists and serves the constants the auto-mode cost model needs:
 
@@ -529,7 +529,7 @@ class Calibration:
                 return False
 
     def summary(self) -> str:
-        L = [f"MXFrame calibration [{self.source}, {'quick' if self.quick else 'full'}]  {self.key}",
+        L = [f"omxcore calibration [{self.source}, {'quick' if self.quick else 'full'}]  {self.key}",
              f"  cpu threads={self.cpu_threads} (cores={self.cpu_cores}), gpu={self.has_gpu}, "
              f"pinned={self.pinned_available}, gpu_mem={self.gpu_mem_bytes / 2**30:.1f} GiB"]
         if self.has_gpu:
@@ -1545,7 +1545,7 @@ def _run_gpu_subprocess(sizes: Tuple[int, ...], budget_s: float, link_mb: Tuple[
     import subprocess
     if item_timeout_s is None:
         item_timeout_s = max(45.0, 20.0 * budget_s)
-    pkg = __package__ or "mxframe"
+    pkg = __package__ or "omxcore"
     code = f"import {pkg}.calibration as c; c._gpu_worker_main()"
     env = dict(os.environ)
     env["PYTHONPATH"] = os.pathsep.join([p for p in sys.path if p])

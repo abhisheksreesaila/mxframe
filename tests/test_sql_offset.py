@@ -6,8 +6,8 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-import mxframe as mx
-from mxframe import gpu_stream
+import omxcore as mx
+from omxcore import gpu_stream
 
 
 def _t(n=400):
@@ -28,7 +28,7 @@ def _w():
 
 
 def _duck(q, t):
-    """DuckDB's answer (the default connection renames a repeated output name to x_1, as MXFrame does)."""
+    """DuckDB's answer (the default connection renames a repeated output name to x_1, as omxcore does)."""
     w = _w()                                                    # noqa: F841 (found by DuckDB by name)
     exp = duckdb.sql(q).arrow()
     return exp.read_all() if isinstance(exp, pa.RecordBatchReader) else exp
@@ -125,8 +125,8 @@ def test_dataframe_offset_below_a_sort():
 
 def _topn_calls(q, monkeypatch, n):
     """The k every top-n pass was asked for: the sort kernel's `topk` and the native heap's k."""
-    from mxframe import native_exec
-    from mxframe.custom_ops import CustomOpsCompiler
+    from omxcore import native_exec
+    from omxcore.custom_ops import CustomOpsCompiler
     seen = {"sort": [], "heap": []}
     orig_sort = CustomOpsCompiler._apply_sort_custom
 
@@ -161,7 +161,7 @@ def test_top_n_with_a_hidden_key_and_offset(monkeypatch):
 
 
 def test_filtered_top_n_keeps_the_native_path_with_an_offset(monkeypatch):
-    from mxframe import native_exec
+    from omxcore import native_exec
     ks = []
     orig = native_exec.try_filter_topk
 

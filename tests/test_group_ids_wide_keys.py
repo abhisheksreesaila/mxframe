@@ -3,7 +3,7 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-from mxframe import LazyFrame, col
+from omxcore import LazyFrame, col
 
 
 def _table(n, cards, seed=0):

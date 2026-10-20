@@ -17,8 +17,8 @@ Step 3 — Compare with synthetic baseline:
 Output columns:
     Pandas   — pandas 2.x (CPU, single-threaded)
     Polars   — Polars lazy API (CPU, multithreaded)
-    MX CPU   — MXFrame Mojo AOT kernels (CPU)
-    MX GPU   — MXFrame Mojo AOT kernels (GPU via Modular MAX Engine)
+    MX CPU   — omxcore Mojo AOT kernels (CPU)
+    MX GPU   — omxcore Mojo AOT kernels (GPU via Modular MAX Engine)
 
 Data provenance:
     DuckDB dbgen generates data according to the TPC-H specification v3.0.1.

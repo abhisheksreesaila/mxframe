@@ -5,7 +5,7 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-from mxframe import LazyFrame
+from omxcore import LazyFrame
 
 
 def _t(name, vals, typ):
@@ -43,7 +43,7 @@ def test_uint64_with_signed_is_refused_everywhere(other, wide):
 
 @pytest.mark.parametrize("device", ["cpu", "auto"])
 def test_composite_uint64_keys_above_2_63(device):
-    from mxframe import LazyFrame, col
+    from omxcore import LazyFrame, col
     top = np.uint64(2**64 - 20)
     a = pa.table({"k1": pa.array(np.array([top, top + np.uint64(1), top, 5], dtype=np.uint64)),
                   "k2": pa.array(np.array([1, 2, 3, 1], dtype=np.int32)), "v": pa.array([1.0, 2.0, 3.0, 4.0])})

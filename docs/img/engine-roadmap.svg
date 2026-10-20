@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1059" viewBox="0 0 1200 1059" role="img" aria-labelledby="t d">
-<title id="t">MX frame roadmap: the path to omxcore</title>
+<title id="t">omxcore roadmap: the path to omxcore</title>
 <desc id="d">Vision: DuckDB-class SQL that uses your GPU and links into any app with no Python. Plug and play with the CSV and Parquet files you already have. What omxcore can be: A faster drop-in for DuckDB; GPU-native analytics on one machine; An embedded engine for apps; The data engine for AI agents; The compute half of a lakehouse; Live dataframes for simulation; ML data prep. The path: 1. SQL and joins, then the TPC-H 22 gate (we are here); 2. Quiet-machine scoreboard; 3. Close the gaps; 4. omxcore 0.7.0; 5. Agent-native plugins; 6. Bigger than RAM, the long tail. Built for agents (plugins on the core · planned · m10, after 0.7.0): Plug and play: point it at your CSV and Parquet files. mx (today): speaks JSON, starts in 12 ms, no Python; Vector search, GPU-native (planned): embeddings beside your data; nearest-k with SQL filters in one query; Agent search (planned): keyword + vector + SQL in one ranked call, with why each row matched; Classification and decision API (planned): label or route rows, batched on the GPU; MCP server (with 0.7.0): every agent gets sql / explain / schema / search as tools; Agent memory (planned): facts with time and source, queried like any table.</desc>
 <defs>
   <pattern id="rule" width="24" height="24" patternUnits="userSpaceOnUse"><path d="M0 23.5H24" stroke="#D8D0C2" stroke-opacity=".45"/></pattern>
@@ -8,8 +8,8 @@
 <g clip-path="url(#clip)">
 <rect width="1200" height="1059" fill="#F2EFE7"/>
 <rect y="72" width="1200" height="1059" fill="url(#rule)"/>
-<text x="56" y="46" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="16" font-weight="800" letter-spacing="5" fill="#20221F">M<tspan fill="#6C3E78">X</tspan> FRAME</text>
-<text x="206.0" y="46.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="12" font-weight="700" fill="#6E716A" text-anchor="start" letter-spacing="3">THE ROADMAP · SOON OMXCORE</text>
+<text x="56" y="46" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="16" font-weight="800" letter-spacing="5" fill="#20221F">OM<tspan fill="#6C3E78">X</tspan>CORE</text>
+<text x="206.0" y="46.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="12" font-weight="700" fill="#6E716A" text-anchor="start" letter-spacing="3">THE ROADMAP · OMXCORE</text>
 <text x="1144.0" y="46.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="12" font-weight="700" fill="#6E716A" text-anchor="end" letter-spacing="1">docs/briefs/positioning.md</text>
 <path d="M56 64H1144" stroke="#20221F" stroke-width="1.5"/>
 <text x="56.0" y="122.0" font-family="Georgia, 'Times New Roman', Times, serif" font-size="38" font-weight="400" fill="#20221F" text-anchor="start" font-style="italic">DuckDB-class SQL that uses your GPU and links into any</text>
@@ -67,11 +67,11 @@
 <text x="418.7" y="569.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#4C5049" text-anchor="start">join speed, sort and large</text>
 <text x="418.7" y="586.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#4C5049" text-anchor="start">outputs, window functions</text>
 <circle cx="610.0" cy="492" r="7" fill="#FFFDF8" stroke="#BEB4A4" stroke-width="2"/>
-<text x="600.0" y="526.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="10.5" font-weight="700" fill="#6C3E78" text-anchor="start">4 · F-165 · F-169</text>
+<text x="600.0" y="526.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="10.5" font-weight="700" fill="#6C3E78" text-anchor="start">4 · F-169</text>
 <text x="600.0" y="548.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="15" font-weight="700" fill="#20221F" text-anchor="start">omxcore 0.7.0</text>
-<text x="600.0" y="569.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#4C5049" text-anchor="start">the rename, plus an MCP</text>
-<text x="600.0" y="586.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#4C5049" text-anchor="start">server so agents reach for</text>
-<text x="600.0" y="603.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#4C5049" text-anchor="start">it first</text>
+<text x="600.0" y="569.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#4C5049" text-anchor="start">an MCP server so agents</text>
+<text x="600.0" y="586.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#4C5049" text-anchor="start">reach for it first (the</text>
+<text x="600.0" y="603.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#4C5049" text-anchor="start">rename is done)</text>
 <circle cx="791.3333333333334" cy="492" r="7" fill="#FFFDF8" stroke="#BEB4A4" stroke-width="2"/>
 <text x="781.3" y="526.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="10.5" font-weight="700" fill="#6C3E78" text-anchor="start">5 · M10</text>
 <text x="781.3" y="548.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="15" font-weight="700" fill="#20221F" text-anchor="start">Agent-native</text>

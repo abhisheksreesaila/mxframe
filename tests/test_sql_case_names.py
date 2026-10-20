@@ -11,7 +11,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-import mxframe as mx
+import omxcore as mx
 
 
 def _t():
@@ -261,7 +261,7 @@ def test_unknown_column_still_raises():
 def test_nested_subqueries_translate_each_query_once():
     """IN over a derived table, 8 deep: names are resolved by the translator that builds each query, not by
     an extra throwaway copy (which doubled the work per level: 0.4 s -> 6 s)."""
-    from mxframe import sql_frontend as sf
+    from omxcore import sql_frontend as sf
     q = "SELECT CUSTOMERID FROM t"
     for k in range(8):
         q = f"SELECT customerid FROM t WHERE customerid IN (SELECT customerid FROM ({q}) AS d{k})"

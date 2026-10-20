@@ -94,8 +94,8 @@ def test_csv_files_the_pages_read_have_no_quotes():
 
 
 def test_pages_workflow_publishes_the_kernel_visualizer():
-    """site.js links visualize/mxframe_pipeline.html; it lives outside docs/site and is copied in at deploy."""
+    """site.js links visualize/omxcore_pipeline.html; it lives outside docs/site and is copied in at deploy."""
     wf = (ROOT / ".github" / "workflows" / "pages.yml").read_text()
     assert "cp -r visualize _site/visualize" in wf
-    assert (ROOT / "visualize" / "mxframe_pipeline.html").is_file()
-    assert "visualize/mxframe_pipeline.html" in (SITE / "site.js").read_text()
+    assert (ROOT / "visualize" / "omxcore_pipeline.html").is_file()
+    assert "visualize/omxcore_pipeline.html" in (SITE / "site.js").read_text()

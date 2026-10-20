@@ -4,9 +4,9 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-import mxframe as mx
-from mxframe import LazyFrame
-from mxframe.aot_kernels import GPU_AOT_AVAILABLE, get_aot_gpu
+import omxcore as mx
+from omxcore import LazyFrame
+from omxcore.aot_kernels import GPU_AOT_AVAILABLE, get_aot_gpu
 
 pytestmark = pytest.mark.skipif(not GPU_AOT_AVAILABLE or get_aot_gpu() is None, reason="no GPU")
 

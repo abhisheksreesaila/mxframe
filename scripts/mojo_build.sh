@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build one Mojo program against the package (build/mxframe.mojoc), with the codec libraries linked.
+# Build one Mojo program against the package (build/omxcore.mojoc), with the codec libraries linked.
 # Usage: bash scripts/mojo_build.sh <source.mojo> <output binary> [--no-package]
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"

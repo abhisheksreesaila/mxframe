@@ -2,7 +2,7 @@
 """Mojo frees a value at its last use. A List whose address is handed to a kernel or a hook has no use the compiler can see after that,
 so it is freed before the kernel reads it, and the kernel reads freed memory (F-148, F-152 twice, F-152 review: a third time).
 
-The structural fix is `mojo/mxframe/kargs.py`'s `KernelRun`: it owns the lists of a kernel call, hands out their addresses and makes the
+The structural fix is `mojo/omxcore/kargs.py`'s `KernelRun`: it owns the lists of a kernel call, hands out their addresses and makes the
 call itself, so no list's address leaves its owner. This check covers whatever the owner does not: for every function (a method, a nested
 function too) it finds each local value whose address is taken --
 
@@ -13,7 +13,7 @@ after the last such line: a real use, or the keep-alive `_ = xs^`. A mention in 
 (`self.x`, `look.table`) and `ref` bindings belong to the caller and are not checked. A line that is inside a loop which uses the list
 again can say `# lifetime: ok`.
 
-Usage: python3 scripts/check_list_lifetimes.py [files...]   (default: mojo/mxframe/*.mojo mojo/cli/*.mojo mojo/tools/*.mojo)
+Usage: python3 scripts/check_list_lifetimes.py [files...]   (default: mojo/omxcore/*.mojo mojo/cli/*.mojo mojo/tools/*.mojo)
 """
 import glob
 import os
@@ -104,7 +104,7 @@ def check(path):
 
 if __name__ == "__main__":
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    files = sys.argv[1:] or sorted(glob.glob(root + "/mojo/mxframe/*.mojo") + glob.glob(root + "/mojo/cli/*.mojo") + glob.glob(root + "/mojo/tools/*.mojo"))
+    files = sys.argv[1:] or sorted(glob.glob(root + "/mojo/omxcore/*.mojo") + glob.glob(root + "/mojo/cli/*.mojo") + glob.glob(root + "/mojo/tools/*.mojo"))
     problems = []
     for f in files:
         problems += check(f)

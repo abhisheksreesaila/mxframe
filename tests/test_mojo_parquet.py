@@ -105,7 +105,7 @@ def mojo_read(dumper, path):
 
 
 def stored(v, t):
-    """A pyarrow value as MX frame stores it."""
+    """A pyarrow value as omxcore stores it."""
     if v is None:
         return None
     if pa.types.is_decimal(t):
@@ -571,7 +571,7 @@ def test_footer_names_the_writer_and_uncompressed_row_group_size(writer, tmp_pat
     path = tmp_path / "m.parquet"
     subprocess.run([str(writer), str(path), "zstd", "3000", "1024"], check=True)
     md = pq.read_metadata(path)
-    assert md.created_by == "MX frame version 0.6.0"
+    assert md.created_by == "omxcore version 0.6.0"
     for g in range(md.num_row_groups):
         rg = md.row_group(g)
         assert rg.total_byte_size == sum(rg.column(c).total_uncompressed_size for c in range(rg.num_columns))

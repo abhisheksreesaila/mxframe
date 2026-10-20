@@ -9,7 +9,7 @@ the name; HAVING: the alias wins), and still do. Expected answers come from a na
 """
 import pytest
 
-import mxframe as mx
+import omxcore as mx
 from _sql_reference import CON, T, check, refused, cfg  # noqa: F401  (cfg is the fixture)
 
 ALIAS_IN_WHERE = [

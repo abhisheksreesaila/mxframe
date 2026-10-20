@@ -64,7 +64,7 @@ def _find_kernels_path() -> str:
         return str(_src)
     # Last resort: raise a clear error instead of returning a stale hardcoded path.
     raise FileNotFoundError(
-        f"mxframe: could not locate kernels.mojoc or kernels/ next to {__file__}. "
+        f"omxcore: could not locate kernels.mojoc or kernels/ next to {__file__}. "
         "The installed package is missing its Mojo kernels."
     )
 
@@ -240,7 +240,7 @@ def _load_aot_kernels():
         if not _AOT_WARNED:
             _AOT_WARNED = True
             import warnings
-            warnings.warn(f"mxframe: CPU AOT kernels disabled ({exc}); using the fallback path",
+            warnings.warn(f"omxcore: CPU AOT kernels disabled ({exc}); using the fallback path",
                           RuntimeWarning, stacklevel=3)
         return None
 
@@ -2482,7 +2482,7 @@ class CustomOpsCompiler(GraphCompiler):
                 "path": _shortcut_path,
             }
             if verbose:
-                print(f"[mxframe] PyArrow shortcut — {(t1-t0)*1000:.1f}ms")
+                print(f"[omxcore] PyArrow shortcut — {(t1-t0)*1000:.1f}ms")
             return result
 
         # F-008 -- fused pipeline: filter + arithmetic + aggregates in one vectorized AOT pass
@@ -2786,7 +2786,7 @@ class CustomOpsCompiler(GraphCompiler):
                     "path": "cpu_aot",
                 }
                 if verbose:
-                    print(f"[mxframe] CPU AOT — {(t1-t0)*1000:.1f}ms")
+                    print(f"[omxcore] CPU AOT — {(t1-t0)*1000:.1f}ms")
                 return _aot_result
 
 
@@ -2855,7 +2855,7 @@ class CustomOpsCompiler(GraphCompiler):
                     "gpu_declined": True,
                 }
                 if verbose:
-                    print(f"[mxframe] CPU AOT (GPU session) — {(t1-t0)*1000:.1f}ms")
+                    print(f"[omxcore] CPU AOT (GPU session) — {(t1-t0)*1000:.1f}ms")
                 return _aot_result
 
         # 5 -- Graph cache lookup --------------------------------------
@@ -2873,7 +2873,7 @@ class CustomOpsCompiler(GraphCompiler):
             t_compile = _time.perf_counter()
         else:
             if verbose:
-                print("[mxframe] Compiling query plan...", end=" ", flush=True)
+                print("[omxcore] Compiling query plan...", end=" ", flush=True)
 
             input_types = [
                 TensorType(_max_dtype(all_arrays[n]), list(all_arrays[n].shape), self._device_ref)
@@ -2933,7 +2933,7 @@ class CustomOpsCompiler(GraphCompiler):
             exec_ms = (t_exec - t_compile) * 1000
             total_ms = (t_exec - t0) * 1000
             if cache_hit:
-                print(f"[mxframe] Cache hit. Executed on {self._session_device.upper()} in "
+                print(f"[omxcore] Cache hit. Executed on {self._session_device.upper()} in "
                       f"{total_ms:.1f}ms (data prep: {compile_ms:.1f}ms, execute: {exec_ms:.1f}ms)")
             else:
                 print(f"done in {total_ms:.1f}ms "

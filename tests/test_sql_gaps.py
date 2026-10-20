@@ -10,8 +10,8 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-import mxframe as mx
-from mxframe.np_arrow import array as A
+import omxcore as mx
+from omxcore.np_arrow import array as A
 
 
 def _t(n=5_000, seed=11):
@@ -254,7 +254,7 @@ def test_nulls_match_duckdb(q):
 
 
 def test_count_star_counts_rows_in_the_dataframe_api():
-    from mxframe import LazyFrame, col, lit
+    from omxcore import LazyFrame, col, lit
     got = LazyFrame(_n()).groupby("g").agg(lit(1).count().alias("c"), col("x").count().alias("cx")) \
         .compute(device="cpu").to_pydict()
     assert sorted(zip(got["g"], got["c"], got["cx"]), key=repr) == \
@@ -273,7 +273,7 @@ def test_matches_duckdb(q):
 
 def test_having_is_a_filter_above_the_aggregate():
     """HAVING is never dropped: the plan has a Filter over the Aggregate."""
-    from mxframe.lazy_frame import Filter, Aggregate
+    from omxcore.lazy_frame import Filter, Aggregate
     lf = mx.sql("SELECT s, SUM(v) AS x FROM t GROUP BY s HAVING SUM(v) > 125000", t=_t())
     p = lf.plan
     while not isinstance(p, Filter):
@@ -282,7 +282,7 @@ def test_having_is_a_filter_above_the_aggregate():
 
 
 def test_count_distinct_reaches_the_native_count(monkeypatch):
-    import mxframe.native_exec as nx
+    import omxcore.native_exec as nx
     if not nx.available():
         pytest.skip("libmxexec_cpu.so not built")
     monkeypatch.setenv("MXFRAME_NATIVE", "1")

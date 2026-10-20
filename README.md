@@ -1,17 +1,17 @@
-<img src="https://raw.githubusercontent.com/abhisheksreesaila/mxframe/main/docs/img/engine-hero.svg" alt="MX frame, the Mojo engine: a data engine kernel apps and agents build on. Streamed 20M-row query 0.14 s (DuckDB 0.18 s); NOT EXISTS 9 ms (DuckDB 35 ms); median at 1M groups 398 ms (DuckDB 2,208 ms); a 1.6 GB file in 72 MB. Informal timings on a shared machine." width="100%"> <a href="https://github.com/abhisheksreesaila/mxframe/blob/main/docs/briefs/positioning.md"><img src="https://raw.githubusercontent.com/abhisheksreesaila/mxframe/main/docs/img/engine-roadmap.svg" alt="Roadmap: DuckDB-class SQL that uses your GPU and links into any app with no Python. What omxcore can be: a faster drop-in for DuckDB, GPU-native analytics on one machine, an embedded engine for apps, the data engine for AI agents, the compute half of a lakehouse, live dataframes for simulation, ML data prep. The path: 1. SQL and joins, then the TPC-H 22 gate (we are here); 2. quiet-machine scoreboard; 3. close the gaps; 4. omxcore 0.7.0 with an MCP server; 5. joins bigger than RAM and the SQL long tail. Built for agents (plugins on the core, planned for M10 after 0.7.0): plug and play with your CSV and Parquet files, GPU-native vector search, agent search, classification, an MCP server and agent memory; mx with JSON, a 12 ms start and no Python works today." width="100%"></a> <img src="https://raw.githubusercontent.com/abhisheksreesaila/mxframe/main/docs/img/engine-family.svg" alt="The omx family: omxapp (UI built once, native on Linux, macOS, iPhone, Android and the web) over omxcore (the data engine, CPU and GPU) over your CSV and Parquet files. The app and its engine compile into one native binary, with no Python and no server; omxplorer is the first app built this way." width="100%">
+<img src="https://raw.githubusercontent.com/abhisheksreesaila/omxcore/main/docs/img/engine-hero.svg" alt="omxcore, the Mojo engine: a compute engine (CPU and GPU) with persistence to open Parquet files that apps and agents build on. Streamed 20M-row query 0.14 s (DuckDB 0.18 s); NOT EXISTS 9 ms (DuckDB 35 ms); median at 1M groups 398 ms (DuckDB 2,208 ms); a 1.6 GB file in 72 MB. Informal timings on a shared machine." width="100%"> <a href="https://github.com/abhisheksreesaila/omxcore/blob/main/docs/briefs/positioning.md"><img src="https://raw.githubusercontent.com/abhisheksreesaila/omxcore/main/docs/img/engine-roadmap.svg" alt="Roadmap: DuckDB-class SQL that uses your GPU and links into any app with no Python. What omxcore can be: a faster drop-in for DuckDB, GPU-native analytics on one machine, an embedded engine for apps, the data engine for AI agents, the compute half of a lakehouse, live dataframes for simulation, ML data prep. The path: 1. SQL and joins, then the TPC-H 22 gate (we are here); 2. quiet-machine scoreboard; 3. close the gaps; 4. omxcore 0.7.0 with an MCP server; 5. joins bigger than RAM and the SQL long tail. Built for agents (plugins on the core, planned for M10 after 0.7.0): plug and play with your CSV and Parquet files, GPU-native vector search, agent search, classification, an MCP server and agent memory; mx with JSON, a 12 ms start and no Python works today." width="100%"></a> <img src="https://raw.githubusercontent.com/abhisheksreesaila/omxcore/main/docs/img/engine-family.svg" alt="The omx family: omxapp (UI built once, native on Linux, macOS, iPhone, Android and the web) over omxcore (the data engine, CPU and GPU) over your CSV and Parquet files. The app and its engine compile into one native binary, with no Python and no server; omxplorer is the first app built this way." width="100%">
 
-# MXFrame
+# omxcore
 
-**A data engine written in Mojo, for apps and agents: CPU, GPU and an auto mode that picks between them. Faster than DuckDB on the TPC-H SF10 total.** Soon renamed **omxcore** ([where it's going](https://github.com/abhisheksreesaila/mxframe/blob/main/docs/briefs/positioning.md)).<br>
+**A compute engine (CPU and GPU) with persistence to open Parquet files, written in Mojo for apps and agents: CPU, GPU and an auto mode that picks between them. Faster than DuckDB on the TPC-H SF10 total.** omxcore was called MX frame until 0.6.0 ([where it's going](https://github.com/abhisheksreesaila/omxcore/blob/main/docs/briefs/positioning.md)).<br>
 **Built for agents, plug and play with the CSV and Parquet files you already have:** `mx` speaks JSON with no Python today; GPU vector search, agent search, decisions, memory and an MCP server are planned next (M10).
 
-[![PyPI](https://img.shields.io/pypi/v/mxframe?color=f97316)](https://pypi.org/project/mxframe/) [![Mojo](https://img.shields.io/badge/engine-Mojo%201.1-ff4f00)](https://github.com/abhisheksreesaila/mxframe/tree/main/mojo) [![Mojo API](https://img.shields.io/badge/Mojo%20API-no%20Python-22c55e)](https://github.com/abhisheksreesaila/mxframe/blob/main/docs/mxframe-mojo-api.md) [![GPU](https://img.shields.io/badge/GPU-NVIDIA-76b900)](https://abhisheksreesaila.github.io/mxframe/auto-mode.html) [![Python](https://img.shields.io/badge/python-3.12%2B-3776ab)](https://github.com/abhisheksreesaila/mxframe/blob/main/pyproject.toml) [![Docs](https://img.shields.io/badge/docs-interactive-a855f7)](https://abhisheksreesaila.github.io/mxframe/)
+[![PyPI](https://img.shields.io/pypi/v/mxframe?color=f97316)](https://pypi.org/project/mxframe/) [![Mojo](https://img.shields.io/badge/engine-Mojo%201.1-ff4f00)](https://github.com/abhisheksreesaila/omxcore/tree/main/mojo) [![Mojo API](https://img.shields.io/badge/Mojo%20API-no%20Python-22c55e)](https://github.com/abhisheksreesaila/omxcore/blob/main/docs/omxcore-mojo-api.md) [![GPU](https://img.shields.io/badge/GPU-NVIDIA-76b900)](https://abhisheksreesaila.github.io/omxcore/auto-mode.html) [![Python](https://img.shields.io/badge/python-3.12%2B-3776ab)](https://github.com/abhisheksreesaila/omxcore/blob/main/pyproject.toml) [![Docs](https://img.shields.io/badge/docs-interactive-a855f7)](https://abhisheksreesaila.github.io/omxcore/)
 
-🔥 **[The Mojo engine: what it does and how it got fast →](https://abhisheksreesaila.github.io/mxframe/engine.html)** ([long form](https://github.com/abhisheksreesaila/mxframe/blob/main/docs/mojo-engine.md): every number, and where it is still behind) · 📖 **[Interactive docs](https://abhisheksreesaila.github.io/mxframe/)**: [benchmarks](https://abhisheksreesaila.github.io/mxframe/benchmarks.html) · [how `device="auto"` decides](https://abhisheksreesaila.github.io/mxframe/auto-mode.html) · [behind the scenes](https://abhisheksreesaila.github.io/mxframe/internals.html) · [how it got fast](https://abhisheksreesaila.github.io/mxframe/how-it-got-fast.html)
+🔥 **[The Mojo engine: what it does and how it got fast →](https://abhisheksreesaila.github.io/omxcore/engine.html)** ([long form](https://github.com/abhisheksreesaila/omxcore/blob/main/docs/mojo-engine.md): every number, and where it is still behind) · 📖 **[Interactive docs](https://abhisheksreesaila.github.io/omxcore/)**: [benchmarks](https://abhisheksreesaila.github.io/omxcore/benchmarks.html) · [how `device="auto"` decides](https://abhisheksreesaila.github.io/omxcore/auto-mode.html) · [behind the scenes](https://abhisheksreesaila.github.io/omxcore/internals.html) · [how it got fast](https://abhisheksreesaila.github.io/omxcore/how-it-got-fast.html)
 
 ## 🔥 Two ways in
 
-| | 🐍 **Python package** (`pip install mxframe`) | 🔥 **Mojo API** (`from mxframe import ...`) |
+| | 🐍 **Python package** (`pip install mxframe`, then `import omxcore as mx`) | 🔥 **Mojo API** (`from omxcore import ...`) |
 |---|---|---|
 | For | notebooks, pipelines, SQL | apps and agents compiled in Mojo, e.g. [omxplorer](https://github.com/abhisheksreesaila/mxapp) |
 | Python | Arrow in, Arrow out | **none**: no libpython, links on Linux and macOS (arm64) |
@@ -19,7 +19,7 @@
 | Bigger than memory | 💾 streams files, spills big joins to disk (Grace hash join) | 💾 streams Parquet a row group at a time: a 1.6 GB file in 72 MB, with edits and save over it |
 | Data | Parquet, Arrow, SQL | CSV (parallel, typed, import report), Parquet (zstd / snappy), edits, undo, formulas |
 
-<img src="https://raw.githubusercontent.com/abhisheksreesaila/mxframe/main/docs/img/engine-hood.svg" alt="Under the hood: modern algorithms, all built and in use today (morsel-driven parallelism, radix-partitioned hash joins without atomics, parallel radix sort and select, HyperLogLog-sized hash sets, bounded top-k heaps, SIMD bulk Parquet decode, two-phase parallel dictionaries, a planner from exact statistics, reproducible float sums) times Mojo, compiled ahead of time with SIMD types, compile-time specialisation, no garbage collector and the same kernels on CPU and GPU." width="100%"> <img src="https://raw.githubusercontent.com/abhisheksreesaila/mxframe/main/docs/img/engine-wins.svg" alt="Where the Mojo engine leads DuckDB: SQL, joins, expressions and aggregates, from 11.9x (1M groups out) through date + INTERVAL 5.1x, date_trunc 4.8x and a star join 2.1x to TPC-H Q9 1.5x. Informal timings." width="100%"> <img src="https://raw.githubusercontent.com/abhisheksreesaila/mxframe/main/docs/img/engine-behind.svg" alt="Where the Mojo engine is still behind DuckDB: count(DISTINCT lower) 5.8x, TPC-H Q7 4.5x, Q5 3.2x, one-to-many LEFT join 2.6x, full sort 2.4x, LIKE over 3.6M words 1.9x, probe-side filter 1.5x, streamed with 20 row groups 1.3-1.4x, two-column key 1.4x. Informal timings." width="100%">
+<img src="https://raw.githubusercontent.com/abhisheksreesaila/omxcore/main/docs/img/engine-hood.svg" alt="Under the hood: modern algorithms, all built and in use today (morsel-driven parallelism, radix-partitioned hash joins without atomics, parallel radix sort and select, HyperLogLog-sized hash sets, bounded top-k heaps, SIMD bulk Parquet decode, two-phase parallel dictionaries, a planner from exact statistics, reproducible float sums) times Mojo, compiled ahead of time with SIMD types, compile-time specialisation, no garbage collector and the same kernels on CPU and GPU." width="100%"> <img src="https://raw.githubusercontent.com/abhisheksreesaila/omxcore/main/docs/img/engine-wins.svg" alt="Where the Mojo engine leads DuckDB: SQL, joins, expressions and aggregates, from 11.9x (1M groups out) through date + INTERVAL 5.1x, date_trunc 4.8x and a star join 2.1x to TPC-H Q9 1.5x. Informal timings." width="100%"> <img src="https://raw.githubusercontent.com/abhisheksreesaila/omxcore/main/docs/img/engine-behind.svg" alt="Where the Mojo engine is still behind DuckDB: count(DISTINCT lower) 5.8x, TPC-H Q7 4.5x, Q5 3.2x, one-to-many LEFT join 2.6x, full sort 2.4x, LIKE over 3.6M words 1.9x, probe-side filter 1.5x, streamed with 20 row groups 1.3-1.4x, two-column key 1.4x. Informal timings." width="100%">
 
 ```mermaid
 flowchart LR
@@ -38,7 +38,7 @@ flowchart LR
 ```
 
 ```mojo
-from mxframe import read_csv, CsvOptions, Query, Frame, col, sum, count, AUTO
+from omxcore import read_csv, CsvOptions, Query, Frame, col, sum, count, AUTO
 
 var csv = read_csv("orders.csv", CsvOptions())       # parallel, typed, with an import report
 var orders = csv.take_table().share()
@@ -51,20 +51,20 @@ f.set_text(f.column("revenue"), 0, "99.00"); f.formula("net = revenue - qty")
 print(Query(f).agg(sum(col("net"))).compute().values(0)[0])     # decimals are exact scaled integers
 ```
 
-Runnable as [`mojo/tools/readme_example.mojo`](https://github.com/abhisheksreesaila/mxframe/blob/main/mojo/tools/readme_example.mojo) (checked by `pixi run mojo-test`). Reference: [Mojo API](https://github.com/abhisheksreesaila/mxframe/blob/main/docs/mxframe-mojo-api.md) · [build switches](https://github.com/abhisheksreesaila/mxframe/blob/main/mojo/README.md) · build the package with `pixi run bash scripts/build_mojo_pkg.sh` → `build/mxframe.mojoc`.
+Runnable as [`mojo/tools/readme_example.mojo`](https://github.com/abhisheksreesaila/omxcore/blob/main/mojo/tools/readme_example.mojo) (checked by `pixi run mojo-test`). Reference: [Mojo API](https://github.com/abhisheksreesaila/omxcore/blob/main/docs/omxcore-mojo-api.md) · [build switches](https://github.com/abhisheksreesaila/omxcore/blob/main/mojo/README.md) · build the package with `pixi run bash scripts/build_mojo_pkg.sh` → `build/omxcore.mojoc`.
 
 ## Latest release: 0.6.0
 
-The native Mojo CPU executor ([release notes](https://github.com/abhisheksreesaila/mxframe/blob/main/RELEASE_NOTES_0.6.0.md)). All 22 TPC-H queries, query time only (fresh process, data already loaded, no warm-up), every MXFrame result equal to DuckDB's:
+The native Mojo CPU executor ([release notes](https://github.com/abhisheksreesaila/omxcore/blob/main/RELEASE_NOTES_0.6.0.md)). All 22 TPC-H queries, query time only (fresh process, data already loaded, no warm-up), every omxcore result equal to DuckDB's:
 
-| Run | MXFrame | DuckDB | Polars |
+| Run | omxcore | DuckDB | Polars |
 |---|---|---|---|
 | SF10 | 3.15 s | 5.08 s | 14.40 s |
 | SF1 | 0.47 s | 0.63 s | 1.31 s |
 | SF10 shuffled | 4.97 s | 5.55 s | 15.06 s |
 | SF1 shuffled | 0.61 s | 0.66 s | 1.41 s |
 
-Honestly: Q21 carries the lead. Without it DuckDB is ahead, 2.27 s to 2.41 s at SF10 and 2.79 s to 3.63 s at SF10 shuffled, and DuckDB is faster on 12 of the 22 SF10 queries, mostly join-heavy ones. On seeded random queries over the same tables (geometric mean of DuckDB's time over MXFrame's), MXFrame is 1.09x at SF10 (50 queries), 0.83x at SF1 (100) and 1.21x at SF1 shuffled (100). [Every query, interactively →](https://abhisheksreesaila.github.io/mxframe/benchmarks.html)
+Honestly: Q21 carries the lead. Without it DuckDB is ahead, 2.27 s to 2.41 s at SF10 and 2.79 s to 3.63 s at SF10 shuffled, and DuckDB is faster on 12 of the 22 SF10 queries, mostly join-heavy ones. On seeded random queries over the same tables (geometric mean of DuckDB's time over omxcore's), omxcore is 1.09x at SF10 (50 queries), 0.83x at SF1 (100) and 1.21x at SF1 shuffled (100). [Every query, interactively →](https://abhisheksreesaila.github.io/omxcore/benchmarks.html)
 
 ## Install and run
 
@@ -73,7 +73,7 @@ pip install "mxframe[runtime,sql]"   # pixi: pixi add --pypi "mxframe[sql]" (MAX
 ```
 
 ```python
-import mxframe as mx
+import omxcore as mx
 
 lf = mx.scan_parquet("lineitem.parquet")
 out = (lf.filter(mx.col("l_quantity") < 24).groupby("l_returnflag")
@@ -82,7 +82,7 @@ out = (lf.filter(mx.col("l_quantity") < 24).groupby("l_returnflag")
 print(out.to_pandas())
 ```
 
-Nothing runs until `.compute()`; then the plan is optimized and executed in one native call. The 0.6.0 numbers above are `device="cpu"`; the default, `device="auto"`, runs the same native executor whenever it decides on the CPU, and `explain(device="auto", costs=True)` says why. On main (F-058, quiet machine) auto took 2.75 s against cpu 2.67 s on all of SF10. Extras: `runtime` (the MAX engine; pixi users get it from conda), `sql` (sqlglot), `polars`. The GPU path is validated on NVIDIA; MXFrame caps the Mojo runtime's GPU memory pool at 25% on import (`MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE_PERCENT`).
+Nothing runs until `.compute()`; then the plan is optimized and executed in one native call. The 0.6.0 numbers above are `device="cpu"`; the default, `device="auto"`, runs the same native executor whenever it decides on the CPU, and `explain(device="auto", costs=True)` says why. On main (F-058, quiet machine) auto took 2.75 s against cpu 2.67 s on all of SF10. Extras: `runtime` (the MAX engine; pixi users get it from conda), `sql` (sqlglot), `polars`. The GPU path is validated on NVIDIA; omxcore caps the Mojo runtime's GPU memory pool at 25% on import (`MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE_PERCENT`).
 
 ## API reference
 
@@ -135,6 +135,6 @@ SQL covers `SELECT`, `WHERE`, `GROUP BY`, `ORDER BY`, `LIMIT`, `JOIN … ON` and
 
 ## More
 
-[Benchmarks](https://abhisheksreesaila.github.io/mxframe/benchmarks.html) ([tables](https://github.com/abhisheksreesaila/mxframe/blob/main/docs/benchmarks.md)) · [Behind the scenes](https://abhisheksreesaila.github.io/mxframe/internals.html) · [How it got fast](https://abhisheksreesaila.github.io/mxframe/how-it-got-fast.html) ([long form](https://github.com/abhisheksreesaila/mxframe/blob/main/docs/optimizations.md)) · [How `device="auto"` decides](https://abhisheksreesaila.github.io/mxframe/auto-mode.html) · [API notes](https://github.com/abhisheksreesaila/mxframe/blob/main/docs/api.md) · [Architecture](https://github.com/abhisheksreesaila/mxframe/blob/main/docs/vision-and-architecture.md) · [Kernel visualizer](https://abhisheksreesaila.github.io/mxframe/visualize/mxframe_pipeline.html) · [Changelog](https://github.com/abhisheksreesaila/mxframe/blob/main/CHANGELOG.md) · [0.6.0 notes](https://github.com/abhisheksreesaila/mxframe/blob/main/RELEASE_NOTES_0.6.0.md) · [Contributing](https://github.com/abhisheksreesaila/mxframe/blob/main/CONTRIBUTING.md)
+[Benchmarks](https://abhisheksreesaila.github.io/omxcore/benchmarks.html) ([tables](https://github.com/abhisheksreesaila/omxcore/blob/main/docs/benchmarks.md)) · [Behind the scenes](https://abhisheksreesaila.github.io/omxcore/internals.html) · [How it got fast](https://abhisheksreesaila.github.io/omxcore/how-it-got-fast.html) ([long form](https://github.com/abhisheksreesaila/omxcore/blob/main/docs/optimizations.md)) · [How `device="auto"` decides](https://abhisheksreesaila.github.io/omxcore/auto-mode.html) · [API notes](https://github.com/abhisheksreesaila/omxcore/blob/main/docs/api.md) · [Architecture](https://github.com/abhisheksreesaila/omxcore/blob/main/docs/vision-and-architecture.md) · [Kernel visualizer](https://abhisheksreesaila.github.io/omxcore/visualize/omxcore_pipeline.html) · [Changelog](https://github.com/abhisheksreesaila/omxcore/blob/main/CHANGELOG.md) · [0.6.0 notes](https://github.com/abhisheksreesaila/omxcore/blob/main/RELEASE_NOTES_0.6.0.md) · [Contributing](https://github.com/abhisheksreesaila/omxcore/blob/main/CONTRIBUTING.md)
 
-Build from source with [pixi](https://pixi.sh): `git clone https://github.com/abhisheksreesaila/mxframe && cd mxframe && pixi install && pixi run test`. License: [Apache-2.0](https://github.com/abhisheksreesaila/mxframe/blob/main/LICENSE).
+Build from source with [pixi](https://pixi.sh): `git clone https://github.com/abhisheksreesaila/omxcore && cd omxcore && pixi install && pixi run test`. License: [Apache-2.0](https://github.com/abhisheksreesaila/omxcore/blob/main/LICENSE).

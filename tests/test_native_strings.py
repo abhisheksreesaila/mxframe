@@ -6,8 +6,8 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
 
-import mxframe.native_exec as nx
-from mxframe import LazyFrame, col, lit
+import omxcore.native_exec as nx
+from omxcore import LazyFrame, col, lit
 
 pytestmark = pytest.mark.skipif(not nx.available(), reason="libmxexec_cpu.so not built")
 

@@ -51,7 +51,7 @@ def generate_local_ctx(llms_file='llms.txt', output_file='llms-ctx.txt'):
     
     if ctx_output:
         # Add header
-        header = """# mxframe LLM Context
+        header = """# omxcore LLM Context
 # GPU-accelerated DataFrames powered by MAX Engine
 # Auto-generated - do not edit manually
 

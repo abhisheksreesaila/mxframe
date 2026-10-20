@@ -9,9 +9,9 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-import mxframe.native_exec as nx
-from mxframe import LazyFrame, col, lit
-from mxframe.np_arrow import array as A
+import omxcore.native_exec as nx
+from omxcore import LazyFrame, col, lit
+from omxcore.np_arrow import array as A
 
 pytestmark = pytest.mark.skipif(not nx.available(), reason="libmxexec_cpu.so not built")
 
@@ -134,7 +134,7 @@ def test_dictionary_column_through_a_join(seen):
 
 
 def test_from_parquet(seen, tmp_path):
-    import mxframe as mx
+    import omxcore as mx
     import pyarrow.parquet as pq
     t = _table()
     pq.write_table(t.select(["a", "p", "d"]), tmp_path / "t.parquet", row_group_size=50_000)
@@ -223,7 +223,7 @@ def test_sorted_keys_with_few_runs(seen, keys):
 
 def _gpu_usable():
     try:
-        import mxframe.custom_ops as co
+        import omxcore.custom_ops as co
         return co._max_accelerator() is not None
     except Exception:
         return False
@@ -266,7 +266,7 @@ def test_auto_steered_to_the_gpu_decodes(seen):
 
 
 def _parquet_or_memory(tmp_path, source):
-    import mxframe as mx
+    import omxcore as mx
     import pyarrow.parquet as pq
     t = _table(n=400_000)
     if source == "memory":

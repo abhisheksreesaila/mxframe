@@ -20,9 +20,9 @@ from pathlib import Path
 import numpy as np
 import pyarrow as pa
 
-from mxframe.lazy_expr import col
-from mxframe.lazy_frame import LazyFrame
-from mxframe.custom_ops import CustomOpsCompiler, clear_cache, AUTO_GPU_THRESHOLD
+from omxcore.lazy_expr import col
+from omxcore.lazy_frame import LazyFrame
+from omxcore.custom_ops import CustomOpsCompiler, clear_cache, AUTO_GPU_THRESHOLD
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -129,7 +129,7 @@ def bench_gpu_filter(n_rows: int = 1_000_000, n_groups: int = 50):
     lf2 = LazyFrame(table)
     q2 = lf2.filter(col("flag") > 0).groupby("grp").agg(col("value").sum())
     q2.compute(device="gpu")  # warm
-    from mxframe.custom_ops import CustomOpsCompiler as _C
+    from omxcore.custom_ops import CustomOpsCompiler as _C
     # Re-read provenance from LazyFrame
     lf3 = LazyFrame(table)
     lf3.filter(col("flag") > 0).groupby("grp").agg(col("value").sum()).compute(device="gpu")
@@ -181,7 +181,7 @@ def bench_scale(device: str = "auto"):
 
 def _prov(lf_query, device: str) -> str:
     """Run query and return the gpu_filter flag from provenance."""
-    from mxframe.custom_ops import CustomOpsCompiler
+    from omxcore.custom_ops import CustomOpsCompiler
     import pyarrow as pa
     # Rebuild LazyFrame to get fresh provenance
     return "see last_compile_provenance"

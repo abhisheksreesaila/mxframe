@@ -8,8 +8,8 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-from mxframe import group_keys
-from mxframe.custom_ops import CustomOpsCompiler
+from omxcore import group_keys
+from omxcore.custom_ops import CustomOpsCompiler
 
 pytestmark = pytest.mark.skipif(not group_keys.available(), reason="libmxgroupkeys_cpu.so not built")
 
@@ -93,8 +93,8 @@ def test_cpu_query_does_not_import_max():
         "import sys, pyarrow as pa\n"
         "sys.path.insert(0, %r)\n"
         "import conftest\n"
-        "import mxframe as mx\n"
-        "from mxframe import LazyFrame, col\n"
+        "import omxcore as mx\n"
+        "from omxcore import LazyFrame, col\n"
         "d = pa.DictionaryArray.from_arrays(pa.array([0,1,0,1]*1000, type=pa.int8()), pa.array(['a','b']))\n"
         "t = pa.table({'k': d, 'v': pa.array([1.0]*4000)})\n"
         "r = LazyFrame(t).groupby('k').agg(col('v').sum().alias('s')).compute(device='cpu')\n"

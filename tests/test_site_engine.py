@@ -105,7 +105,7 @@ def test_page_is_in_the_nav_and_reads_the_one_data_file():
 
 def test_readme_shows_the_engine_art_and_links_the_page():
     readme = (ROOT / "README.md").read_text()
-    raw = "https://raw.githubusercontent.com/abhisheksreesaila/mxframe/main/docs/img/"
+    raw = "https://raw.githubusercontent.com/abhisheksreesaila/omxcore/main/docs/img/"
     used = re.findall(re.escape(raw) + r"([\w.-]+\.svg)", readme)
     assert "engine-hero.svg" in used and len(used) >= 2
     for n in used:

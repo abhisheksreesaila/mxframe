@@ -17,11 +17,11 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-import mxframe as mx
-import mxframe.native_exec as nx
+import omxcore as mx
+import omxcore.native_exec as nx
 from conftest import TPCH_DATA
-from mxframe import LazyFrame, col, lit
-from mxframe.np_arrow import array as A
+from omxcore import LazyFrame, col, lit
+from omxcore.np_arrow import array as A
 
 pytestmark = pytest.mark.skipif(not nx.available(), reason="libmxexec_cpu.so not built")
 

@@ -12,11 +12,11 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-import mxframe.lazy_frame as lfm
-import mxframe.native_exec as nx
-from mxframe import LazyFrame, auto_mode as am, calibration as cal, col, lit
-from mxframe import coproc_fused as cf
-from mxframe.np_arrow import array as A
+import omxcore.lazy_frame as lfm
+import omxcore.native_exec as nx
+from omxcore import LazyFrame, auto_mode as am, calibration as cal, col, lit
+from omxcore import coproc_fused as cf
+from omxcore.np_arrow import array as A
 
 pytestmark = pytest.mark.skipif(not nx.available(), reason="libmxexec_cpu.so not built")
 
@@ -211,7 +211,7 @@ def test_a_split_worthy_query_on_host_data_runs_native_and_queues_the_upload(mon
     monkeypatch.setattr(cf, "_gpu_usable", lambda: True)
     monkeypatch.setattr(cf, "IDLE_BEFORE_BACKGROUND_S", 0.0)
     queued = []
-    from mxframe import pipeline_exec
+    from omxcore import pipeline_exec
     monkeypatch.setattr(pipeline_exec, "queue_resident_upload", lambda plan: queued.append(1))
     lf = LazyFrame(f).groupby("k").agg(col("v").sum().alias("s"))
     got = lf.compute(device="auto")
@@ -302,7 +302,7 @@ def test_auto_keeps_count_distinct_columns_encoded_like_device_cpu(native_calls,
 
     if source == "parquet":
         import pyarrow.parquet as pq
-        from mxframe import read_parquet
+        from omxcore import read_parquet
         pq.write_table(t, str(tmp_path / "t.parquet"), row_group_size=50_000)
 
     def frame():

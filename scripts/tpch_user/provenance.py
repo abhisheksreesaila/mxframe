@@ -6,9 +6,9 @@ from collections import Counter
 
 def install() -> list:
     """Wrap LazyFrame.compute; returns the list the entries are appended to (clear it between runs)."""
-    import mxframe.aot_kernels as ak
-    import mxframe.sort_check as sc
-    from mxframe.lazy_frame import LazyFrame
+    import omxcore.aot_kernels as ak
+    import omxcore.sort_check as sc
+    from omxcore.lazy_frame import LazyFrame
     entries: list = []
     ak.gpu_call_log = []
     orig = LazyFrame.compute

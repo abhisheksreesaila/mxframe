@@ -1,4 +1,4 @@
-# 🛠️ Contributing to MXFrame
+# 🛠️ Contributing to omxcore
 
 > Developer guide — architecture, kernel writing, adding queries, running tests.
 
@@ -12,7 +12,7 @@ A query is a lazy plan built in Python. At `.compute(device="cpu")` it is valida
 2. **Fused pipeline** (`pipeline_exec.py` → `libmxpipeline_cpu.so` / `libmxpipeline_gpu.so`): filter + group + aggregate in one pass, for aggregates the executor declines.
 3. **Per-operator path** (`custom_ops.py` → `libmxkernels_aot.so` / `libmxkernels_aot_gpu.so`, plus `join_engine.py`, `libmxgroupkeys_cpu.so`, `libmxjoin_cpu.so`): everything else, one kernel per operator. Joins are built here first; the aggregate on the joined table then goes back to layers 1 and 2.
 
-The [behind-the-scenes page](https://abhisheksreesaila.github.io/mxframe/internals.html) walks through each layer, its seams, when it declines and the environment switches (`MXFRAME_NATIVE=0`, `MXFRAME_FUSED_PIPELINE=0`, ...). The file-by-file layout is in [docs/api.md](docs/api.md#source-layout).
+The [behind-the-scenes page](https://abhisheksreesaila.github.io/omxcore/internals.html) walks through each layer, its seams, when it declines and the environment switches (`MXFRAME_NATIVE=0`, `MXFRAME_FUSED_PIPELINE=0`, ...). The file-by-file layout is in [docs/api.md](docs/api.md#source-layout).
 
 ### The compiled libraries
 
@@ -37,10 +37,10 @@ With no target the script rebuilds every library. Each build sets the relocatabl
 ### 1. Setup
 
 ```sh
-git clone https://github.com/abhisheksreesaila/mxframe
-cd mxframe
+git clone https://github.com/abhisheksreesaila/omxcore
+cd omxcore
 pixi install             # Python, Mojo and all dependencies into .pixi/envs/default/
-pixi run setup-mxframe   # links the repo into site-packages as `mxframe`
+pixi run setup-omxcore   # links the repo into site-packages as `omxcore`
 ```
 
 Python changes take effect immediately; Mojo changes need the library rebuilt (table above).
@@ -57,7 +57,7 @@ New tests go in `tests/`. A change to the engine should test both the answer and
 
 ### 3. Add an operator to the native executor
 
-Follow the worked example on the [behind-the-scenes page](https://abhisheksreesaila.github.io/mxframe/internals.html#add-operator): plan node, optimizer, the Python fallback, the encoding in `native_exec.py`, the Mojo function in `executor_cpu.mojo`, the rebuild, and tests against `MXFRAME_NATIVE=0` and DuckDB.
+Follow the worked example on the [behind-the-scenes page](https://abhisheksreesaila.github.io/omxcore/internals.html#add-operator): plan node, optimizer, the Python fallback, the encoding in `native_exec.py`, the Mojo function in `executor_cpu.mojo`, the rebuild, and tests against `MXFRAME_NATIVE=0` and DuckDB.
 
 ### 4. Benchmark before and after
 

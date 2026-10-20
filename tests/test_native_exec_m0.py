@@ -14,9 +14,9 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-import mxframe.native_exec as nx
-from mxframe import LazyFrame, col, lit
-from mxframe.np_arrow import array as A
+import omxcore.native_exec as nx
+from omxcore import LazyFrame, col, lit
+from omxcore.np_arrow import array as A
 
 SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
 sys.path.insert(0, str(SCRIPTS))
@@ -183,9 +183,9 @@ def test_no_pandas_and_no_numpy_conversion_of_the_input():
 import os, sys
 os.environ["MXFRAME_NATIVE"] = "1"
 import numpy as np, pyarrow as pa
-import mxframe.native_exec as nx
-from mxframe import LazyFrame, col, lit
-from mxframe.np_arrow import array as A
+import omxcore.native_exec as nx
+from omxcore import LazyFrame, col, lit
+from omxcore.np_arrow import array as A
 n = 50_000
 r = np.random.default_rng(0)
 t = pa.table({"f": pa.DictionaryArray.from_arrays(A(r.integers(0, 3, n).astype(np.int32)), A(["A", "N", "R"])),
@@ -223,7 +223,7 @@ def test_chunks_with_different_dictionaries(native, monkeypatch):
 
 
 def test_columns_chunked_differently(native, monkeypatch):
-    """MXFrame's reader returns numeric columns as one chunk and dictionary columns per row group."""
+    """omxcore's reader returns numeric columns as one chunk and dictionary columns per row group."""
     t = _table(n=30_000)
     f = t.column("f")
     cut = pa.chunked_array([f.chunk(0).slice(0, 7000), f.chunk(0).slice(7000, 13000), f.chunk(0).slice(20000)])
@@ -331,9 +331,9 @@ def test_invalid_dictionary_codes_are_declined_not_read():
 import os, sys
 os.environ["MXFRAME_NATIVE"] = "1"
 import numpy as np, pyarrow as pa
-import mxframe.native_exec as nx
-from mxframe import LazyFrame, col, lit
-from mxframe.np_arrow import array as A
+import omxcore.native_exec as nx
+from omxcore import LazyFrame, col, lit
+from omxcore.np_arrow import array as A
 idx = A(np.array([0, 1, 7, 1] * 1000, np.int32))         # 7 is outside a 3-entry dictionary
 f = pa.DictionaryArray.from_buffers(pa.dictionary(pa.int32(), pa.string()), 4000, idx.buffers(), A(["A", "N", "R"]))
 t = pa.table({"f": f, "v": A(np.ones(4000))})

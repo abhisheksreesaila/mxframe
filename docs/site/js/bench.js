@@ -1,7 +1,7 @@
 // Interactive benchmarks page (F-049). Everything shown is computed here from the files in bench/.
 // The first half is pure logic (no DOM), so tests can run it under node and compare with the CSV.
 
-const ENGINES = [["mx-cpu", "MXFrame", "--mx"], ["duckdb", "DuckDB", "--dk"], ["polars", "Polars", "--pl"]];
+const ENGINES = [["mx-cpu", "omxcore", "--mx"], ["duckdb", "DuckDB", "--dk"], ["polars", "Polars", "--pl"]];
 const FILES = {
   stored: "bench/m2s-engine.csv",
   shuffled: "bench/m2s-engine-shuffled.csv",
@@ -45,7 +45,7 @@ function total(m, engine, skip) {
 const wrongQueries = (m, engine) => m.queries.filter((q) => m.verdict[engine] && m.verdict[engine][q] === "wrong");
 const median = (xs) => { const s = [...xs].sort((a, b) => a - b), n = s.length; return n ? (n % 2 ? s[(n - 1) / 2] : (s[n / 2 - 1] + s[n / 2]) / 2) : null; };
 
-// queries where DuckDB is strictly faster than MXFrame
+// queries where DuckDB is strictly faster than omxcore
 const duckdbFaster = (m) => m.queries.filter((q) => m.ms.duckdb[q] < m.ms["mx-cpu"][q]);
 
 // Two totals within 1% of the larger one are a tie, not a win (at SF1 stored, without Q21: 386.9 vs 387.4 ms).
@@ -55,7 +55,7 @@ function compareTotals(a, b, tol = TIE_TOLERANCE) {
   return { tie, aLower: a < b };
 }
 
-// random suite: per shape (and "all"), the geometric mean of DuckDB ms / MXFrame ms (above 1: MXFrame faster)
+// random suite: per shape (and "all"), the geometric mean of DuckDB ms / omxcore ms (above 1: omxcore faster)
 function randomShapes(results) {
   const by = {};
   for (const r of results) {
@@ -124,9 +124,9 @@ if (typeof document !== "undefined") (function () {
     const sfTxt = "SF" + state.sf;
     let s = "";
     if (mx != null && dk != null) {
-      const cmp = compareTotals(dk21, mx21), lo = cmp.aLower ? ["DuckDB", dk21, "MXFrame", mx21] : ["MXFrame", mx21, "DuckDB", dk21];
+      const cmp = compareTotals(dk21, mx21), lo = cmp.aLower ? ["DuckDB", dk21, "omxcore", mx21] : ["omxcore", mx21, "DuckDB", dk21];
       s = (cmp.tie
-        ? `Without Q21, MXFrame and DuckDB tie at ${sfTxt} (${sec(mx21)} and ${sec(dk21)}, within 1%), `
+        ? `Without Q21, omxcore and DuckDB tie at ${sfTxt} (${sec(mx21)} and ${sec(dk21)}, within 1%), `
         : `Without Q21, ${lo[0]}'s ${sfTxt} total is the lower one (${sec(lo[1])} against ${lo[2]}'s ${sec(lo[3])}), `) +
         `and DuckDB is faster on ${duckdbFaster(m).length} of ${m.queries.length} queries. `;
     }
@@ -160,7 +160,7 @@ if (typeof document !== "undefined") (function () {
       const vals = list.map(([e]) => m.ms[e] && m.ms[e][q]).filter((v) => v != null);
       s.append(svg("text", { x: L - 8, y: y + 3, "text-anchor": "end" }, "Q" + q));
       if (vals.length > 1) s.append(svg("line", { x1: X(Math.min(...vals)), x2: X(Math.max(...vals)), y1: y, y2: y, stroke: cssVar("--border-hi"), "stroke-width": 1.5 }));
-      [...list].reverse().forEach(([e, , c]) => {          // MXFrame drawn last, on top
+      [...list].reverse().forEach(([e, , c]) => {          // omxcore drawn last, on top
         const v = m.ms[e] && m.ms[e][q];
         if (v == null) return;
         s.append(svg("circle", { cx: X(v), cy: y, r: 4, fill: cssVar(c), stroke: cssVar("--surface"), "stroke-width": 1.5, "pointer-events": "none" }));
@@ -195,21 +195,21 @@ if (typeof document !== "undefined") (function () {
       s.append(svg("text", { x: X(r), y: H - 18, "text-anchor": "middle" }, (r < 1 ? "1/" + 1 / r : r) + "x"));
     }
     s.append(svg("text", { x: C - 6, y: H - 3, "text-anchor": "end" }, "← DuckDB faster"));
-    s.append(svg("text", { x: C + 6, y: H - 3 }, "MXFrame faster →"));
+    s.append(svg("text", { x: C + 6, y: H - 3 }, "omxcore faster →"));
     rs.forEach(([q, r], i) => {
       const y = T + i * rh + rh / 2, x = X(r);
       s.append(svg("text", { x: L - 8, y: y + 3, "text-anchor": "end" }, "Q" + q));
       s.append(svg("rect", { x: Math.min(C, x), y: y - 4, width: Math.max(2, Math.abs(x - C)), height: 8, rx: 1.5, fill: cssVar(r >= 1 ? "--fast" : "--slow") }));
       s.append(svg("text", { x: r >= 1 ? x + 5 : x - 5, y: y + 3, "text-anchor": r >= 1 ? "start" : "end" }, r.toFixed(2) + "x"));
       const hit = svg("rect", { x: 0, y: y - rh / 2, width: W, height: rh, fill: "transparent" });
-      hover(hit, () => `<b>Q${q}</b><br>${dot("--mx")}MXFrame ${fmtMs(m.ms["mx-cpu"][q])}<br>${dot("--dk")}DuckDB ${fmtMs(m.ms.duckdb[q])}<br>` +
-        (r >= 1 ? `MXFrame ${r.toFixed(2)}x faster` : `DuckDB ${(1 / r).toFixed(2)}x faster`));
+      hover(hit, () => `<b>Q${q}</b><br>${dot("--mx")}omxcore ${fmtMs(m.ms["mx-cpu"][q])}<br>${dot("--dk")}DuckDB ${fmtMs(m.ms.duckdb[q])}<br>` +
+        (r >= 1 ? `omxcore ${r.toFixed(2)}x faster` : `DuckDB ${(1 / r).toFixed(2)}x faster`));
       s.append(hit);
     });
     s.append(svg("line", { x1: C, x2: C, y1: T, y2: H - 30, stroke: cssVar("--mid"), "stroke-width": 1.5 }));
     s.append(svg("text", { x: C, y: H - 18, "text-anchor": "middle" }, "1x"));
-    table("tblC", ["Query", "MXFrame ms", "DuckDB ms", "DuckDB / MXFrame", "Faster"],
-      rs.map(([q, r]) => [`Q${q}`, m.ms["mx-cpu"][q].toFixed(1), m.ms.duckdb[q].toFixed(1), r.toFixed(2) + "x", r >= 1 ? "MXFrame" : "DuckDB"]));
+    table("tblC", ["Query", "omxcore ms", "DuckDB ms", "DuckDB / omxcore", "Faster"],
+      rs.map(([q, r]) => [`Q${q}`, m.ms["mx-cpu"][q].toFixed(1), m.ms.duckdb[q].toFixed(1), r.toFixed(2) + "x", r >= 1 ? "omxcore" : "DuckDB"]));
   }
 
   // ----- random shapes -----
@@ -238,15 +238,15 @@ if (typeof document !== "undefined") (function () {
         // the value sits in its own column at the right edge: a bar that points left would run into the shape name
         s.append(svg("text", { x: W - 4, y: y + 3, "text-anchor": "end" }, row.ratio.toFixed(2) + "x"));
         const hit = svg("rect", { x: 0, y: y - rh / 2, width: W, height: rh, fill: "transparent" });
-        hover(hit, () => `<b>${row.shape}</b> · ${label}<br>${row.n} queries, MXFrame correct ${row.correct}/${row.n}<br>` +
-          `faster than DuckDB on ${row.faster}/${row.ran}<br>DuckDB / MXFrame, geo. mean: <b>${ratioTxt(row.ratio)}</b>`);
+        hover(hit, () => `<b>${row.shape}</b> · ${label}<br>${row.n} queries, omxcore correct ${row.correct}/${row.n}<br>` +
+          `faster than DuckDB on ${row.faster}/${row.ran}<br>DuckDB / omxcore, geo. mean: <b>${ratioTxt(row.ratio)}</b>`);
         s.append(hit);
       });
       s.append(svg("line", { x1: C, x2: C, y1: 0, y2: H - 28, stroke: cssVar("--mid"), "stroke-width": 1.5 }));
       s.append(svg("text", { x: C, y: H - 14, "text-anchor": "middle" }, "1x"));
     });
     const shapes = all[0].map((s) => s.shape);
-    table("tblR", ["Shape", ...data.random.flatMap(([l]) => [l + ": queries", "correct", "faster than DuckDB", "DuckDB / MXFrame"])],
+    table("tblR", ["Shape", ...data.random.flatMap(([l]) => [l + ": queries", "correct", "faster than DuckDB", "DuckDB / omxcore"])],
       shapes.map((sh) => [sh, ...all.flatMap((rows) => { const s = rows.find((x) => x.shape === sh);
         return s ? [s.n, `${s.correct}/${s.n}`, `${s.faster}/${s.ran}`, s.ratio.toFixed(2) + "x"] : ["", "", "", ""]; })]));
   }

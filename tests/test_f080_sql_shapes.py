@@ -13,9 +13,9 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-import mxframe as mx
-import mxframe.native_exec as nx
-from mxframe.np_arrow import array as A
+import omxcore as mx
+import omxcore.native_exec as nx
+from omxcore.np_arrow import array as A
 
 pytestmark = pytest.mark.skipif(not nx.available(), reason="libmxexec_cpu.so not built")
 
@@ -172,7 +172,7 @@ group by c_count order by custdist desc, c_count desc"""
 @pytest.fixture
 def counted(monkeypatch):
     """How many times the left-join counting route answered."""
-    import mxframe.join_engine as je
+    import omxcore.join_engine as je
     log = {"ran": 0}
     real = getattr(je, "left_join_counts", lambda *a, **k: None)
 
@@ -268,7 +268,7 @@ def test_left_join_count_declines_keep_the_answer(counted, name, sql, mod):
 def test_unique_memo_does_not_keep_a_released_table_alive():
     import gc
     import weakref
-    import mxframe.join_engine as je
+    import omxcore.join_engine as je
     t = pa.table({"k": A(np.arange(1000, dtype=np.int64))})
     ref = weakref.ref(t)
     assert je._is_unique(t, "k") is True

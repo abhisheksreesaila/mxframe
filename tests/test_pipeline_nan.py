@@ -5,9 +5,9 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-from mxframe import pipeline_kernels as pk
-from mxframe.lazy_expr import col
-from mxframe.pipeline_program import compile_pipeline, finalize
+from omxcore import pipeline_kernels as pk
+from omxcore.lazy_expr import col
+from omxcore.pipeline_program import compile_pipeline, finalize
 
 NAN = float("nan")
 GIDS = np.array([0, 0, 0, 1, 1, 2, 3, 3, 4, 4], dtype=np.int32)

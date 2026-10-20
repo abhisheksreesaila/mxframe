@@ -1,8 +1,8 @@
 # F-153: the hash join kernel (kernels_aot/hashjoin_cpu.mojo) against a plain dictionary, on every layout it chooses.
 from std.collections import Dict
-from mxframe.kernels.hashjoin_cpu import (JoinMap, hj_build, hj_probe_unique, hj_probe_pairs, hj_probe_block, MapView, hj_release, MODE_DIRECT, MODE_HASH,
+from omxcore.kernels.hashjoin_cpu import (JoinMap, hj_build, hj_probe_unique, hj_probe_pairs, hj_probe_block, MapView, hj_release, MODE_DIRECT, MODE_HASH,
                                           MODE_EMPTY, E_BUDGET, hj_probe_select, hj_filter_block, hj_probe_left_block, PM_SEMI, PM_ANTI, PM_ANTI_NA, PM_NONE)
-from mxframe.kernels.hashjoin_cpu import IP, LP, BP
+from omxcore.kernels.hashjoin_cpu import IP, LP, BP
 
 
 def expect(ok: Bool, what: String) raises:

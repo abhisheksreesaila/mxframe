@@ -86,7 +86,7 @@ def test_js_totals_match_python(name, sf):
 
 
 def _md_ratios(name):
-    """shape -> DuckDB / MXFrame (geo. mean) as printed in the run's summary table."""
+    """shape -> DuckDB / omxcore (geo. mean) as printed in the run's summary table."""
     out = {}
     for line in (BENCH / name).read_text().splitlines():
         cells = [c.strip() for c in line.strip("|").split("|")]

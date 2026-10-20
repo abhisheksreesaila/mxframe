@@ -34,7 +34,7 @@ import warnings
 warnings.filterwarnings("ignore")
 
 from scripts import benchmark_tpch as b
-from mxframe.lazy_frame import LazyFrame
+from omxcore.lazy_frame import LazyFrame
 
 # Paths considered GPU-resident vs Mojo-CPU vs Python-side fallback.
 GPU_PATHS = {"gpu_aot"}

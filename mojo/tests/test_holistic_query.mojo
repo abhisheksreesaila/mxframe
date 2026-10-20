@@ -1,7 +1,7 @@
 # F-148: count_distinct, median / percentile and top_k through Query, over a table, a Frame with edits (queried
 # live, checked against a plain loop over its baked table) and a Parquet scan of a multi-row-group file. Every answer
 # is checked against an oracle written here: plain loops over the cells, sorting with a merge sort, no kernel.
-from mxframe import (Table, SharedTable, Query, QueryResult, Frame, col, lit, least, sum, count, mean, min_of, max_of,
+from omxcore import (Table, SharedTable, Query, QueryResult, Frame, col, lit, least, sum, count, mean, min_of, max_of,
                      count_distinct, percentile, median, top_k, INT, DECIMAL, TEXT, write_parquet, read_parquet,
                      scan_parquet, ZSTD, CPU, GPU, AUTO, DeviceTable, gpu_available)
 

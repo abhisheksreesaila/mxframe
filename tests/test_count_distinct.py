@@ -6,9 +6,9 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-import mxframe.native_exec as nx
-from mxframe import LazyFrame, col, lit
-from mxframe.np_arrow import array as A
+import omxcore.native_exec as nx
+from omxcore import LazyFrame, col, lit
+from omxcore.np_arrow import array as A
 
 pytestmark = pytest.mark.skipif(not nx.available(), reason="libmxexec_cpu.so not built")
 
@@ -212,7 +212,7 @@ def test_empty_input(calls):
 
 def _gpu_usable():
     try:
-        import mxframe.custom_ops as co
+        import omxcore.custom_ops as co
         return co._max_accelerator() is not None
     except Exception:
         return False

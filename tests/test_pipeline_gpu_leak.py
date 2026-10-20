@@ -6,9 +6,9 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-from mxframe import pipeline_kernels as pk
-from mxframe.lazy_expr import col, lit
-from mxframe.pipeline_program import compile_pipeline
+from omxcore import pipeline_kernels as pk
+from omxcore.lazy_expr import col, lit
+from omxcore.pipeline_program import compile_pipeline
 
 
 def _gpu_ok():

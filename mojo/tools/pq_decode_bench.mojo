@@ -5,8 +5,8 @@
 from std.sys import argv
 from std.os import getenv
 from std.time import perf_counter_ns
-from mxframe import Query, col, sum, count, mean, min_of, max_of, read_parquet, scan_parquet, AUTO, GPU, CPU, MORSELS_AUTO, MORSELS_ON, MORSELS_OFF
-from mxframe.kernels._fpenv import core_count
+from omxcore import Query, col, sum, count, mean, min_of, max_of, read_parquet, scan_parquet, AUTO, GPU, CPU, MORSELS_AUTO, MORSELS_ON, MORSELS_OFF
+from omxcore.kernels._fpenv import core_count
 
 
 

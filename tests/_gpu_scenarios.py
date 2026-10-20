@@ -14,7 +14,7 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 
 import numpy as np
 
-import mxframe.aot_kernels as ak
+import omxcore.aot_kernels as ak
 
 INT_MIN = np.int32(-2147483648)
 F32_MAX = np.float32(3.4028235e38)
@@ -244,7 +244,7 @@ def sort_multikey():
     """LazyFrame.sort("k", "j") on the GPU (and CPU): correct order, ties in row order,
     including key columns whose combined radix overflows int32."""
     import pyarrow as pa
-    from mxframe import LazyFrame, Scan
+    from omxcore import LazyFrame, Scan
     rng = np.random.default_rng(3)
     for n, kmax, jmax in [(10, 3, 3), (1000, 5, 7), (1024, 5, 7), (100_000, 100, 100),
                           (100_000, 100_000, 100_000)]:
@@ -285,7 +285,7 @@ def sort_end_to_end():
     descending, with and without LIMIT (top-k), n not a power of two and spanning many blocks,
     and after a group-by (the reviewer's 2M rows / 1000 groups case)."""
     import pyarrow as pa
-    from mxframe import LazyFrame, Scan, col
+    from omxcore import LazyFrame, Scan, col
     rng = np.random.default_rng(9)
     for n in (5, 1000, 4097, 100_003, 2_000_000):
         t = pa.table({"k": rng.integers(0, 1000, n).astype(np.int32),

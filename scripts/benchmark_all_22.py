@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Memory-bounded TPC-H benchmark: MXFrame CPU/GPU, Polars, and Pandas."""
+"""Memory-bounded TPC-H benchmark: omxcore CPU/GPU, Polars, and Pandas."""
 import argparse
 import gc
 import importlib.util
@@ -46,7 +46,7 @@ from scripts.benchmark_tpch import (
     run_q21_mxframe, run_q21_pandas, run_q21_polars,
     run_q22_mxframe, run_q22_pandas, run_q22_polars,
 )
-from mxframe.custom_ops import clear_cache
+from omxcore.custom_ops import clear_cache
 
 ALL_QUERIES = list(range(1, 23))
 DESCRIPTIONS = {

@@ -1,4 +1,4 @@
-"""A session's view of a shared table: its edits, rows, merges and formula columns (docs/mxframe-mojo-api.md
+"""A session's view of a shared table: its edits, rows, merges and formula columns (docs/omxcore-mojo-api.md
 sections 3, 4 and 6).
 
     var f = Frame(shared)

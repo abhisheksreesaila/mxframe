@@ -31,6 +31,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from engine_sources import engine_sources
 
 ROOT = Path(__file__).resolve().parent.parent
 BUILD = ROOT / "build"
@@ -44,7 +45,7 @@ NAMES = [c for c, _ in COLS]
 def _build_probe(name, flags=""):
     BUILD.mkdir(exist_ok=True)
     out = BUILD / name
-    src = list((ROOT / "mojo/mxframe").glob("*.mojo")) + list((ROOT / "kernels_aot").glob("*.mojo")) + [ROOT / "mojo/tools/range_probe.mojo"]
+    src = engine_sources(ROOT / "mojo/tools/range_probe.mojo")
     with open(BUILD / ".range_probe.lock", "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         if not out.exists() or out.stat().st_mtime < max(p.stat().st_mtime for p in src):

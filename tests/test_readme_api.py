@@ -8,8 +8,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-import mxframe as mx
-from mxframe import LazyFrame, col, lit, when
+import omxcore as mx
+from omxcore import LazyFrame, col, lit, when
 
 ROOT = Path(__file__).resolve().parent.parent
 README = (ROOT / "README.md").read_text()
@@ -141,7 +141,7 @@ def test_api_example_results(data, name):
 
 def test_quickstart_runs_on_the_native_executor(data):
     """The README's numbers are the native executor's; its quickstart must take that path."""
-    from mxframe import native_exec
+    from omxcore import native_exec
     code = re.findall(r"```python\n(.*?)```", README, re.S)[0]
     ns = {}
     exec(compile(code, "README.md", "exec"), ns)

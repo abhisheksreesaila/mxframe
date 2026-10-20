@@ -5,9 +5,9 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-from mxframe.lazy_expr import col, lit, when
-from mxframe import pipeline_kernels as pk
-from mxframe.pipeline_program import (
+from omxcore.lazy_expr import col, lit, when
+from omxcore import pipeline_kernels as pk
+from omxcore.pipeline_program import (
     compile_pipeline, finalize, merge_partials, empty_partials, Partials,
 )
 

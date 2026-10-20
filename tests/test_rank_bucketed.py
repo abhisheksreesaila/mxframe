@@ -4,9 +4,9 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-import mxframe.group_keys as gk
-from mxframe import LazyFrame, col
-from mxframe.lazy_frame import Scan
+import omxcore.group_keys as gk
+from omxcore import LazyFrame, col
+from omxcore.lazy_frame import Scan
 
 pytestmark = pytest.mark.skipif(not gk.available(), reason="libmxgroupkeys_cpu.so not built")
 

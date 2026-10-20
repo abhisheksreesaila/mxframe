@@ -1,5 +1,5 @@
 """F-044: seeded random queries over the TPC-H tables, each written once as a spec and rendered three
-ways (MXFrame LazyFrame, Polars LazyFrame, DuckDB SQL), so the engines run the same logical query.
+ways (omxcore LazyFrame, Polars LazyFrame, DuckDB SQL), so the engines run the same logical query.
 
 Shapes: filter + group-by on one table, joins along the TPC-H foreign keys (1-3 tables, filters
 before or after the joins), global aggregates, top-N rows, COUNT(DISTINCT) per key, HAVING, the
@@ -241,8 +241,8 @@ def _pre_split(spec):
 
 
 def run_mx(spec, t, device="cpu"):
-    """MXFrame: the spec on the LazyFrames `t`; returns the computed pyarrow.Table."""
-    from mxframe import LazyFrame, col, lit
+    """omxcore: the spec on the LazyFrames `t`; returns the computed pyarrow.Table."""
+    from omxcore import LazyFrame, col, lit
 
     def pred(f):
         c, op, v = col(f["col"]), f["op"], f["v"]

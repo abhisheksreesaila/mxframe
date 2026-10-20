@@ -16,10 +16,10 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-import mxframe as mx
-from mxframe import pipeline_kernels as pk
-from mxframe.custom_ops import _can_be_null
-from mxframe.lazy_expr import col, lit
+import omxcore as mx
+from omxcore import pipeline_kernels as pk
+from omxcore.custom_ops import _can_be_null
+from omxcore.lazy_expr import col, lit
 
 DEVICES = ["cpu", pytest.param("gpu", marks=pytest.mark.skipif(not pk.gpu_available(), reason="needs a GPU"))]
 
@@ -243,7 +243,7 @@ def test_power_edge_values_are_doubles_like_duckdb():
 # ---- the NULL sources are registered in _can_be_null ------------------------------------------------------------
 
 def test_every_null_source_is_registered_in_can_be_null():
-    from mxframe.lazy_expr import Expr
+    from omxcore.lazy_expr import Expr
     a, b = col("a"), col("b")
     assert _can_be_null(Expr("nullify", a)) is True
     assert _can_be_null(Expr("idiv", a, b)) is True

@@ -1,12 +1,12 @@
 import pyarrow as pa
 
-import mxframe
-from mxframe import LazyFrame, col
+import omxcore
+from omxcore import LazyFrame, col
 
 
 def test_import_resolves_to_this_checkout():
     from pathlib import Path
-    assert Path(mxframe.__file__).resolve().parent == Path(__file__).resolve().parent.parent
+    assert Path(omxcore.__file__).resolve().parent == Path(__file__).resolve().parent.parent
 
 
 def test_grouped_sum_cpu():

@@ -15,9 +15,9 @@ import duckdb
 import pyarrow as pa
 import pytest
 
-import mxframe as mx
-import mxframe.native_exec as nx
-from mxframe import gpu_stream
+import omxcore as mx
+import omxcore.native_exec as nx
+from omxcore import gpu_stream
 
 GPU = gpu_stream.cuda_available()
 D0 = dt.date(2024, 1, 1)

@@ -28,7 +28,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import numpy as np
 import pyarrow as pa
 import duckdb
-import mxframe as mx
+import omxcore as mx
 
 PASS = 0; FAIL = 0
 
@@ -125,9 +125,9 @@ def test_q5():
     region, nation, supplier, customer, orders, lineitem = make_q5_tables()
     DATE_LO, DATE_HI = 9131, 9496  # ~1995-01-01 to ~1996-01-01
 
-    # MXFrame DataFrame API (multi-join + filter + groupby + sort)
-    from mxframe import col, lit
-    from mxframe.lazy_frame import LazyFrame, Scan
+    # omxcore DataFrame API (multi-join + filter + groupby + sort)
+    from omxcore import col, lit
+    from omxcore.lazy_frame import LazyFrame, Scan
     import pyarrow.compute as pc
 
     # Join path: orders ⋈ customer ⋈ lineitem ⋈ supplier ⋈ nation ⋈ region
@@ -178,8 +178,8 @@ def test_q10():
     nation, customer, orders, lineitem = make_q10_tables()
     DATE_LO, DATE_HI = 9204, 9296
 
-    from mxframe import col, lit
-    from mxframe.lazy_frame import LazyFrame, Scan
+    from omxcore import col, lit
+    from omxcore.lazy_frame import LazyFrame, Scan
 
     lf = (
         LazyFrame(Scan(orders))

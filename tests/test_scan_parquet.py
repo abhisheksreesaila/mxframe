@@ -4,10 +4,10 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-import mxframe as mx
-from mxframe import LazyFrame, col, lit
-from mxframe.io_parquet import resolve_plan
-from mxframe.lazy_frame import Scan, ParquetScan, Filter
+import omxcore as mx
+from omxcore import LazyFrame, col, lit
+from omxcore.io_parquet import resolve_plan
+from omxcore.lazy_frame import Scan, ParquetScan, Filter
 
 DEV = "cpu"
 
@@ -322,14 +322,14 @@ def test_string_filters_on_dictionary_columns(pred):
 
 def test_global_aggregate_with_dictionary_filter():
     d, p = _string_dict_pair()
-    from mxframe.lazy_frame import Aggregate
+    from omxcore.lazy_frame import Aggregate
     q = lambda t: LazyFrame(Aggregate(LazyFrame(t).filter(col("s").isin(["AIR", "RAIL"])).plan, [],  # noqa: E731
                                       [col("v").sum().alias("t")])).compute(device=DEV)
     assert_same(q(d), q(p))
 
 
 def test_case_when_and_projection_over_dictionary_columns():
-    from mxframe import when
+    from omxcore import when
     d, p = _string_dict_pair()
     q = lambda t: (LazyFrame(t).groupby("id").agg(  # noqa: E731
         when(col("s").isin(["AIR", "RAIL"]), 1, 0).sum().alias("hi")).compute(device=DEV))
@@ -385,7 +385,7 @@ def test_import_does_not_load_parquet_dataset_modules():
     import subprocess
     import sys
     root = str(pathlib.Path(mxframe_root()).parent)
-    code = "import sys; import mxframe; print('pyarrow.dataset' in sys.modules)"
+    code = "import sys; import omxcore; print('pyarrow.dataset' in sys.modules)"
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
                          env={"PYTHONPATH": root, "PATH": ""})
     assert out.stdout.split()[-1:] == ["False"], out.stderr[-500:]
@@ -471,7 +471,7 @@ def test_engine_caches_do_not_serve_stale_results_for_reused_table_ids(tmp_path)
 
 def test_cache_entries_are_purged_when_table_dies(monkeypatch):
     import gc
-    from mxframe import custom_ops as co
+    from omxcore import custom_ops as co
     monkeypatch.setenv("MXFRAME_NATIVE", "0")   # the Python path's caches (the executor keeps none)
     t = pa.table({"g": ["a", "b", "a"], "v": np.ones(3, dtype=np.float32)})
     LazyFrame(t).groupby("g").agg(col("v").sum().alias("s")).compute(device=DEV)
@@ -484,7 +484,7 @@ def test_cache_entries_are_purged_when_table_dies(monkeypatch):
 
 
 def test_other_tables_caches_survive_scan_parquet_compute(parquet_file, monkeypatch):
-    from mxframe import custom_ops as co
+    from omxcore import custom_ops as co
     monkeypatch.setenv("MXFRAME_NATIVE", "0")   # the Python path's caches (the executor keeps none)
     t = _base_table()
     LazyFrame(t).groupby("grp").agg(col("qty").sum().alias("s")).compute(device=DEV)
@@ -500,7 +500,7 @@ def test_isin_with_none_on_dictionary():
     vals = ["a", None, "b", "a"]
     plain = pa.table({"s": pa.array(vals), "v": np.arange(4, dtype=np.float32)})
     dic = pa.table({"s": pa.array(vals).dictionary_encode(), "v": plain["v"]})
-    from mxframe.arrow_dict import dict_predicate
+    from omxcore.arrow_dict import dict_predicate
     import pyarrow.compute as pc
     for values in (["a"], ["a", "b"]):
         exp = pc.is_in(plain["s"], value_set=pa.array(values, pa.string()))

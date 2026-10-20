@@ -3,9 +3,9 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-from mxframe import LazyFrame, col, lit
-from mxframe.aot_kernels import AOT_AVAILABLE, AOTKernels
-from mxframe.lazy_frame import Scan
+from omxcore import LazyFrame, col, lit
+from omxcore.aot_kernels import AOT_AVAILABLE, AOTKernels
+from omxcore.lazy_frame import Scan
 
 pytestmark = pytest.mark.skipif(not AOT_AVAILABLE, reason="libmxkernels_aot.so not built")
 
@@ -48,7 +48,7 @@ def test_length_mismatch_raises_instead_of_reading_past_buffers():
 
 def test_stale_library_warns_once_and_falls_back(monkeypatch):
     import warnings
-    from mxframe import custom_ops
+    from omxcore import custom_ops
 
     def boom(*a, **k):
         raise RuntimeError("stale kernel library")

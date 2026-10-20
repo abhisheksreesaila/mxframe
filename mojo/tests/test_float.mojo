@@ -3,7 +3,7 @@
 from std.os import makedirs
 from std.ffi import external_call
 from std.sys import CompilationTarget
-from mxframe import (float_text, Table, SharedTable, Frame, Catalog, Query, QueryResult, INT, DECIMAL, TEXT, FLOAT, F32_COLUMN, col, lit_float, lit_f32,
+from omxcore import (float_text, Table, SharedTable, Frame, Catalog, Query, QueryResult, INT, DECIMAL, TEXT, FLOAT, F32_COLUMN, col, lit_float, lit_f32,
                      sum, count, mean, min_of, max_of, count_distinct, median, percentile, sql, PlannerOptions, GROUP_DENSE,
                      read_parquet, write_parquet, scan_parquet, read_csv, CsvOptions, ZSTD, CPU, AUTO)
 

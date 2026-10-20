@@ -962,7 +962,7 @@ def _try_stream(lf, plan, device: str, *, strict: bool, prefer, placement, gpu_f
     if isinstance(got, Plan):
         plan = got.plan
     if isinstance(got, str):
-        warnings.warn(f"mxframe: this query's working set does not fit in memory (budget {fmt_bytes(budget)}); "
+        warnings.warn(f"omxcore: this query's working set does not fit in memory (budget {fmt_bytes(budget)}); "
                       f"not streamed: {got}. Running it in memory, which may run out of memory.",
                       RuntimeWarning, stacklevel=3)
         return None
@@ -996,7 +996,7 @@ def _try_stream(lf, plan, device: str, *, strict: bool, prefer, placement, gpu_f
                 else:
                     sink.add(part, done_bytes / total_bytes if share is not None else None)
                 if verbose:
-                    print(f"[mxframe] streamed batch {batches_run}/{len(got.batches) or '?'}: "
+                    print(f"[omxcore] streamed batch {batches_run}/{len(got.batches) or '?'}: "
                           f"{n_in}, {part.num_rows} {'partial ' if spec else ''}rows")
                 if sink is not None and sink.full:
                     break

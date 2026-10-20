@@ -20,9 +20,9 @@ import duckdb
 import pyarrow as pa
 import pytest
 
-import mxframe as mx
-import mxframe.native_exec as nx
-from mxframe import gpu_stream
+import omxcore as mx
+import omxcore.native_exec as nx
+from omxcore import gpu_stream
 
 GPU = gpu_stream.cuda_available()
 D0 = dt.date(2024, 1, 1)
@@ -269,8 +269,8 @@ def test_possible_null_is_not_answered_natively(q, monkeypatch):
 # -- the DataFrame API: when() without otherwise is NULL ------------------------------------------------------
 
 def test_when_without_otherwise_is_null(cfg):
-    from mxframe import LazyFrame, col, lit
-    from mxframe.lazy_expr import when
+    from omxcore import LazyFrame, col, lit
+    from omxcore.lazy_expr import when
     dev, _ = cfg
     out = LazyFrame(T).select(col("id"), when(col("p") == lit(1), lit("one")).alias("c")).sort(col("id")).compute(device=dev)
     want = CON.execute("select id, case when p = 1 then 'one' end as c from t order by id").to_arrow_table()

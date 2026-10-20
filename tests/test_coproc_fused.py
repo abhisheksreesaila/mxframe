@@ -6,9 +6,9 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-from mxframe import LazyFrame, col, lit
-from mxframe import coproc_fused as cf
-from mxframe import pipeline_kernels as pk
+from omxcore import LazyFrame, col, lit
+from omxcore import coproc_fused as cf
+from omxcore import pipeline_kernels as pk
 
 needs_gpu = pytest.mark.skipif(not pk.gpu_available() or not pk.cpu_available(), reason="needs both pipeline libraries and a GPU")
 
@@ -156,7 +156,7 @@ def test_eviction_during_a_split_never_frees_memory_in_use(monkeypatch):
 
 
 def cf_bind(t):
-    from mxframe.pipeline_program import compile_pipeline
+    from omxcore.pipeline_program import compile_pipeline
     prog = compile_pipeline([col("d") > lit(20)], [col("v").sum(), (col("v") * col("w")).sum(), col("w").max()], t)
     return prog.bind_chunks(t)
 
@@ -179,7 +179,7 @@ def test_gpu_error_inside_split_is_redone_on_cpu(monkeypatch):
 
 @needs_gpu
 def test_sticky_cuda_error_in_split_disables_gpu(monkeypatch):
-    from mxframe import auto_mode as am
+    from omxcore import auto_mode as am
     cf.clear_residency()
     t = table(800_000)
     want = query(t).compute(device="cpu")
@@ -213,8 +213,8 @@ def test_derived_group_keys_do_not_upload():
 @needs_gpu
 @pytest.mark.parametrize("threads", ["1", "2", None])
 def test_split_shapes_match_cpu_for_thread_counts(monkeypatch, threads):
-    from mxframe import aot_kernels as ak
-    from mxframe import pipeline_kernels as pkm
+    from omxcore import aot_kernels as ak
+    from omxcore import pipeline_kernels as pkm
     if threads:
         monkeypatch.setattr(pkm, "default_threads", lambda *a: int(threads))
     cf.clear_residency()
@@ -276,7 +276,7 @@ def test_profile_reports_both_devices_busy():
 
 def test_first_query_makes_no_cuda_call_on_the_query_thread(monkeypatch):
     import threading
-    from mxframe import gpu_stream
+    from omxcore import gpu_stream
     main = threading.get_ident()
     calls = []
     real = gpu_stream.mem_info

@@ -11,10 +11,10 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-import mxframe.native_exec as nx
+import omxcore.native_exec as nx
 
-from mxframe import LazyFrame, col, sql
-from mxframe.np_arrow import array as A
+from omxcore import LazyFrame, col, sql
+from omxcore.np_arrow import array as A
 
 BITS = {np.float64: ("<Q", "<d"), np.float32: ("<I", "<f")}
 NAN_PAYLOADS = {np.float64: (0x7FF8000000000000, 0xFFF8000000001234, 0x7FF0000000000001),
@@ -274,6 +274,6 @@ def test_fused_join_partner_key_without_null(dt, first, monkeypatch):
 
 
 def test_an_all_null_float_key_encodes_without_error():
-    from mxframe import arrow_dict
+    from omxcore import arrow_dict
     enc = arrow_dict.encode_key(pa.chunked_array([pa.array([None, None], pa.float64())]))
     assert len(enc.dictionary) == 0 and enc.indices.null_count == 2

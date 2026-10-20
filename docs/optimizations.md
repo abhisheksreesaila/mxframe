@@ -1,6 +1,6 @@
-# How MXFrame got fast
+# How omxcore got fast
 
-This page tells the story of MXFrame's CPU engine, one optimization at a time: what was slow, why,
+This page tells the story of omxcore's CPU engine, one optimization at a time: what was slow, why,
 what the engine does now, and what it bought. Every number comes from the engine-only TPC-H
 benchmark in [`docs/bench/`](bench/):
 
@@ -16,10 +16,10 @@ ordinary engineering that any language would get.
 > Numbers: [`docs/bench/m2s-engine.md`](bench/m2s-engine.md) and its shuffled-rows twin
 > (2026-10-14, mx-cpu, Polars and DuckDB in one run each; Ryzen 9 5900X, 12 cores; a quiet machine).
 > Each milestone's own section quotes the run that was current when it landed.
-> Earlier milestones' DuckDB figures included DuckDB's pyarrow import (see F-044 below); MXFrame's
+> Earlier milestones' DuckDB figures included DuckDB's pyarrow import (see F-044 below); omxcore's
 > own figures are unaffected. Charts: `pixi run python scripts/plot_progress.py`.
 
-![MXFrame total per milestone against Polars and DuckDB](img/progress.svg)
+![omxcore total per milestone against Polars and DuckDB](img/progress.svg)
 
 ## The shape of the engine
 
@@ -134,7 +134,7 @@ Importing `pyarrow.compute` costs about 22 ms per process: it generates a docstr
 its roughly 270 functions. Arrow's own methods, such as `Array.cast` and `Table.filter`, import
 it as a side effect, so 15 of the 22 queries paid that cost inside their first run.
 
-MXFrame now calls Arrow's compute core directly. At SF1: Q17 41 → 17 ms, Q11 32 → 13 ms. **Not a
+omxcore now calls Arrow's compute core directly. At SF1: Q17 41 → 17 ms, Q11 32 → 13 ms. **Not a
 Mojo win**, but it shows that at small scale, fixed costs matter as much as kernels do.
 
 ### M2g: a group-by specialized at compile time
@@ -181,7 +181,7 @@ engineering: more parallelism isn't free.
 ### M2j: semi and anti joins in the API
 
 `join(..., how="semi" | "anti")` and `col(...).str_slice(offset, length)` let TPC-H Q22
-("customers who never ordered") be written in MXFrame alone instead of dropping to PyArrow. SF1:
+("customers who never ordered") be written in omxcore alone instead of dropping to PyArrow. SF1:
 34 → 18 ms.
 
 ### M2k: one thread per core, not per hyperthread (plain engineering)
@@ -240,7 +240,7 @@ flowchart LR
 ```
 
 SF10 Q21: 3.44 s before (M2l run) → 0.95 s (Polars 3.93 s, DuckDB 2.81 s in the same run as the 0.95). SF1: 279 → 102 ms. Polars and DuckDB use
-the same idea when they know a column is sorted; MXFrame checks at run time.
+the same idea when they know a column is sorted; omxcore checks at run time.
 
 *Mojo:* the kernel is a few `parallelize` closures over blocks that start at run boundaries, and
 reuses the value hashing and comparison helpers written for DISTINCT, including strings.
@@ -266,19 +266,19 @@ reuses the value hashing and comparison helpers written for DISTINCT, including 
 ### F-044: random queries, and a fairness bug in our own benchmark
 
 To check that none of this is TPC-H tuning, a seeded generator writes random queries over the
-TPC-H tables and runs each one in MXFrame, Polars and DuckDB, on the stored rows and on
+TPC-H tables and runs each one in omxcore, Polars and DuckDB, on the stored rows and on
 shuffled rows. Shapes: filters, group-bys, 1-3 joins, top-N, DISTINCT, COUNT(DISTINCT) and HAVING.
-Every result is checked against DuckDB, and **all 250 MXFrame results matched**.
+Every result is checked against DuckDB, and **all 250 omxcore results matched**.
 
 It found two blind spots and fixed them:
 - **ORDER BY ... LIMIT had no fast path.** A native top-k now keeps a heap of the best k rows per
   worker (one query: 543 → 14 ms).
 - **WHERE-only queries were filtered by Arrow.** They now go through the native filter.
 
-It also found **a bug in the benchmark that favoured MXFrame.** DuckDB imports pyarrow inside its
+It also found **a bug in the benchmark that favoured omxcore.** DuckDB imports pyarrow inside its
 first `.arrow()` call, about 70 ms per process. That had been counted in every DuckDB time, and
 it explained most of the earlier "faster than DuckDB on 22/22 at SF1". The import is now staging,
-like MXFrame's own.
+like omxcore's own.
 
 ### F-046: closing the gaps the random queries found
 
@@ -318,8 +318,8 @@ over raw Arrow buffers. The byte map's per-key counts use `Atomic[DType.int64]` 
 
 | | before F-046 (F-044 run) | after F-046 |
 |---|---:|---:|
-| TPC-H SF10, rows shuffled: MXFrame total (DuckDB) | 8.64 s (5.78 s) | **4.97 s** (5.55 s) |
-| TPC-H SF10, stored rows: MXFrame total (DuckDB) | 3.27 s (5.31 s) | 3.15 s (5.08 s) |
+| TPC-H SF10, rows shuffled: omxcore total (DuckDB) | 8.64 s (5.78 s) | **4.97 s** (5.55 s) |
+| TPC-H SF10, stored rows: omxcore total (DuckDB) | 3.27 s (5.31 s) | 3.15 s (5.08 s) |
 | random SF10 vs DuckDB, geometric mean | 0.75x | **1.09x** |
 | random SF1 shuffled vs DuckDB | 0.91x | **1.21x** |
 | random SF1 vs DuckDB | 0.63x | 0.83x |
@@ -329,9 +329,9 @@ work targeted it.
 
 ## Where it stands
 
-![SF10: MXFrame against Polars per query](img/per-query-sf10.svg)
+![SF10: omxcore against Polars per query](img/per-query-sf10.svg)
 
-| total of 22 queries | MXFrame (CPU) | Polars | DuckDB |
+| total of 22 queries | omxcore (CPU) | Polars | DuckDB |
 |---|---:|---:|---:|
 | SF10, engine-only | **3.15 s** | 14.40 s | 5.08 s |
 | SF1, engine-only | **0.47 s** | 1.31 s | 0.63 s |
@@ -346,11 +346,11 @@ work targeted it.
 - **Against DuckDB:**
   - **The lower TPC-H totals rest on Q21:** 0.74 s against 2.81 s at SF10 on stored rows, and
     1.34 s against 2.77 s shuffled. Leaving Q21 out, DuckDB's SF10 total is lower:
-    - stored rows: 2.27 s against MXFrame's 2.41 s;
+    - stored rows: 2.27 s against omxcore's 2.41 s;
     - shuffled rows: 2.79 s against 3.63 s.
   - DuckDB is faster on 12 of the 22 queries at SF10. The biggest gaps are joins: Q3, Q5, Q8,
     Q11, Q12, Q17 and Q22 run at 0.44–0.69x DuckDB's speed.
-  - **Random queries** (geometric mean of DuckDB time / MXFrame time):
+  - **Random queries** (geometric mean of DuckDB time / omxcore time):
 
     | | SF1 | SF1 shuffled | SF10 |
     |---|---:|---:|---:|
@@ -359,26 +359,26 @@ work targeted it.
 
   - **Next:** joins on build sides that are not direct-addressable, SELECT DISTINCT, and the
     TPC-H join queries above.
-- **Correctness:** MXFrame's results equal DuckDB's on all 44 TPC-H runs, the 44 shuffled ones,
+- **Correctness:** omxcore's results equal DuckDB's on all 44 TPC-H runs, the 44 shuffled ones,
   and the 250 random queries.
 
-![SF1: MXFrame against Polars per query](img/per-query-sf1.svg)
+![SF1: omxcore against Polars per query](img/per-query-sf1.svg)
 
 ### Read these numbers honestly
 
 - **Engine-only is the headline.** Loading data is staging and stays outside the clock (as in the
   TPC-H power test, the H2O db-benchmark and ClickBench); the clock covers the first run of the
   query in a fresh process. The secondary user-felt scoreboard (import and Parquet read included,
-  `docs/benchmarks.md`) has not been re-run since these optimizations. MXFrame still reads
+  `docs/benchmarks.md`) has not been re-run since these optimizations. omxcore still reads
   Parquet through PyArrow, so that gap remains (F-021).
-- **MXFrame's kernel warm-up is staged.** `import mxframe` warms the kernel libraries in a
+- **omxcore's kernel warm-up is staged.** `import omxcore` warms the kernel libraries in a
   background thread that finishes during the untimed load; Polars and DuckDB have no such step.
 - **Polars' Q1 is an outlier.** At SF10 its first run takes 2.7 s, and its result differs from
-  DuckDB's (float32 accumulation). Leaving Q1 out, SF10 totals are MXFrame 3.09 s, Polars 11.68 s,
+  DuckDB's (float32 accumulation). Leaving Q1 out, SF10 totals are omxcore 3.09 s, Polars 11.68 s,
   DuckDB 4.94 s.
-- **DuckDB is timed without its pyarrow import** (staging, like MXFrame's import); earlier
-  versions of this page counted it and overstated MXFrame's lead.
-- **TPC-H's stored order helps MXFrame on Q21.** On stored rows Q21 uses the sorted-run
+- **DuckDB is timed without its pyarrow import** (staging, like omxcore's import); earlier
+  versions of this page counted it and overstated omxcore's lead.
+- **TPC-H's stored order helps omxcore on Q21.** On stored rows Q21 uses the sorted-run
   count-distinct (0.74 s at SF10). Shuffled, it uses the hash layouts from F-046 (1.34 s). DuckDB
   takes about 2.8 s either way.
 - **One build, a quiet machine.** Numbers come from `docs/bench/m2s-engine*.md` and

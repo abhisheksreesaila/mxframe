@@ -2,7 +2,7 @@
 path = '/home/ablearn/mxdf_v2/scripts/_test_aot_smoke.py'
 with open(path) as f:
     c = f.read()
-c = c.replace("from mxdf_v2.aot_kernels", "from mxframe.aot_kernels")
+c = c.replace("from mxdf_v2.aot_kernels", "from omxcore.aot_kernels")
 c = c.replace("sys.path.insert(0, '/home/ablearn/mxdf_v2')\n", "")
 c = c.replace("import traceback\n", "")
 c = c.replace("np.array(got)", "np.array(got if hasattr(got,'__len__') else [got], dtype=float)")

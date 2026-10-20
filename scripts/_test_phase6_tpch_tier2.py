@@ -4,9 +4,9 @@ import sys
 import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from mxframe import LazyFrame, col, lit, when
-from mxframe.aot_kernels import AOTKernelsGPU
-from mxframe.custom_ops import clear_cache
+from omxcore import LazyFrame, col, lit, when
+from omxcore.aot_kernels import AOTKernelsGPU
+from omxcore.custom_ops import clear_cache
 
 DEVICE = os.environ.get("MXFRAME_TEST_DEVICE", "cpu")
 

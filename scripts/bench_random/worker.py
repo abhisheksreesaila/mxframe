@@ -28,9 +28,9 @@ def main():
     path = lambda n: os.path.join(data_dir, f"{n}.parquet")
     res = {"engine": engine, "seed": spec["seed"]}
     if engine == "mx":
-        import mxframe as mx
-        from mxframe import LazyFrame
-        import mxframe.native_exec as nx
+        import omxcore as mx
+        from omxcore import LazyFrame
+        import omxcore.native_exec as nx
         if shuffle:
             tabs = {}
             for n, cols in spec["tables"].items():

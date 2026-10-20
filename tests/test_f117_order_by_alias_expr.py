@@ -68,6 +68,6 @@ def test_a_from_column_wins_over_an_alias_in_a_grouped_expression(cfg):
 def test_distinct_order_by_expression_of_an_alias_still_names_the_problem(cfg):
     # DuckDB accepts this; the engine refuses with its usual DISTINCT message (follow-up, not F-117)
     with pytest.raises(ValueError, match="DISTINCT"):
-        import mxframe as mx
+        import omxcore as mx
         from _sql_reference import T
         mx.sql("select distinct g, 1 as c from t order by c + 1, g", t=T).compute(device=cfg[0])

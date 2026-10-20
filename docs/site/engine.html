@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>The Mojo engine: what it does and how it got fast</title>
-<meta name="description" content="MX frame's Mojo engine, the core that apps and agents build on: Parquet, text, bigger-than-RAM streams, GPU AUTO, aggregates, SQL and joins, with every number against DuckDB and pyarrow, including where it is still behind.">
+<meta name="description" content="omxcore's Mojo engine, the core that apps and agents build on: Parquet, text, bigger-than-RAM streams, GPU AUTO, aggregates, SQL and joins, with every number against DuckDB and pyarrow, including where it is still behind.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="site.css">
@@ -89,7 +89,7 @@
 <div class="shell">
 <nav class="side"></nav>
 <main id="main">
-  <div class="read"><b>What you're looking at</b>What MX frame's Mojo engine does and how each part got fast, area by area, against DuckDB 1.5.1 and pyarrow on the same files. Bars are times: shorter is faster. Hover a bar or dot for its numbers; every chart has a data table under it. All numbers come from one file, <a href="bench/engine-informal.json">bench/engine-informal.json</a>, which quotes <a href="https://github.com/abhisheksreesaila/mxframe/blob/main/docs/mojo-engine.md">docs/mojo-engine.md</a>. They are <b style="display:inline;font:inherit;text-transform:none;letter-spacing:0">informal</b>: measured on a shared machine while other work ran.</div>
+  <div class="read"><b>What you're looking at</b>What omxcore's Mojo engine does and how each part got fast, area by area, against DuckDB 1.5.1 and pyarrow on the same files. Bars are times: shorter is faster. Hover a bar or dot for its numbers; every chart has a data table under it. All numbers come from one file, <a href="bench/engine-informal.json">bench/engine-informal.json</a>, which quotes <a href="https://github.com/abhisheksreesaila/omxcore/blob/main/docs/mojo-engine.md">docs/mojo-engine.md</a>. They are <b style="display:inline;font:inherit;text-transform:none;letter-spacing:0">informal</b>: measured on a shared machine while other work ran.</div>
 
   <section class="hero fade" id="hero"><div class="status">loading bench/engine-informal.json…</div></section>
 
@@ -115,7 +115,7 @@
 
   <h2>Still behind DuckDB</h2>
   <div class="card behind-card fade">
-    <div class="card-h">MX frame time / DuckDB time · 1x is a tie · shorter is better</div>
+    <div class="card-h">omxcore time / DuckDB time · 1x is a tie · shorter is better</div>
     <div class="card-b">
       <div class="ch" id="behind"></div>
       <p class="note" id="next"></p>
@@ -130,7 +130,7 @@
 <script>
 const DATA = "bench/engine-informal.json";
 const $ = (id) => document.getElementById(id);
-const SER = { mx: ["--mx", "MX frame"], dk: ["--dk", "DuckDB 1.5.1"], pa: ["--pa", "pyarrow"], cpu: ["--mx", "CPU"], gpu: ["--accent", "GPU"], slow: ["--slow", "MX frame time / DuckDB time"] };
+const SER = { mx: ["--mx", "omxcore"], dk: ["--dk", "DuckDB 1.5.1"], pa: ["--pa", "pyarrow"], cpu: ["--mx", "CPU"], gpu: ["--accent", "GPU"], slow: ["--slow", "omxcore time / DuckDB time"] };
 const AREA = { joins: "join", sql: "SQL", streaming: "streamed", aggregates: "1M groups", multiway: "join", exprs: "expr" };
 const named = (g, r) => g.label || (r.label.toLowerCase().includes(AREA[g.from[0]].toLowerCase()) ? r.label : `${AREA[g.from[0]]} · ${r.label}`);
 let D;
@@ -212,14 +212,14 @@ function drawHero() {
   const val = (h) => { const r = lookup(h.ref); return h.ref[0] === "memory" ? [r.peak_mb, r.file_gb * 1000] : [lo(r.mx), hi(r.duckdb)]; };
   const focus = D.headline.find((h) => h.focus), rest = D.headline.filter((h) => h !== focus);
   const [num, unit] = focus.big.split(" "), [a, b] = val(focus);
-  $("hero").innerHTML = `<div class="top"><span class="wm">M<span class="x">X</span> FRAME</span><span class="label">The Mojo engine · CPU · GPU · AUTO</span>` +
+  $("hero").innerHTML = `<div class="top"><span class="wm">OM<span class="x">X</span>CORE</span><span class="label">The Mojo engine · CPU · GPU · AUTO</span>` +
     `<span class="sp"></span><span class="label">informal numbers · shared machine</span></div>` +
     `<div class="body"><div><div class="focus"><div class="big">${esc(num)}<em>${esc(unit)}</em></div>` +
     `<div><p class="fl">${esc(focus.label)}</p><p class="fv">${esc(focus.vs)}.</p><span class="fr">${ratio(b, a)} faster</span></div></div>` +
     `<p class="vision">${esc(D.vision)}</p><div class="aim">Aims to beat DuckDB and Polars, on CPU and GPU.</div></div>` +
     `<div class="ledger">${rest.map((h) => { const [n, u] = h.big.split(" ");
       return `<div class="row"><span class="n">${esc(n)}<em>${esc(u)}</em></span><span class="t"><b>${esc(h.label)}</b>${esc(h.vs)}</span></div>`; }).join("")}</div></div>` +
-    `<p class="cav">${esc(D.caveat)} <a href="https://github.com/abhisheksreesaila/mxframe/blob/main/docs/mojo-engine.md">docs/mojo-engine.md ↗</a></p>`;
+    `<p class="cav">${esc(D.caveat)} <a href="https://github.com/abhisheksreesaila/omxcore/blob/main/docs/mojo-engine.md">docs/mojo-engine.md ↗</a></p>`;
 }
 
 function drawGlance() {
@@ -261,7 +261,7 @@ function drawSteps() {
   };
   cols.forEach((p, i) => {
     const mxUp = p.duckdb === undefined || p.mx > hi(p.duckdb);
-    dot(i, p.mx, c.mx, mxUp, fmt(p.mx, "s"), `<b>${p.ticket}: ${esc(p.label)}</b><br>MX frame ${fmt(p.mx, "s")}${p.memory ? "<br>memory: " + esc(p.memory) : ""}`);
+    dot(i, p.mx, c.mx, mxUp, fmt(p.mx, "s"), `<b>${p.ticket}: ${esc(p.label)}</b><br>omxcore ${fmt(p.mx, "s")}${p.memory ? "<br>memory: " + esc(p.memory) : ""}`);
     if (p.duckdb !== undefined) dot(i, p.duckdb, c.dk, !mxUp, fmt(p.duckdb, "s"), `<b>${p.ticket}: ${esc(p.label)}</b><br>DuckDB ${fmt(p.duckdb, "s")}, same file, same minute`);
     const tx = svg("text", { x: CX(i), y: H - m.b + 22, "text-anchor": "middle" });
     tx.appendChild(svg("tspan", { x: CX(i), style: `fill:${cssVar("--accent")};font-weight:700` }, narrow ? p.ticket.replace(", F-1", "/") : p.ticket));
@@ -274,7 +274,7 @@ function drawSteps() {
   const first = st.steps[0], last = st.steps[st.steps.length - 1];
   $("steps-note").innerHTML = `${fmt(first.mx, "s")} to ${fmt(last.mx, "s")}: about ${Math.round(first.mx / last.mx)}x faster across four tickets, in ${esc(first.memory)}. ` +
     `On 20 row groups DuckDB is still ${ratio(last.mx, last.duckdb)} ahead; on a file with 4 row groups the engine wins, ${fmt(st.few_groups.mx, "s")} to ${fmt(st.few_groups.duckdb, "s")}.`;
-  $("steps-table").innerHTML = tableHTML(["step", "ticket", "MX frame", "DuckDB", "memory"], cols.map((p) => [p.label, p.ticket, fmt(p.mx, "s"), p.duckdb !== undefined ? fmt(p.duckdb, "s") : "", p.memory || ""]));
+  $("steps-table").innerHTML = tableHTML(["step", "ticket", "omxcore", "DuckDB", "memory"], cols.map((p) => [p.label, p.ticket, fmt(p.mx, "s"), p.duckdb !== undefined ? fmt(p.duckdb, "s") : "", p.memory || ""]));
 }
 function wrapWords(s, n) {
   const out = []; let cur = "";
@@ -289,7 +289,7 @@ const speedRows = (sec, prefix) => D[sec].rows.map((r) => ({
   bars: [{ s: "mx", v: r.mx, text: fmt(r.mx, "ms") }, { s: "dk", v: r.duckdb, text: fmt(r.duckdb, "ms") }],
   right: ratio(r.duckdb, r.mx), sub: r.was ? `was ${r.was} ms` : r.groups8 ? `8 groups: ${r.groups8} ms` :
     r.label.startsWith("star: ") ? "lineitem as the fact table" : r.label.includes(" (") ? r.label.split(" (")[1].replace(/\)$/, "") : "" }));
-const speedTable = (sec) => tableHTML(["", "MX frame (ms)", "DuckDB (ms)", "speedup"], D[sec].rows.map((r) => [r.label, r.mx, r.duckdb, ratio(r.duckdb, r.mx)]));
+const speedTable = (sec) => tableHTML(["", "omxcore (ms)", "DuckDB (ms)", "speedup"], D[sec].rows.map((r) => [r.label, r.mx, r.duckdb, ratio(r.duckdb, r.mx)]));
 
 function drawAreas() {
   const p = D.parquet.rows, t = D.text.rows, st = D.streaming, ed = D.edits.rows;
@@ -298,21 +298,21 @@ function drawAreas() {
     { label: "after", bars: [{ s: "mx", v: p[1].mx, text: fmt(p[1].mx, "s") }, { s: "pa", v: p[1].pyarrow, text: fmt(p[1].pyarrow, "s") }] },
   ], { scale: "log", domain: [0.1, 5], ticks: [[0.1, "0.1 s"], [1, "1 s"], [5, "5 s"]], title: D.parquet.title, pad: 70 });
   $("a-parquet-note").textContent = `${ratio(p[0].mx, p[1].mx)} faster than before: bulk decode, every core inside a row group, lazy dictionaries.`;
-  $("a-parquet-table").innerHTML = tableHTML(["", "MX frame", "pyarrow"], p.map((r) => [r.label, fmt(r.mx, "s"), r.pyarrow ? fmt(r.pyarrow, "s") : ""]));
+  $("a-parquet-table").innerHTML = tableHTML(["", "omxcore", "pyarrow"], p.map((r) => [r.label, fmt(r.mx, "s"), r.pyarrow ? fmt(r.pyarrow, "s") : ""]));
 
   hbars($("a-text"), [
     { label: "before", bars: [{ s: "mx", v: t[0].mx, text: fmt(t[0].mx, "s") }] },
     { label: "after", bars: [{ s: "mx", v: t[1].mx, text: fmt(t[1].mx, "s") }, { s: "dk", v: t[1].duckdb, text: fmt(t[1].duckdb, "s"), more: "whole query" }, { s: "pa", v: t[1].pyarrow, text: fmt(t[1].pyarrow, "s") }] },
   ], { scale: "log", domain: [0.1, 2], ticks: [[0.1, "0.1 s"], [0.5, "0.5 s"], [1, "1 s"], [2, "2 s"]], title: D.text.title, pad: 110 });
   $("a-text-note").textContent = D.text.note;
-  $("a-text-table").innerHTML = tableHTML(["", "MX frame", "DuckDB", "pyarrow"], t.map((r) => [r.label, fmt(r.mx, "s"), r.duckdb ? fmt(r.duckdb, "s") : "", r.pyarrow ? fmt(r.pyarrow, "s") : ""]));
+  $("a-text-table").innerHTML = tableHTML(["", "omxcore", "DuckDB", "pyarrow"], t.map((r) => [r.label, fmt(r.mx, "s"), r.duckdb ? fmt(r.duckdb, "s") : "", r.pyarrow ? fmt(r.pyarrow, "s") : ""]));
 
   const many = st.steps[st.steps.length - 1], few = st.few_groups;
   hbars($("a-stream"), [many, few].map((r) => ({ label: r.label.replace("morsels, ", ""), sub: r.memory,
     bars: [{ s: "mx", v: r.mx, text: fmt(r.mx, "s") }, { s: "dk", v: r.duckdb, text: fmt(r.duckdb, "s") }] })),
     { scale: "lin", domain: [0, 0.25], ticks: [[0, "0"], [0.1, "0.1 s"], [0.2, "0.2 s"]], title: st.title, pad: 80 });
   $("a-stream-note").textContent = `A ${D.memory.file_gb} GB file is queried in ${D.memory.peak_mb} MB, one row group at a time. Each core owns a row group and walks it in 32k-row blocks; files with fewer row groups than cores are cut into row ranges.`;
-  $("a-stream-table").innerHTML = tableHTML(["", "MX frame", "DuckDB", "memory"], [many, few].map((r) => [r.label, fmt(r.mx, "s"), fmt(r.duckdb, "s"), r.memory]));
+  $("a-stream-table").innerHTML = tableHTML(["", "omxcore", "DuckDB", "memory"], [many, few].map((r) => [r.label, fmt(r.mx, "s"), fmt(r.duckdb, "s"), r.memory]));
 
   hbars($("a-gpu"), D.gpu.rows.map((r) => ({ label: `${r.cores} cores · ${r.plan} plan`, right: `AUTO: ${r.auto}`,
     bars: [{ s: "cpu", v: r.cpu, text: fmt(r.cpu, "s"), ring: r.auto === "CPU" }, { s: "gpu", v: r.gpu, text: fmt(r.gpu, "s"), ring: r.auto === "GPU" }] })),
@@ -325,7 +325,7 @@ function drawAreas() {
   $("a-aggs-table").innerHTML = speedTable("aggregates");
 
   hbars($("a-sql"), speedRows("sql"), { scale: "log", domain: [1, 4000], ticks: LOGMS, title: D.sql.title, rightHead: "SPEEDUP", pad: 80 });
-  $("a-sql-note").textContent = "Speedup is DuckDB's time over MX frame's: above 1x the engine is faster. A planner reading only statistics picks dense or hashed grouping, top-k heaps or a full sort; EXPLAIN shows why.";
+  $("a-sql-note").textContent = "Speedup is DuckDB's time over omxcore's: above 1x the engine is faster. A planner reading only statistics picks dense or hashed grouping, top-k heaps or a full sort; EXPLAIN shows why.";
   $("a-sql-table").innerHTML = speedTable("sql");
 
   hbars($("a-joins"), speedRows("joins"), { scale: "log", domain: [1, 400], ticks: [[1, "1 ms"], [10, "10 ms"], [100, "100 ms"]], title: D.joins.title, rightHead: "SPEEDUP", pad: 80 });
@@ -353,7 +353,7 @@ function drawBehind() {
     bars: [{ s: "slow", v: g.hi - g.lo >= 0.05 ? [g.lo, g.hi] : g.lo, text: ratio(g.r.mx, g.r.duckdb), more: `${fmt(g.r.mx, g.u)} vs ${fmt(g.r.duckdb, g.u)}` }] })),
     { scale: "lin", domain: [1, Math.ceil(gaps[0].hi) + 0.2], ticks: Array.from({ length: Math.ceil(gaps[0].hi) }, (_, i) => [i + 1, `${i + 1}x`]), title: "Still behind DuckDB", pad: 170 });
   $("next").textContent = "Next: " + D.next;
-  $("behind-table").innerHTML = tableHTML(["", "MX frame", "DuckDB", "slower by", "next"], gaps.map((g) => [named(g, g.r), fmt(g.r.mx, g.u), fmt(g.r.duckdb, g.u), ratio(g.r.mx, g.r.duckdb), g.next]));
+  $("behind-table").innerHTML = tableHTML(["", "omxcore", "DuckDB", "slower by", "next"], gaps.map((g) => [named(g, g.r), fmt(g.r.mx, g.u), fmt(g.r.duckdb, g.u), ratio(g.r.mx, g.r.duckdb), g.next]));
 }
 
 function drawAll() { drawSteps(); drawAreas(); drawBehind(); }

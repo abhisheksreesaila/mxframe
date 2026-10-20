@@ -13,14 +13,14 @@ from pathlib import Path
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import conftest  # noqa: F401,E402  (makes `import mxframe` resolve to this checkout)
+import conftest  # noqa: F401,E402  (makes `import omxcore` resolve to this checkout)
 
 import numpy as np  # noqa: E402
 import pyarrow as pa  # noqa: E402
 import pyarrow.compute as pc  # noqa: E402
 
-from mxframe import LazyFrame, col, lit, when  # noqa: E402
-from mxframe.lazy_frame import Scan  # noqa: E402
+from omxcore import LazyFrame, col, lit, when  # noqa: E402
+from omxcore.lazy_frame import Scan  # noqa: E402
 
 
 def _lf(t):
@@ -183,7 +183,7 @@ def join_keys_of_different_integer_widths(device):
 
 def join_cache_is_keyed_by_device(device):
     """A join computed for one device is not reused by a query on another (GPU gathers may round)."""
-    from mxframe import custom_ops
+    from omxcore import custom_ops
     big = 16_777_217.0                                               # not representable in float32
     left = pa.table({"k": pa.array(np.arange(100, dtype=np.int32)), "v": pa.array(np.full(100, big))})
     right = pa.table({"k": pa.array(np.arange(100, dtype=np.int32)), "w": pa.array(np.ones(100, np.float32))})
@@ -254,7 +254,7 @@ def gpu_scratch_does_not_reserve_the_device(device):
     if device == "cpu":
         return
     import ctypes
-    from mxframe.aot_kernels import get_aot_gpu
+    from omxcore.aot_kernels import get_aot_gpu
     g = get_aot_gpu()
     assert g is not None
     lib = g._cu._lib

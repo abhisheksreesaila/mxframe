@@ -1,6 +1,6 @@
-# F-134 (M3): the CSV reader, docs/mxframe-mojo-api.md section 2.
+# F-134 (M3): the CSV reader, docs/omxcore-mojo-api.md section 2.
 from std.os import makedirs
-from mxframe import (read_csv, CsvOptions, CsvResult, FailedRow, Table, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT, write_parquet,
+from omxcore import (read_csv, CsvOptions, CsvResult, FailedRow, Table, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT, write_parquet,
                      read_parquet)
 
 comptime DIR = "mxframe_csv_test/"

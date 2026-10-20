@@ -1,4 +1,4 @@
-"""A device copy of a shared table (docs/mxframe-mojo-api.md section 7).
+"""A device copy of a shared table (docs/omxcore-mojo-api.md section 7).
 
     var dt = DeviceTable(shared)                 # uploads every column once (a default DeviceContext, GPU 0)
     var dt = DeviceTable(shared, app_ctx)        # or on the app's own DeviceContext
@@ -12,8 +12,8 @@ Why it looks like this:
   process uploaded. `release()` frees it for all of them (a query on a released table raises on `GPU` and runs on
   the CPU on `AUTO`).
 - The app's `DeviceContext` is used as is: buffers are allocated on it and the query kernels are enqueued on it, so
-  the app's own kernels (charts, point clouds) and MX frame's share one device, one memory pool and one stream. With
-  the default constructor MX frame creates its own context on device 0.
+  the app's own kernels (charts, point clouds) and omxcore's share one device, one memory pool and one stream. With
+  the default constructor omxcore creates its own context on device 0.
 - It is read-only: a session's edits never touch it (a query uploads the small bitmap of changed rows instead).
 - F-138b, where the GPU code lives: only on a GPU build. `HAS_GPU` is true on Linux (the target, as the app's D-56
   compiles its GPU path out of Apple builds); `-D MXFRAME_NO_GPU` turns it off on Linux too (to test the other side).
@@ -34,7 +34,7 @@ comptime NO_GPU_MESSAGE = "no GPU on this build"
 
 
 def gpu_available() -> Bool:
-    """Is there a GPU MX frame can use? (Creating a DeviceContext with none present crashes: ask first.) Always False
+    """Is there a GPU omxcore can use? (Creating a DeviceContext with none present crashes: ask first.) Always False
     on a build without GPU code."""
     comptime if HAS_GPU:
         try:

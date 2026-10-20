@@ -1,4 +1,4 @@
-// MXFrame docs site: sidebar nav, theme toggle, tooltip, small SVG and CSV helpers.
+// omxcore docs site: sidebar nav, theme toggle, tooltip, small SVG and CSV helpers.
 // Every page includes this file and a <nav class="side"></nav>; pages are listed once, here.
 const PAGES = [
   ["index.html", "Overview"],
@@ -8,7 +8,7 @@ const PAGES = [
   ["internals.html", "Behind the scenes"],
   ["how-it-got-fast.html", "How it got fast"],
 ];
-const REPO = "https://github.com/abhisheksreesaila/mxframe";
+const REPO = "https://github.com/abhisheksreesaila/omxcore";
 
 (function theme() {
   const saved = localStorage.getItem("mx-theme");
@@ -27,9 +27,9 @@ function renderNav() {
   const nav = document.querySelector("nav.side");
   if (!nav) return;
   const here = location.pathname.split("/").pop() || "index.html";
-  nav.innerHTML = `<a class="brand" href="index.html">M<span class="x">X</span>FRAME</a>` +
+  nav.innerHTML = `<a class="brand" href="index.html">OM<span class="x">X</span>CORE</a>` +
     PAGES.map(([href, name]) => `<a class="nav${href === here ? " on" : ""}" href="${href}"${href === here ? ' aria-current="page"' : ""}>${name}</a>`).join("") +
-    `<a class="nav" href="visualize/mxframe_pipeline.html">Kernel visualizer ↗</a>` +  // copied in by pages.yml
+    `<a class="nav" href="visualize/omxcore_pipeline.html">Kernel visualizer ↗</a>` +  // copied in by pages.yml
     `<a class="nav" href="${REPO}#api-reference">API reference ↗</a>` +
     `<div class="foot"><button class="btn" id="theme-btn" type="button" aria-pressed="${document.documentElement.dataset.theme === "dark"}">Light / dark</button>` +
     `<a class="label" href="${REPO}">GitHub ↗</a></div>`;

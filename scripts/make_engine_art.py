@@ -29,7 +29,7 @@ THEMES = {
                   text="#20221F", mid="#4C5049", dim="#6E716A", accent="#6C3E78", accent_hi="#512B5C",
                   mx="#2a78d6", dk="#1baf7a", pa="#eda100", slow="#e34948", grid="#E4DDD0", green="#18704F"),
 }
-SERIES = {"mx": "MX frame", "dk": "DuckDB", "pa": "pyarrow"}
+SERIES = {"mx": "omxcore", "dk": "DuckDB", "pa": "pyarrow"}
 
 
 def load():
@@ -127,7 +127,7 @@ def hero_paper(data):
 <rect y="72" width="{W}" height="{H - 72}" fill="url(#rule)"/>''']
     x = 56
     b.append(f'<text x="{x}" y="46" font-family="{MONO}" font-size="16" font-weight="800" letter-spacing="5" fill="{t["text"]}">'
-             f'M<tspan fill="{t["accent"]}">X</tspan> FRAME</text>')
+             f'OM<tspan fill="{t["accent"]}">X</tspan>CORE</text>')
     b.append(text(x + 150, 46, "THE MOJO ENGINE", 12, t["dim"], MONO, 700, ls=3))
     b.append(text(W - 56, 46, "INFORMAL NUMBERS · SHARED MACHINE", 12, t["dim"], MONO, 700, "end", ls=2))
     b.append(f'<path d="M{x} 64H{W - 56}" stroke="{t["text"]}" stroke-width="1.5"/>')
@@ -157,7 +157,7 @@ def hero_paper(data):
             b.append(f'<path d="M{cx} {y + 70}H{W - 56}" stroke="{t["border"]}"/>')
     b.append("</g>")
     b.append(f'<rect x=".5" y=".5" width="{W - 1}" height="{H - 1}" rx="18" fill="none" stroke="{t["border_hi"]}"/>')
-    return svg_doc(W, H, "\n".join(b), "MX frame: the Mojo engine (editorial)",
+    return svg_doc(W, H, "\n".join(b), "omxcore: the Mojo engine (editorial)",
                    data["vision"] + " " + "; ".join(f'{h["label"]}: {h["big"]} ({h["vs"]})' for h in data["headline"]) + ". " + data["caveat"])
 
 
@@ -171,7 +171,7 @@ def chart(theme, title, subtitle, legend, rows, scale, ticks, footer, value_col=
     heights = [max(len(r["bars"]) * step + 16, 52 if r.get("sub") else 0) for r in rows]
     H = head + sum(heights) + 58
     b = [f'<rect x=".5" y=".5" width="{W - 1}" height="{H - 1}" rx="14" fill="{t["surface"]}" stroke="{t["border_hi"]}"/>',
-         text(LX, 36, "// MX FRAME · THE MOJO ENGINE", 11, t["accent"], MONO, 700, ls=2),
+         text(LX, 36, "// OMXCORE · THE MOJO ENGINE", 11, t["accent"], MONO, 700, ls=2),
          text(LX, 64, title, 21, t["text"], SANS, 700),
          text(LX, 86, subtitle, 12, t["dim"], MONO)]
     lx = LX
@@ -242,7 +242,7 @@ def chart_wins(data, theme):
     rows.sort(key=lambda r: -r["ratio"])
     ticks = [(1, "1 ms"), (10, "10 ms"), (100, "100 ms"), (1000, "1 s")]
     return chart(theme, "Where the Mojo engine leads DuckDB", "SQL, joins, expressions and aggregates · time, log scale · lower is faster",
-                 [("mx", "MX frame"), ("dk", "DuckDB 1.5.1")], rows, log_scale(1, 4000), ticks, FOOT, "FASTER")
+                 [("mx", "omxcore"), ("dk", "DuckDB 1.5.1")], rows, log_scale(1, 4000), ticks, FOOT, "FASTER")
 
 
 def chart_read(data, theme):
@@ -261,7 +261,7 @@ def chart_read(data, theme):
     ]
     ticks = [(0, "0"), (0.2, "0.2 s"), (0.4, "0.4 s"), (0.6, "0.6 s")]
     return chart(theme, "Reading files at memory speed", "Parquet, text and bigger-than-RAM streams · time, linear · lower is faster",
-                 [("mx", "MX frame"), ("dk", "DuckDB 1.5.1"), ("pa", "pyarrow")], rows, lambda v: v / 0.75, ticks, FOOT)
+                 [("mx", "omxcore"), ("dk", "DuckDB 1.5.1"), ("pa", "pyarrow")], rows, lambda v: v / 0.75, ticks, FOOT)
 
 
 def gaps(data):
@@ -284,7 +284,7 @@ def chart_behind(data, theme):
     ticks = [(v, f"{v}x") for v in range(1, int(top) + 2)]
     # leave room right of the longest bar for its "5.8x  336 ms vs 58 ms" label
     return chart(theme, "Where we're still behind DuckDB", "how many times slower than DuckDB · 1x is a tie · shorter is better",
-                 [("slow", "MX frame time / DuckDB time")], rows, lambda v: (v - 1) / ((top - 1) / 0.66), ticks, FOOT)
+                 [("slow", "omxcore time / DuckDB time")], rows, lambda v: (v - 1) / ((top - 1) / 0.66), ticks, FOOT)
 
 
 def paper_frame(t, W, H, kicker, right):
@@ -297,7 +297,7 @@ def paper_frame(t, W, H, kicker, right):
 <rect width="{W}" height="{H}" fill="{t['bg']}"/>
 <rect y="72" width="{W}" height="{H}" fill="url(#rule)"/>''',
             f'<text x="56" y="46" font-family="{MONO}" font-size="16" font-weight="800" letter-spacing="5" fill="{t["text"]}">'
-            f'M<tspan fill="{t["accent"]}">X</tspan> FRAME</text>',
+            f'OM<tspan fill="{t["accent"]}">X</tspan>CORE</text>',
             text(206, 46, kicker, 12, t["dim"], MONO, 700, ls=3),
             text(W - 56, 46, right, 12, t["dim"], MONO, 700, "end", ls=1),
             f'<path d="M56 64H{W - 56}" stroke="{t["text"]}" stroke-width="1.5"/>']
@@ -399,13 +399,13 @@ def roadmap(data):
     b += band
     H = int(by + bh + 50)
     b.append(text(X0, H - 20, "informal timings: shared machine, see docs/mojo-engine.md · plugins are planned, not built", 11, t["dim"], MONO))
-    head = paper_frame(t, W, H, f"THE ROADMAP · SOON {rm['name'].upper()}", rm["source"])
+    head = paper_frame(t, W, H, f"THE ROADMAP · {rm['name'].upper()}", rm["source"])
     body = paper_close(t, W, H, head + b)
     desc = (f"Vision: {rm['vision']}. {rm['vision_2']}. What {rm['name']} can be: " + "; ".join(rm["can_be"]) + ". The path: " +
             "; ".join(f"{i + 1}. {s['title']}" + (" (we are here)" if i == now else "") for i, s in enumerate(steps)) +
             f". {ag['title']} ({ag['when'].lower()}): {ag['lead']}. " +
             "; ".join(f"{it['name']} ({it['status']}): {it['line']}" for it in ag["items"]) + ".")
-    return svg_doc(W, H, body, f"MX frame roadmap: the path to {rm['name']}", desc)
+    return svg_doc(W, H, body, f"omxcore roadmap: the path to {rm['name']}", desc)
 
 
 def hood(data):

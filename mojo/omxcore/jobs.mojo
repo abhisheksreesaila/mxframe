@@ -10,7 +10,7 @@
 Each takes its inputs by value or copies them (the job owns what it works on): a `Query` is moved in, a `Catalog` and a `Frame`
 are snapshotted when the job starts, so the caller may go on editing the frame or the catalog's sources; a `SharedTable` is
 shared read only. The result of a job is what the plain call returns, value for value. Each takes a `JobDone` callback (job.mojo) as its
-last argument, `NoCallback()` by default. Docs: docs/mxframe-mojo-api.md section 8c.
+last argument, `NoCallback()` by default. Docs: docs/omxcore-mojo-api.md section 8c.
 """
 from .job import Job, JobCtl, JobBody, JobDone, NoCallback, start_job_then
 from .query import Query, QueryResult, AUTO

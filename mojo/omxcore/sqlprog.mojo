@@ -776,7 +776,7 @@ struct _Emitter(Movable):
         var total = (na + plus) * (nb + plus)
         if total > CONCAT_LIMIT:
             raise Error("concatenating two columns whose dictionaries hold " + String(na) + " and " + String(nb) + " distinct words needs " + String(total) +
-                        " combinations (the most is " + String(CONCAT_LIMIT) + "): MX frame builds the result's words once per pair of words, never per row")
+                        " combinations (the most is " + String(CONCAT_LIMIT) + "): omxcore builds the result's words once per pair of words, never per row")
         var ents = List[Int64](length=max(total, 1), fill=0)
         for i in range(na + plus):
             var wa = self.dicts.word(da, i) if i < na else String()
@@ -845,7 +845,7 @@ struct _Emitter(Movable):
             self.ins(OP_I2F, fu, v.reg)
             var set_u = self.add_set(self.undecided[e].copy(), 0)
             self.ins(OP_IN_SET, fu, fu, set_u)
-            self.flag_errors(fu, v.nul, "reverse() of a word with combining marks, joiners or an emoji sequence: DuckDB reverses by grapheme clusters, MX frame by code points")
+            self.flag_errors(fu, v.nul, "reverse() of a word with combining marks, joiners or an emoji sequence: DuckDB reverses by grapheme clusters, omxcore by code points")
             self.free(fu)
         self.tab(v.reg, self.ents[e].copy())
         return V(v.reg, v.nul, False)
@@ -1516,7 +1516,7 @@ struct _Emitter(Movable):
             self.ins(OP_I2F, fu, v.reg)
             var set_u = self.add_set(unsb, 0)
             self.ins(OP_IN_SET, fu, fu, set_u)
-            self.flag_errors(fu, v.nul, "the word is one of DuckDB's text quirks that MX frame does not read (a date such as `infinity`, a BC date, a decimal with an exponent): " + String(self.rx[e].text))
+            self.flag_errors(fu, v.nul, "the word is one of DuckDB's text quirks that omxcore does not read (a date such as `infinity`, a BC date, a decimal with an exponent): " + String(self.rx[e].text))
             self.free(fu)
         self.tab(v.reg, ents)
         self.p.text_tabs += 1

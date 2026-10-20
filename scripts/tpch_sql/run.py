@@ -35,7 +35,7 @@ def load_tables(text: str, directory: str) -> dict:
     import pyarrow.parquet as pq
     import sqlglot
     import sqlglot.expressions as sge
-    import mxframe as mx
+    import omxcore as mx
     tree = sqlglot.parse_one(text, dialect="duckdb")
     names = {c.name.lower() for c in tree.find_all(sge.Column)}
     ctes = {c.alias.lower() for c in tree.find_all(sge.CTE)}
@@ -119,7 +119,7 @@ def compare(got, want, text: str) -> str:
 
 
 def one(q: int, sf: str) -> dict:
-    import mxframe as mx
+    import omxcore as mx
     from tpch_sql.queries import SQL
     text = SQL[q]
     d = data_dir(sf)
@@ -142,7 +142,7 @@ def main():
     ap.add_argument("--one", type=int)
     a = ap.parse_args()
     if a.one:
-        import conftest  # noqa: F401  (import mxframe from this checkout)
+        import conftest  # noqa: F401  (import omxcore from this checkout)
         print("@@SQL " + json.dumps(one(a.one, a.sf)), flush=True)
         return
     env = dict(os.environ, CUDA_VISIBLE_DEVICES="-1", PYTHONUNBUFFERED="1")

@@ -15,9 +15,9 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-from mxframe import LazyFrame, col, custom_ops, gpu_stream
-from mxframe import auto_mode as am
-from mxframe.aot_kernels import _bind_gpu, get_aot_gpu
+from omxcore import LazyFrame, col, custom_ops, gpu_stream
+from omxcore import auto_mode as am
+from omxcore.aot_kernels import _bind_gpu, get_aot_gpu
 
 pytestmark = pytest.mark.skipif(not gpu_stream.cuda_available() or get_aot_gpu() is None, reason="no CUDA GPU")
 
@@ -154,7 +154,7 @@ time.sleep(secs)
 
 SORT = r"""
 import numpy as np, pyarrow as pa
-from mxframe import LazyFrame
+from omxcore import LazyFrame
 rng = np.random.default_rng(9)
 n = 30_000_000       # more scratch than the GPU has left
 t = pa.table({"k": rng.integers(0, 1000, n).astype(np.int32), "j": rng.integers(0, 7, n).astype(np.int32),

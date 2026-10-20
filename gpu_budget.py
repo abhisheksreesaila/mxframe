@@ -151,7 +151,7 @@ def run_piece(name: str, need: int, gpu: Callable, cpu: Callable, *, shape=None,
         run.events.append({"piece": name, "action": "cpu", "why": why, "need": need, "free": free, "line": line})
         if run.device == "gpu" and key + (why,) not in _warned:
             _warned.add(key + (why,))
-            warnings.warn(f"mxframe gpu: {line}", RuntimeWarning, stacklevel=4)
+            warnings.warn(f"omxcore gpu: {line}", RuntimeWarning, stacklevel=4)
         return cpu()
 
     free = free_bytes()

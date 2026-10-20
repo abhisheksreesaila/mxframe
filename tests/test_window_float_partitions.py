@@ -6,7 +6,7 @@ import duckdb
 import pyarrow as pa
 import pytest
 
-from mxframe import LazyFrame, col, row_number
+from omxcore import LazyFrame, col, row_number
 
 
 def _nan(payload):

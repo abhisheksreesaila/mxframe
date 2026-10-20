@@ -23,7 +23,7 @@ Release artifacts and evidence:
 
 The sections below provide background and manual alternatives. Substitute the current version (`0.5.0`) in any older example.
 
-# 📦 Publishing MXFrame to PyPI
+# 📦 Publishing omxcore to PyPI
 
 > Step-by-step guide to building and releasing a new version.
 
@@ -43,7 +43,7 @@ In your PyPI project settings → **Add a new publisher**:
 | Field | Value |
 |---|---|
 | Owner | `abhisheksreesaila` |
-| Repository | `mxframe` |
+| Repository | `omxcore` |
 | Workflow filename | `publish.yml` |
 | Environment | `pypi` |
 
@@ -71,7 +71,7 @@ pip install build twine
 - [ ] All tests pass: `pixi run test-all`
 - [ ] GPU integration passes: `pixi run test6-gpu`
 - [ ] Benchmark shows no regression versus the previous release
-- [ ] `pyproject.toml` and `mxframe.__version__` agree
+- [ ] `pyproject.toml` and `omxcore.__version__` agree
 - [ ] `CHANGELOG.md` and the release-note artifact are updated
 - [ ] Pre-built CPU/GPU `.so` files are current
 - [ ] `twine check dist/*` passes
@@ -170,10 +170,10 @@ twine upload --repository testpypi dist/*
 # Test install in a clean env
 pip install --index-url https://test.pypi.org/simple/ \
     --extra-index-url https://pypi.org/simple/ \
-    mxframe==0.2.0
+    omxcore==0.2.0
 
 # Quick sanity check
-python3 -c "from mxframe import LazyFrame, col, lit; print('OK')"
+python3 -c "from omxcore import LazyFrame, col, lit; print('OK')"
 ```
 
 ---
@@ -229,7 +229,7 @@ pip install mxframe==0.2.0
 python3 - <<'EOF'
 import pyarrow as pa
 import numpy as np
-from mxframe import LazyFrame, Scan, col, lit
+from omxcore import LazyFrame, Scan, col, lit
 
 data = pa.table({
     "x": pa.array([1, 2, 3, 4, 5], pa.int32()),
@@ -244,7 +244,7 @@ result = (
     .compute(device="cpu")
 )
 print(result.to_pandas())
-print("✅ mxframe install verified")
+print("✅ omxcore install verified")
 EOF
 ```
 

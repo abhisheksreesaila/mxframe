@@ -11,11 +11,11 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-import mxframe.auto_mode as auto_mode
-import mxframe.custom_ops as custom_ops
-from mxframe import LazyFrame, col, lit, when
-from mxframe.aot_kernels import AOT_AVAILABLE, GPU_AOT_AVAILABLE, get_aot_gpu
-from mxframe.lazy_frame import Scan
+import omxcore.auto_mode as auto_mode
+import omxcore.custom_ops as custom_ops
+from omxcore import LazyFrame, col, lit, when
+from omxcore.aot_kernels import AOT_AVAILABLE, GPU_AOT_AVAILABLE, get_aot_gpu
+from omxcore.lazy_frame import Scan
 
 
 def _gpu_usable() -> bool:

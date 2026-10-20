@@ -4,7 +4,7 @@ import duckdb
 import pyarrow as pa
 import pytest
 
-from mxframe import LazyFrame, col, row_number
+from omxcore import LazyFrame, col, row_number
 
 NAN = float("nan")
 # three partitions; NULLs, NaNs (ties), -0.0 / 0.0, and one all-NULL partition (k=3)

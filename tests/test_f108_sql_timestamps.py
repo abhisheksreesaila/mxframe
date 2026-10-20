@@ -23,9 +23,9 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-import mxframe as mx
-import mxframe.native_exec as nx
-from mxframe import gpu_stream
+import omxcore as mx
+import omxcore.native_exec as nx
+from omxcore import gpu_stream
 
 GPU = gpu_stream.cuda_available()
 D0 = dt.date(2024, 1, 1)
@@ -530,8 +530,8 @@ def test_interval_across_a_dst_change_equals_duckdb(q, cfg):
 def test_a_float_min_max_over_a_join_does_not_materialize_the_join(monkeypatch):
     """F-058: deciding whether MIN / MAX of an expression needs the F-108 rewrite materialized the join below the
     aggregate first, only to leave a float expression alone (random SF1 seed 1: 26 -> 48 ms). Types come first now."""
-    import mxframe.custom_ops as co
-    from mxframe import LazyFrame, col, lit
+    import omxcore.custom_ops as co
+    from omxcore import LazyFrame, col, lit
     calls = []
     real = co.CustomOpsCompiler._computed_extremes
 
@@ -562,7 +562,7 @@ def test_a_float_min_max_over_a_join_does_not_materialize_the_join(monkeypatch):
 def test_min_max_over_a_join_with_clashing_column_names_equals_duckdb():
     """F-130 review: column_types drops a name both join sides carry with different types, so MIN / MAX over the
     renamed right column must still be rewritten (int64 past 2^53, text) after materializing the join."""
-    from mxframe import LazyFrame, col, lit
+    from omxcore import LazyFrame, col, lit
     big = 2 ** 53
     left = pa.table({"k": [1, 1, 2], "x": [1.5, 2.5, 3.5]})
     right = pa.table({"k": [1, 2], "x": pa.array([big + 1, big + 3], pa.int64())})

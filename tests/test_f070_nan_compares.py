@@ -18,11 +18,11 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-import mxframe as mx
-import mxframe.native_exec as nx
-from mxframe import LazyFrame, col, lit
-from mxframe import gpu_stream
-from mxframe.custom_ops import CustomOpsCompiler
+import omxcore as mx
+import omxcore.native_exec as nx
+from omxcore import LazyFrame, col, lit
+from omxcore import gpu_stream
+from omxcore.custom_ops import CustomOpsCompiler
 
 NAN, INF = float("nan"), math.inf
 GPU = gpu_stream.cuda_available()
@@ -380,7 +380,7 @@ def test_parquet_row_groups_with_nan(tmp_path, monkeypatch, native, pred, expr):
 
 def _flags(expr, **cols):
     """(op, flag) of every compare instruction in the compiled predicate."""
-    import mxframe.pipeline_program as pp
+    import omxcore.pipeline_program as pp
     t = pa.table(cols)
     prog = pp.compile_pipeline([expr], [], t, concat_dicts=True)
     code = prog.code[16:].reshape(-1, 5).tolist()
@@ -388,7 +388,7 @@ def _flags(expr, **cols):
 
 
 def test_integer_compares_and_compares_nan_cannot_change_stay_ieee():
-    import mxframe.pipeline_program as pp
+    import omxcore.pipeline_program as pp
     f, i = pa.array([1.0, NAN]), pa.array([1, 2], pa.int64())
     assert _flags(col("n") > 1, n=i) == [(pp.OP_CMPC, 0)]                                   # integer column: unchanged
     assert _flags(col("n") >= col("m"), n=i, m=i) == [(pp.OP_GE, 0)]

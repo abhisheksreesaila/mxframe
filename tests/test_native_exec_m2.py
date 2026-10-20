@@ -13,9 +13,9 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-import mxframe.native_exec as nx
-from mxframe import LazyFrame, col, lit
-from mxframe.np_arrow import array as A
+import omxcore.native_exec as nx
+from omxcore import LazyFrame, col, lit
+from omxcore.np_arrow import array as A
 
 SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
 sys.path.insert(0, str(SCRIPTS))
@@ -150,8 +150,8 @@ def test_deferred_dictionary_columns_are_decoded_after_the_filter(monkeypatch):
     """On the Python path too: resolve_plan no longer decodes a join leaf's dictionary column in
     full; the leaf decodes it after its filter, so only surviving rows are decoded."""
     monkeypatch.setenv("MXFRAME_NATIVE", "0")
-    import mxframe.arrow_dict as ad
-    import mxframe.join_engine as je
+    import omxcore.arrow_dict as ad
+    import omxcore.join_engine as je
     sizes = []
     real = ad.decode
 
@@ -196,8 +196,8 @@ def test_case_when_column_above_a_join_is_decoded_on_the_joined_rows_only(monkey
     """Q12's o_orderpriority: a dictionary column used in CASE WHEN above the join (a use the
     Python path can't take on dictionaries) is no longer decoded in full up front: the join decodes
     it after its final gather, so only joined rows are decoded."""
-    from mxframe.lazy_expr import when
-    import mxframe.arrow_dict as ad
+    from omxcore.lazy_expr import when
+    import omxcore.arrow_dict as ad
     monkeypatch.setenv("MXFRAME_NATIVE", native_on)
     sizes = []
     real = ad.decode
@@ -218,7 +218,7 @@ def test_case_when_column_above_a_join_is_decoded_on_the_joined_rows_only(monkey
     assert sizes or native_on == "1"
     monkeypatch.setattr(ad, "decode", real)
     monkeypatch.setenv("MXFRAME_NATIVE", "0")
-    monkeypatch.setattr("mxframe.io_parquet._join_leaf_filters", lambda plan: {})   # reference: decode up front
+    monkeypatch.setattr("omxcore.io_parquet._join_leaf_filters", lambda plan: {})   # reference: decode up front
     _same(got, plan().compute(device="cpu"))
 
 
@@ -267,7 +267,7 @@ def test_left_join_with_deferred_columns_matches(monkeypatch, filters):
 def test_parquet_source_with_join(star_scan, tmp_path, filters, monkeypatch):
     """scan_parquet: dictionary columns read as dictionaries, filtered natively at the leaf."""
     import pyarrow.parquet as pq
-    import mxframe as mx
+    import omxcore as mx
     f, d = _fact(), _dim()
     pq.write_table(f.cast(pa.schema([fld if not pa.types.is_dictionary(fld.type) else pa.field(fld.name, pa.string())
                                      for fld in f.schema])), tmp_path / "f.parquet", row_group_size=30_000)
@@ -319,7 +319,7 @@ def test_join_output_is_gathered_natively(gathers, monkeypatch):
 
 
 def test_native_gather_matches_arrow_take_on_odd_chunks():
-    import mxframe.custom_ops as co
+    import omxcore.custom_ops as co
     r = np.random.default_rng(3)
     words = np.array(["", "a", "bb", "ccc", "Zz"], dtype=object)
     parts = []
@@ -343,7 +343,7 @@ def test_native_gather_matches_arrow_take_on_odd_chunks():
 def test_fused_pipeline_declines_int64_past_2_53_too(monkeypatch):
     """With the executor off, the older fused pipeline (also float64) must decline as well."""
     monkeypatch.setenv("MXFRAME_NATIVE", "0")
-    import mxframe.custom_ops as co
+    import omxcore.custom_ops as co
     n = 20_000
     x = np.full(n, (1 << 53) + 1, dtype=np.int64)
     x[::4] = 3
@@ -356,7 +356,7 @@ def test_fused_pipeline_declines_int64_past_2_53_too(monkeypatch):
 def test_native_gather_on_sliced_misaligned_chunks_and_per_chunk_dictionaries():
     """Columns chunked at different boundaries (cut into common segments, offsets > 0) and a
     dictionary column with a different dictionary per chunk, decoded by the gather."""
-    import mxframe.custom_ops as co
+    import omxcore.custom_ops as co
     r = np.random.default_rng(12)
     n = 40_000
     vals = A(r.integers(-1000, 1000, n).astype(np.int64))

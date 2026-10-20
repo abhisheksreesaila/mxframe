@@ -4,7 +4,7 @@ from max import engine, driver
 from max.graph import Graph, TensorType, ops
 from max.graph.type import DType, DeviceRef
 
-KERNELS = Path("mxframe/kernels.mojopkg")
+KERNELS = Path("omxcore/kernels.mojopkg")
 acc = driver.Accelerator()
 session = engine.InferenceSession(devices=[acc])
 dref = DeviceRef.GPU(0)

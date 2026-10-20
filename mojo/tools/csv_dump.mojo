@@ -4,7 +4,7 @@
 # Usage: csv_dump <path> [threads] [chunk_bytes] [infer_rows] [float_columns] [decimal_columns], comma separated
 # (a FLOAT cell is printed as its float64 bits, a signed integer)
 from std.sys import argv
-from mxframe import read_csv, CsvOptions, TEXT
+from omxcore import read_csv, CsvOptions, TEXT
 
 
 def json_string(s: String) -> String:
