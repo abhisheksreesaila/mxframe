@@ -1,6 +1,8 @@
 # Stable engine version for apps
 
 Apps that vendor the Mojo package (`mxframe.mojoc`, soon `omxcore`) read this file to know which commit to build from.
+Scripts read the one-line file `STABLE` (just the commit). When a new version becomes stable, an issue labelled
+`mxframe` is also opened on the app's repo (abhisheksreesaila/mxapp), and the app's scheduled check updates itself.
 Only commits listed here are stable: every ticket in them passed adversarial review, and the full test suites were
 green. Anything newer on `main` may still be in review: don't vendor it.
 
