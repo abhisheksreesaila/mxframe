@@ -225,6 +225,74 @@ Text sorts alphabetically ignoring ASCII case, byte order breaking ties ("apple"
 review). A radix sort over Int64 keys: about 25-30 ms at 1M rows for text and narrow integers, 55-75 ms for full-range
 int64 (informal, F-138a). Next: multi-column sort.
 
+## 6b. Ranges and blocks over an order (F-176)
+
+A grid shows a window of a sorted view; a status bar totals a selection of it. Both are "positions a..b of an order", and both used to cost a `get` / `is_null` per cell
+(about 1,000 calls a scroll frame; a 100,000-cell cap on a total). Two calls read the window in bulk (`mojo/mxframe/blocks.mojo`). The engine knows nothing of grids or
+status bars: it takes a list of row numbers and a half-open range.
+
+```mojo
+from mxframe import range_aggregate, read_block, RangeResult, RangeAgg
+
+var order = f.permutation(cost)                     # any list of row numbers: Frame.permutation, the rows of an ORDER BY, a selection; rows may repeat
+var cols: List[Int] = [cost, region, day]
+var r = range_aggregate(f, order, cols, 1_000, 2_000_000)    # positions a <= p < b of `order`, for every column in one call
+r.rows; r.columns[0].count; r.columns[0].sum; r.columns[0].mean; r.columns[0].min; r.columns[0].max; r.columns[0].has_sum; r.columns[0].has_value()
+var s = range_aggregate(t, cols, 0, t.rows())                # no order: the rows themselves (a SharedTable; a Frame works too)
+
+var values = List[Int64](length=len(cols) * (b - a), fill=0)
+var nulls = List[UInt8](length=len(cols) * (b - a), fill=0)
+read_block(f, order, cols, a, b, values, nulls)              # cell (column k, row i) is values[k * (b - a) + i]; nulls[...] == 1 for a null (its value is 0)
+```
+
+Both calls come in four forms: a `SharedTable` or a `Frame`, with an `order` list or without (then position p is row p; over a Frame that holds a removed row the range must not
+include it). A Frame is a table with edits, appended rows, removed rows and merges, or a table on a Parquet file (`Frame(scan_parquet(path))`): the same two calls read all of them.
+
+| What | Rule |
+|---|---|
+| **Range** | half-open, `0 <= a <= b <= len(order)` (the rows, with no order). `a == b` is an empty range: `count` 0, no sum / min / max (SQL's NULL). Errors are plain sentences: `the range 5..3 ends before it starts`, `the range 0..11 goes past the end: the order has 10 rows`, `position 2 of the order is row 12, but there are only 10 rows`, `row 4 (position 4) was removed`, `column 99 does not exist (the table has 8)`, `the buffers hold 3 cells but the block has 10 (columns x rows)` |
+| **Columns** | stored columns only; a formula column raises `column `twice` is a formula: ranges read the stored columns` (F-179 and the formula work can lift it) |
+| **Cells** | the stored values, as `Table.get` / `Frame.get` give them: edits applied, merged text codes read as the code they were merged into, appended rows included; a null is skipped by every aggregate |
+| **count** | non-null cells, every kind |
+| **sum, mean** | INT and DECIMAL: the exact int64 sum at the column's own scale (`sum` is the stored integer, a DECIMAL(2) keeps two places); only a total outside int64 raises (`the sum of column `x` passed the int64 range (about 9.2e18)`; partial sums inside the range may pass it). `mean` is a Float64, DuckDB's AVG bit for bit (the exact sum over `count * 10^scale`, `ld_div`). FLOAT: `sum_float()` and `mean` in float64, see below. DATE, BOOL and TEXT have no sum or mean (`has_sum` is False) |
+| **min, max** | every kind. INT / DECIMAL / DATE / BOOL: the stored value. TEXT: the code of the smallest / largest word in the case-insensitive order of `Frame.permutation` (bytes break ties), `f.text_of(c, code)` for the word. FLOAT: NaN is above +inf (MAX is NaN when the range holds one, MIN only when it holds nothing else), -0.0 equals 0.0 (the first in order is reported) |
+| **FLOAT sum** | float64 added in position order inside each morsel of 16,384 positions counted from `a`, the morsels' sums added in morsel order, so the bits are the same on every run and every thread count (they differ from a plain left-to-right sum, and from DuckDB's, in the last places). NaN, +inf and -inf follow IEEE |
+| **Block layout** | column-major: a column's window is contiguous (`values[k * (b - a) ...]`). `values` holds the stored value: INT the integer, DECIMAL the scaled integer, DATE days, BOOL 0 / 1, TEXT the code (the word is `text_of(c, code)`, a session's new words and merges included), FLOAT the float64's bits (`Float64(from_bits=UInt64(v))`; NaN payloads and -0.0 are kept as stored) |
+
+**How it runs.** No cell is read by a call. A column of the window is gathered into a dense buffer by one tight loop over the order (the shared column read at the row numbers, the validity bit
+beside it) and then reduced by another; the changed rows of a Frame are patched in by a small binary search over the rows the session touched, built per call from the cells of the
+window's rows (a window no longer than 4x the frame's edits probes its own rows, so a 50-row read costs the same with 3 edits as with 300,000; a longer range takes every changed row, about 0.3 microseconds
+an edited cell). A Table or a Frame over one runs on every core: the range is cut into morsels of 16,384 positions, each worker gathers and reduces its morsels into private records, and the records are
+folded in morsel order (that fold is what makes sums reproducible). A Frame over a Parquet file runs on the calling thread (its cache is not thread-safe): the window's rows are bucketed by row group
+so each (group, column) chunk is fetched once through the frame's cache of decoded chunks (§3, `set_cache_limit`): a repeated window decodes nothing, a first window decodes the chunks of the groups it
+touches, and a window wider than the cache decodes on every pass. TEXT min / max marks the codes met and compares only those words.
+
+**Exactness is tested** against a per-cell loop over the same source (`mojo/tests/test_blocks.mojo`: a table, a Frame with 300 edits, appended and removed rows, new words and a merge, again after
+undoing them all, and a Frame over a 13-row-group file with 3,000-row groups, ranges of 0, 1, a morsel, a morsel boundary, several morsels and the whole table, random orders, repeated rows), and
+against DuckDB (`tests/test_mojo_range.py`: rows a..b of `row_number() OVER (ORDER BY key, rid)` on 60,000 rows with nulls, DECIMAL(18,2) and DECIMAL(9,4), a float column with NaN / +-inf / -0.0 / subnormals,
+text with case variants, dates and booleans; a table, a scan of 6,999-row groups, an edited Frame, an edited Frame over the file; ten orders; sums, counts, means (bit for bit), min and max exactly,
+float sums to 1e-12 of the sum of absolute values, the block cell by cell).
+
+Informal timings (F-176; 12-core Ryzen 9 5900X, the machine busy with other jobs (load average 5 to 6), best of several runs in one process, `mojo/tests/test_blocks.mojo`, `mojo/tools/range_bench.mojo`):
+
+| call | time |
+|---|---|
+| `range_aggregate`, one INT / DECIMAL(2) / DATE / BOOL column, 1,000,000 rows, random order (the column is in cache from the previous run) | 0.7 ms |
+| the same in table order (no order list) | 0.6 ms |
+| one FLOAT column (sum, mean, min, max, NaN count), random order / table order | 1.2 ms / 1.1 ms |
+| one TEXT column (13 words), random order / table order | 1.2 ms / 0.7 ms |
+| five columns (INT, DECIMAL x2, FLOAT, TEXT) of 1,000,000 rows, random order (the gathers now miss the cache: DRAM-bound) | 12 ms |
+| three columns (INT, DECIMAL, FLOAT) of 10,000,000 rows, random order | 106 ms |
+| `range_aggregate` of a Frame over a 10-row-group file, 4 columns, 200,000 rows, random order, chunks in the cache | 7.3 ms |
+| `read_block`, 50 rows x 40 columns, table, random order | 0.009 ms best, 0.012 median, 0.055 worst |
+| the same from a Frame with 302 edited rows / with 300,000 edited cells | 0.014 ms / 0.048 ms |
+| the same from a Frame over a file, chunks in the cache | 0.017 ms best, 0.018 median, 0.070 worst |
+| the first such window of a file (400 chunks decoded: 40 columns of 10 row groups, the whole file, because the order is random) | 65 ms |
+| a long range over a Frame with edits: 3 columns, 1,000,000 rows, random order, no edits / 300 / 30,000 / 300,000 edited cells | 8 / 4 / 11 / 119 ms (machine busy; the edits cost about 0.3 microseconds a cell) |
+
+The single-column rows time a column that stays in the cache between runs; a first read of a column from memory in random order costs several times that (five columns: 12 ms). The one-million-row range
+the ticket asked about is under 1 ms for one column and a few milliseconds for several; a grid window is two orders of magnitude under the 1 ms target, and stays so with 300,000 edits.
+
 ## 7. GPU memory
 - A device copy of a table, **uploaded once per process**, shared by every session; `release()` to give it back when a document closes.
 - Values over 32 bits must not break it (today the stand-in uploads int32 and refuses to upload otherwise; a single amount over $21.4M, stored in cents, doesn't fit).

@@ -58,6 +58,15 @@ the kernel's error flag (`OP_FLAG`), gated by the CASE branch it sits in. The th
 (every day 1800-2400 and 60,000 UTF-8 words, value by value), `test_mojo_expr_fuzz.py` (random expressions), `test_mojo_cast_fuzz.py` (`mojo/tools/cast_probe.mojo`: how every text cast reads
 thousands of generated words, against DuckDB's TRY_CAST), `test_mx_exprs.py` (through `build/mx`). No 128-bit division in the package: Apple's libSystem has none (`scripts/check_mac_link.sh`).
 
+## Ranges and blocks over an order (F-176)
+
+`range_aggregate(source, [order,] cols, a, b)` (count / sum / mean / min / max of each column over positions a..b of a row list, exact at each column's scale) and
+`read_block(source, [order,] cols, a, b, values, nulls)` (the window's cells and null flags into the caller's buffers) in `blocks.mojo`; a `SharedTable`, a `Frame` with edits and a `Frame` over a Parquet
+file are all sources (rules, errors and timings: `docs/mxframe-mojo-api.md` section 6b). A column of the window is gathered into a dense buffer and reduced by tight loops, in morsels of 16,384 positions on every
+core (a Frame over a file gathers on the calling thread through its chunk cache). Tests: `mojo/tests/test_blocks.mojo` (against the per-cell loop: tables, edited frames, scans with odd row groups, bounds, timings),
+`tests/test_mojo_range.py` (against DuckDB through `mojo/tools/range_probe.mojo`; the FLOAT sum's bits equal with one thread and many), `mojo/tools/range_bench.mojo` (the cost of edits). No app concept is in the module:
+it takes row numbers and a half-open range.
+
 ## `mx`, the agent command line (F-151)
 
 `mojo/cli/mx.mojo` is `mx sql | explain | schema` over the SQL above: JSON in, JSON out, exit 1 for a query error and 2 for a usage error
