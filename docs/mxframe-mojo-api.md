@@ -609,6 +609,7 @@ var job = read_csv_job(path, options)                               # Job[CsvRes
 var job = read_parquet_job(path)                                    # Job[ParquetResult]: read_parquet
 var job = save_job(frame, path, metadata, compression, allow_narrowing)   # Job[Int]     : Frame.save, the result is the rows written
 var job = write_parquet_job(table, path, metadata, compression, row_group_rows)   # Job[Int]: write_parquet
+var job = permutation_job(frame, column, descending)               # Job[List[Int]]   : Frame.permutation (a sort), over a snapshot
 
 job.poll()        # JOB_RUNNING, JOB_DONE, JOB_FAILED or JOB_CANCELLED (state_name(s) is the word)
 job.wait()        # blocks until the job's thread has ended; returns the state
@@ -628,12 +629,22 @@ Nothing of the job's is the caller's address: the job's body (a struct) owns its
 **Cancel.** `cancel()` answers at once and never returns a partial result. The work checks between:
 - *queries over a table*: row ranges of 2M rows (integer sums, counts, min and max merge exactly, so the answer is the one call's; a query with a float sum or a reproducible plan keeps its one call, since its float64 sum has one defined order); the windows of count_distinct / percentile / top_k;
 - *over a Parquet file or a Frame over one*: the blocks of a morsel (32,768 rows by default), the waves of row groups, the row groups;
-- *SQL*: the chunks (a table is one chunk, a scan's row groups are many, so a table's hashed group-by or a join's kernel call runs to its end; dense-group aggregates over a table and row queries use ranges / slices of 1M rows);
+- *SQL*: the chunks (a scan's row groups), and inside a big table chunk ranges of 2M rows: dense and hashed group-bys (the ranges' groups are merged with `_merge_hashed`, as a scan's row groups are), the probe side of a fused join, row queries (slices of 1M rows). Same rule as queries: a float sum or a reproducible plan keeps its one call. A materialized join's pair building and gather run to their end; the steps between them check. A cancel is noticed within about one range (about 10 ms at the engine's speed);
+- *sorts* (`permutation_job`): every 1M elements of the key pass and of each radix pass;
 - *CSV*: the chunks the file is cut into (`CsvOptions.chunk_bytes`, 4 MB; a file read by one thread is one chunk);
 - *Parquet read and write*: row groups.
 The thread that notices unwinds (everything it owns is freed on the way) and the job ends. Dropping the handle is a cancel that waits for nothing: the thread ends by itself and frees the rest.
 A save writes a temporary file and renames it; `cancel()` before the rename removes the temporary file and the old file stays whole. Just before the rename the save passes its point of no return
 (`JobCtl.commit()`): a `cancel()` after that changes nothing and the job ends JOB_DONE with the new file in place, so a job that says "cancelled" never replaced a file.
+
+**Saves and files.** Every writer has a temporary file of its own (`path.<pid>.<allocation address>.<clock>.tmp`), so two saves to one path, or a cancelled save still unwinding beside the one that replaced it, never touch each other's file; the last
+rename wins and the file is always exactly one of the inputs. A save survives a cancel and a `kill -9` (the old file stays) but not a power loss: there is no `fsync` before the rename. A killed process leaves its temporary file behind (the name says whose it was).
+
+**Handles and callbacks.** A handle dropped while its callback is running does not stop the callback: the app must not free what the callback touches on drop (a callback that posts an event to a long-lived queue is safe). `JOBS_ARE_THREADED` (`mxframe`, `mxframe.job`) is
+the build's answer to "do jobs run on threads?"; an app can assert it. When it is False a job runs, and its callback is called, inside the start call: the callback runs **before** the handle is returned.
+
+**A scan shared with a job.** The file's TEXT dictionaries are built once, behind a lock, by whichever of the job and the caller asks first (the flag that says "built" is an atomic release store, read with an acquire load, so a core with a weak memory order such as arm64 sees the words
+once it sees the flag). The other waits (a spin that yields the core on a threaded build). To avoid waiting, the caller can check `scan.dictionary_loaded(c)` first.
 
 **Progress.** `done` and `total` count rows (`bytes` is True for a CSV, whose rows are unknown before they are parsed, so it counts the file's bytes). One atomic add per block, never per row. `done` only grows; `total` can grow
 while the job finds more work (a join reads its sides one after another, a hashed holistic query makes a second pass); a job that ends done has `done == total`.
@@ -643,7 +654,7 @@ call with no job passes `JobCtl()`: never cancelled, nothing counted, the code p
 **The serial build** (`MXFRAME_SERIAL`, and every target but Linux) has no async runtime and, by default, no job threads: the job runs to its end inside its start call and the handle comes back done (or failed), progress at the
 total, the callback already called; `cancel()` then has nothing to stop. No new symbol: the Mac link check (`scripts/check_mac_link.sh`) lists the same libSystem calls as before the jobs (`pthread_*` is compiled out of that build).
 **Jobs with threads on a serial build** (`-D MXFRAME_JOB_THREADS`, for the app that wants its Mac UI free): the job gets a `pthread` with a 16 MB stack and its kernels still run in a loop (no async runtime, no `AsyncRT_*` symbol);
-the app's libSystem stub and its `ALLOWED` set then need `pthread_create`, `pthread_join`, `pthread_detach`, `pthread_attr_init`, `pthread_attr_setstacksize` and `pthread_attr_destroy` (`scripts/check_mac_link.sh` prints them under "with job threads").
+the app's libSystem stub and its `ALLOWED` set then need `pthread_create`, `pthread_join`, `pthread_detach`, `pthread_attr_init`, `pthread_attr_setstacksize` and `pthread_attr_destroy` and `sched_yield` (`scripts/check_mac_link.sh` prints them under "with job threads").
 To add a job for another kind of work: a struct with `comptime Out = T` and `def run(mut self, ctl: JobCtl) raises -> T` (`JobBody`), started with `start_job(body)` or `start_job_then(body, callback)`; call `ctl.check()`,
 `ctl.add_total(n)` and `ctl.advance(n)` at block boundaries.
 

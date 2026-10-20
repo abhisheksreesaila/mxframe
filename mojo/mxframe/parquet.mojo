@@ -28,10 +28,12 @@ and `read_parquet` refuses a zstd or snappy column chunk with an error naming th
 referenced, so nothing links. On Linux both codecs work as before.
 """
 from std.atomic import Atomic
+from std.time import perf_counter_ns
+from std.memory.alloc import unsafe_alloc
 from std.ffi import external_call
 from std.sys import is_defined, CompilationTarget
 from std.bit import pop_count, byte_swap
-from .job import JobCtl, STAGE_READ, STAGE_WRITE      # F-175
+from .job import JobCtl, STAGE_READ, STAGE_WRITE, THREADS      # F-175
 from .kernels._fpenv import par_n, core_count
 from std.collections import Dict
 from std.memory import ArcPointer
@@ -384,7 +386,11 @@ struct ParquetWriter(Movable):
             self.codec = UNCOMPRESSED                  # no zstd / snappy linked: whatever was asked for
         self.path = path
         # The temp name carries the process id, so two processes saving the same path never share a temp file.
-        self.tmp = path + "." + String(external_call["getpid", Int32]()) + ".tmp"
+        # (F-175) and the address of a fresh allocation and the clock: two saves to one path in one process (a cancelled save that is
+        # still unwinding beside the one that replaced it, two jobs at once) must never share a temporary file.
+        var uniq = unsafe_alloc[Int64](1)
+        self.tmp = path + "." + String(external_call["getpid", Int32]()) + "." + String(Int(uniq)) + "." + String(perf_counter_ns()) + ".tmp"
+        uniq.free()
         self.offset = 0
         self.schema = Table()
         for c in range(shape.columns()):
@@ -2425,7 +2431,7 @@ struct _ScanInfo(Movable):
     var metadata: String
     var dicts: Table                 # TEXT columns' file-wide words, each built on first use
     var widx: List[_WordIndex]       # and their indexes by bytes
-    var loaded: List[Bool]
+    var loaded: List[Int64]          # 1 once the dictionary is built: written with a release store, read with an acquire load (F-175: a job's thread and its caller)
     var extra: List[String]          # the file's other key-value metadata (key, value, ...)
     var build_lock: List[Int64]      # F-175: one word, 1 while a thread builds a dictionary (a job and its caller share a scan)
 
@@ -2434,7 +2440,7 @@ struct _ScanInfo(Movable):
         self.path = path
         self.file = file^
         self.size = size
-        self.loaded = List[Bool](length=len(leaves), fill=False)
+        self.loaded = List[Int64](length=len(leaves), fill=0)
         self.build_lock = List[Int64](length=1, fill=0)
         self.extra = List[String]()
         self.widx = List[_WordIndex]()
@@ -2597,11 +2603,11 @@ struct ParquetScan(Copyable, Movable):
 
     def dictionary_loaded(self, c: Int) -> Bool:
         """Whether column `c`'s file-wide dictionary has been built (it is built on first use)."""
-        return self._info[].loaded[c]
+        return Atomic[Scalar[DType.int64]].load(Pointer[Int64, MutUntrackedOrigin](unsafe_from_address=Int(self._info[].loaded.unsafe_ptr())) + c) != 0
 
     def ensure_words(self, c: Int) raises:
         """Builds TEXT column `c`'s file-wide dictionary (once)."""
-        if self.schema.kind(c) != TEXT or self._info[].loaded[c]:
+        if self.schema.kind(c) != TEXT or self.dictionary_loaded(c):
             return
         ref info = self._info[]
         # F-175: a background job and its caller may ask for the same dictionary at once: one builds it, the other waits for it
@@ -2610,8 +2616,10 @@ struct ParquetScan(Copyable, Movable):
             var free = Int64(0)
             if Atomic[Scalar[DType.int64]].compare_exchange(lock, free, 1):
                 break
+            comptime if THREADS:
+                _ = external_call["sched_yield", Int32]()      # the other thread is building: give it the core
         try:
-            if not info.loaded[c]:
+            if Atomic[Scalar[DType.int64]].load(Pointer[Int64, MutUntrackedOrigin](unsafe_from_address=Int(info.loaded.unsafe_ptr())) + c) == 0:
                 info.check_unchanged()
                 info.widx[c].col = Int(info.dicts.cols.unsafe_ptr() + c)
                 for g in range(len(info.groups)):
@@ -2620,7 +2628,7 @@ struct ParquetScan(Copyable, Movable):
                     _decode_group([src[0]], [src[1]], [info.groups[g][c].copy()], [c], [c], [Int(info.widx.unsafe_ptr() + c)], True,
                                   info.leaves, 0, info.dicts, words_only=True)
                     _ = maps^
-                info.loaded[c] = True
+                Atomic[Scalar[DType.int64]].store(Pointer[Int64, MutUntrackedOrigin](unsafe_from_address=Int(info.loaded.unsafe_ptr())) + c, 1)
         except e:
             Atomic[Scalar[DType.int64]].store(lock, 0)
             raise e^

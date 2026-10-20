@@ -36,6 +36,7 @@ from .kernels._fpenv import SERIAL, start_pool
 # runtime), at the price of three libSystem calls the app's stub must list: pthread_create, pthread_join, pthread_detach.
 comptime JOB_STACK_BYTES = 16 * 1024 * 1024        # a job thread's stack
 comptime THREADS = (not SERIAL) or is_defined["MXFRAME_JOB_THREADS"]()
+comptime JOBS_ARE_THREADED = THREADS     # public: an app can assert it (False: a job runs inside its start call and its callback runs before the handle is returned)
 
 comptime JOB_RUNNING = 0
 comptime JOB_DONE = 1
@@ -51,6 +52,7 @@ comptime STAGE_READ = 2
 comptime STAGE_AGGREGATE = 3
 comptime STAGE_WRITE = 4
 comptime STAGE_FINISH = 5
+comptime STAGE_SORT = 6
 
 # the control block: one Int64 per word, every access atomic
 comptime W_STATE = 0
@@ -84,6 +86,8 @@ def stage_name(s: Int) -> String:
         return "writing"
     if s == STAGE_FINISH:
         return "finishing"
+    if s == STAGE_SORT:
+        return "sorting"
     return "stage " + String(s)
 
 

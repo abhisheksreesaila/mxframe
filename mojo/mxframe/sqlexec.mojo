@@ -18,7 +18,7 @@ from .table import Table, SharedTable, Column, ColumnKind, INT, DECIMAL, TEXT, D
 from .frame import NULL_EDIT, text_ranks, _radix_order
 from .job import JobCtl, STAGE_PLAN, STAGE_AGGREGATE, STAGE_FINISH      # F-175
 from .query import (Program, QueryResult, _run_cpu, _run_cpu_job, _run_mat, _key_from_reg0, _make_result, _merge_partial, _identity_partial, _ScanMask, _group_mask,
-                    OVERFLOW_MESSAGE, overflow_message, CPU, MAGIC, A_MIN, A_MAX, A_FSUM, MORSEL_ROWS, WINDOW_BYTES, SRC_WORDS, fold_float, slot_identity)
+                    OVERFLOW_MESSAGE, overflow_message, CPU, MAGIC, A_MIN, A_MAX, A_FSUM, MORSEL_ROWS, JOB_RANGE_ROWS, WINDOW_BYTES, SRC_WORDS, fold_float, slot_identity)
 from .kernels._fpenv import core_count, par_n
 from .kernels.pipeline_cpu import IP, LP, FP, BP, VEC, E_OVERFLOW, _no_front, _no_keys, pipeline_keyed
 from .kernels.hashagg_cpu import hash_aggregate
@@ -222,10 +222,12 @@ def _hashed_result(run: KernelRun, res_r: Int, n_slots: Int, nkw: Int) -> Partia
     return out^
 
 
-def _run_hashed(t: SharedTable, sp: SqlProgram, mask_addr: Int, nkw: Int, threads: Int, fj: Optional[ArcPointer[FusedJoin]]) raises -> Partial:
+def _run_hashed(t: SharedTable, sp: SqlProgram, mask_addr: Int, nkw: Int, threads: Int, fj: Optional[ArcPointer[FusedJoin]],
+                row0: Int = 0, rows: Int = -1) raises -> Partial:
     """The kernel with hashed groups (hashagg_cpu.hash_aggregate): each worker numbers the key tuples of its rows in a local
     table, the partitions are merged in parallel, and the result is the groups with their key words, slots and counts."""
-    var run = KernelRun(sp.p, sp.set_bytes, sp.set_meta, t, mask_addr)
+    var n_rows = t.rows() if rows < 0 else rows                   # F-175: rows row0 .. row0 + n_rows (a multiple of 8 from row0) of the chunk
+    var run = KernelRun(sp.p, sp.set_bytes, sp.set_meta, t, mask_addr, 1, row0, n_rows)
     var res_r = run.region(3 + max(nkw, 1))
 
     def keyw(c: Int, i0: Int, sl: IP, nsel: Int, use_sel: Bool, dst: LP, rg: FP, wsp: BP) {imm} -> Bool:
@@ -239,13 +241,16 @@ def _run_hashed(t: SharedTable, sp: SqlProgram, mask_addr: Int, nkw: Int, thread
     var rc: Int
     if fj:
         var fs = front_spec(run, fj.value()[], sp.p)
+        fs.keys_a += 8 * row0                                      # the probe keys are indexed by the block's first row
+        if fs.ok_a != 0:
+            fs.ok_a += row0
 
         def front(k: Int, i0: Int, n: Int, sel: IP, ws: BP) {imm} -> Int:
             return jf_front(fs, i0, n, sel, ws)
 
-        rc = run.hashed_fused(keyw, front, fs.ws_bytes, nkw, t.rows(), threads, res_r)
+        rc = run.hashed_fused(keyw, front, fs.ws_bytes, nkw, n_rows, threads, res_r)
     else:
-        rc = run.hashed(keyw, nkw, t.rows(), threads, res_r)
+        rc = run.hashed(keyw, nkw, n_rows, threads, res_r)
     if rc == -7 or rc == E_OVERFLOW:
         raise Error(overflow_message(sp.p.has_float, sp.p.conv_text()))
     if rc != 0:
@@ -387,7 +392,7 @@ def _holistic_states(q: BoundQuery, groups: Int, sp: SqlProgram, dicts: DictAcce
     return HolStates(groups, specs^, ranks^, rows, sp.p.src_float.copy())
 
 
-def _run_dense_fused(t: SharedTable, sp: SqlProgram, mask_addr: Int, threads: Int, fj: ArcPointer[FusedJoin]) raises -> QueryResult:
+def _run_dense_fused(t: SharedTable, sp: SqlProgram, mask_addr: Int, threads: Int, fj: ArcPointer[FusedJoin], start: Int = 0, stop: Int = -1) raises -> QueryResult:
     """The dense / global aggregate over the rows the join's front stage lets through (the kernel call of query.mojo's `_run_cpu`, fused)."""
     ref p = sp.p
     var run = KernelRun(p, sp.set_bytes, sp.set_meta, t, mask_addr, p.groups)
@@ -397,10 +402,11 @@ def _run_dense_fused(t: SharedTable, sp: SqlProgram, mask_addr: Int, threads: In
         return jf_front(fs, i0, n, sel, ws)
 
     var rc: Int
+    var end = t.rows() if stop < 0 else stop
     if p.keyed:
-        rc = run.fused(_key_from_reg0, front, fs.ws_bytes, True, p.groups, 0, t.rows(), threads)
+        rc = run.fused(_key_from_reg0, front, fs.ws_bytes, True, p.groups, start, end, threads)
     else:
-        rc = run.fused(_no_keys, front, fs.ws_bytes, False, 1, 0, t.rows(), threads)
+        rc = run.fused(_no_keys, front, fs.ws_bytes, False, 1, start, end, threads)
     if rc == E_OVERFLOW:
         raise Error(overflow_message(p.has_float, p.conv_text()))
     if rc != 0:
@@ -411,14 +417,39 @@ def _run_dense_fused(t: SharedTable, sp: SqlProgram, mask_addr: Int, threads: In
 def _fold(sp: SqlProgram, plan: PhysicalPlan, chunk: SharedTable, mask_addr: Int, mut hs: HolStates, ops: List[Int], threads: Int,
           mut acc: Partial, mut dense_acc: QueryResult, mut ix: _KeyIndex, fj: Optional[ArcPointer[FusedJoin]], job: JobCtl = JobCtl()) raises:
     """Runs the program over one chunk and folds its partial result into the accumulator. `job` (F-175) moves by the chunk's rows."""
+    var n = chunk.rows()
+    var exact = job.active() and not sp.p.repro
+    for o in ops:
+        exact = exact and o < A_FSUM
+    var step = JOB_RANGE_ROWS // MORSEL_ROWS * MORSEL_ROWS
+    exact = exact and n > 2 * step
     if plan.group == G_HASHED:
+        if exact:                                                    # F-175: row ranges whose groups are merged, as a scan's row groups are
+            var at = 0
+            while at < n:
+                job.check()
+                var end = min(n, at + step)
+                _merge_hashed(acc, _run_hashed(chunk, sp, mask_addr, plan.key_words(), threads, fj, at, end - at), ops, ix)
+                job.advance(end - at)
+                at = end
+            return
         _merge_hashed(acc, _run_hashed(chunk, sp, mask_addr, plan.key_words(), threads, fj), ops, ix)
-        job.advance(chunk.rows())
+        job.advance(n)
         return
     var r: QueryResult
     if fj:
-        r = _run_dense_fused(chunk, sp, mask_addr, threads, fj.value())
-        job.advance(chunk.rows())
+        if exact and not sp.p.mat:
+            var at = 0
+            r = _identity_partial(sp.p.n_slots, sp.p.groups, ops)
+            while at < n:
+                job.check()
+                var end = min(n, at + step)
+                _merge_partial(r, _run_dense_fused(chunk, sp, mask_addr, threads, fj.value(), at, end), ops)
+                job.advance(end - at)
+                at = end
+        else:
+            r = _run_dense_fused(chunk, sp, mask_addr, threads, fj.value())
+            job.advance(n)
     elif sp.p.mat:
         r = _run_mat(chunk, sp.p, mask_addr, hs, 0, 0, job)
     else:
@@ -724,6 +755,7 @@ def _kind_name(k: Int) -> String:
 
 def _join_side[P: Planner](mut catalog: Catalog, q: BoundQuery, t: Int, needed: List[Int], planner: P, opts: PlannerOptions, trust: Bool) raises -> JoinSide:
     """Side `t` of the join: the source table itself when nothing filters it and it is a plain table, else the result of a row query."""
+    opts.job.check()                                              # F-175: between the steps of a join
     ref src = catalog.sources[q.sources[t]]
     var start = q.tab_start[t]
     var conj = q.conj_l.copy() if t == 0 else q.conj_r.copy()
@@ -872,6 +904,7 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
     """A query over two tables: each side is reduced to the rows and columns the query needs (a row query over its source, with the filter
     that reads only it), the smaller side is the build side of the hash join (`kernels/hashjoin_cpu.mojo`), the matching pairs are gathered
     into one table, and the rest of the query (the filter that reads both sides, aggregates, ORDER BY, LIMIT) runs over that table."""
+    opts.job.check()                                              # F-175: between the steps of a join
     var res = SqlResult()
     if q.explain != EXPLAIN_NONE:
         res.notes.append("join: " + _kind_name(q.join_kind) + ", on " + ", ".join(q.jk_l_names) + " = " + ", ".join(q.jk_r_names) +
@@ -1114,6 +1147,7 @@ def _label(q: BoundQuery, t: Int) -> String:
 
 def _read_filtered[P: Planner](mut catalog: Catalog, q: BoundQuery, t: Int, mut leaves: List[_Leaf], planner: P, opts: PlannerOptions, trust: Bool, mut res: SqlResult) raises:
     """A leaf that was only counted: its filtered rows, as a table of the columns later steps read."""
+    opts.job.check()                                              # F-175: between the steps of a join
     var t_m = perf_counter_ns()
     var sq = side_query(catalog, q, t, leaves[t].gcols)
     var r = _run_sql_once(catalog, sq, planner, opts, trust, String())
@@ -1134,6 +1168,7 @@ def _copy_leaf(l: _Leaf) -> _Leaf:
 def _build_cluster[P: Planner](q: BoundQuery, leaves: List[_Leaf], js: JoinStats, cluster: List[Int], keep: List[Int], planner: P, opts: PlannerOptions, threads: Int,
                                budget_bytes: Int, mut res: SqlResult) raises -> _Leaf:
     """The tables of a dimension group joined with each other (the planner orders them), keeping the global columns `keep`: one table to build a star's hash table on."""
+    opts.job.check()                                              # F-175: between the steps of a join
     var sub = JoinStats()
     for lf in cluster:
         sub.names.append(js.names[lf])
@@ -1350,6 +1385,7 @@ def _run_multiway[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: LogicalPl
     from exact row counts; the planner (`Planner.join_order`) picks the order and the build side of each join; every join but the last materializes its pairs
     (each keeps only the columns later steps read, and the conditions across tables are checked as soon as the tables they read are joined); the last is the
     two-table join of `_run_join_query` with the rest of the query (aggregates, ORDER BY, LIMIT), fused when the build side's keys are unique."""
+    opts.job.check()                                              # F-175: between the steps of a join
     var res = SqlResult()
     var n = len(q.sources)
     var threads = opts.threads

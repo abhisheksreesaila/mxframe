@@ -6,9 +6,10 @@ from std.os import makedirs
 from mxframe import (Table, SharedTable, Frame, Query, QueryResult, col, lit, sum, count, mean, min_of, max_of, count_distinct, median,
                      percentile, top_k, INT, DECIMAL, TEXT, FLOAT, write_parquet, read_parquet, scan_parquet, ParquetResult, ZSTD,
                      UNCOMPRESSED, CPU, AUTO, MORSELS_ON, MORSELS_OFF, Job, JOB_RUNNING, JOB_DONE, JOB_FAILED, JOB_CANCELLED,
-                     compute_job, sql_job, read_csv_job, read_parquet_job, save_job, write_parquet_job, Catalog, PlannerOptions,
+                     compute_job, permutation_job, sql_job, read_csv_job, read_parquet_job, save_job, write_parquet_job, Catalog, PlannerOptions,
                      GROUP_HASHED, sql, read_csv, CsvOptions, SqlResult, DeviceTable, gpu_available, GPU)
 from std.os import listdir
+from std.time import perf_counter_ns
 from mxframe.kernels._fpenv import SERIAL
 
 comptime DIR = "mxframe_jobs_test/"
@@ -608,6 +609,110 @@ def test_job_over_edited_frame() raises:
     expect(same_result(sjob.result(), swant), "a frame over a file: the job's answer while the caller reads cells")
 
 
+def temp_files() raises -> Int:
+    var n = 0
+    for name in listdir(DIR):
+        if name.endswith(".tmp"):
+            n += 1
+    return n
+
+
+def test_save_restart_and_two_saves() raises:
+    """A save cancelled and at once started again, and two saves to one path at once: the file is always exactly one of the inputs."""
+    var a = edited_frame(big_table(1_500_000))
+    var b = Frame(big_table(1_000_000))
+    var pa = DIR + "want-a.parquet"
+    var pb = DIR + "want-b.parquet"
+    a.save(pa, "", UNCOMPRESSED)
+    b.save(pb, "", UNCOMPRESSED)
+    var want_a = file_bytes(pa)
+    var want_b = file_bytes(pb)
+    var path = DIR + "contested.parquet"
+    var rng = Rng(8)
+    var failed = 0
+    for cycle in range(40):
+        var j1 = save_job(a, path, "", UNCOMPRESSED)
+        pause(rng.int(0, 15000))
+        j1.cancel()
+        var j2 = save_job(b, path, "", UNCOMPRESSED)                    # no wait: the cancelled save may still be unwinding
+        var s2 = j2.wait()
+        _ = j1.wait()
+        expect(s2 == JOB_DONE, "the restarted save is done, not failed (cycle " + String(cycle) + ")")
+        var now = file_bytes(path)
+        expect(same_bytes(now, want_b), "the file is the restarted save's, whole (cycle " + String(cycle) + ")")
+    for cycle in range(20):
+        var j1 = save_job(a, path, "", UNCOMPRESSED)
+        var j2 = save_job(b, path, "", UNCOMPRESSED)
+        var s1 = j1.wait()
+        var s2 = j2.wait()
+        expect(s1 == JOB_DONE and s2 == JOB_DONE, "two saves at once both finish")
+        var now = file_bytes(path)
+        expect(same_bytes(now, want_a) or same_bytes(now, want_b), "the file is exactly one of the two inputs (cycle " + String(cycle) + ")")
+    expect(temp_files() == 0, "no temporary file is left: " + String(temp_files()))
+
+
+def test_permutation_job() raises:
+    var t = big_table(5_000_000)
+    var f = edited_frame(t)
+    for c in ["v", "w", "name", "x"]:
+        for desc in [False, True]:
+            var col_i = f.column(c)
+            var plain = f.permutation(col_i, desc)
+            var job = permutation_job(f, col_i, desc)
+            _ = watch(job, "sort " + String(c))
+            var got = job.result()
+            expect(len(got) == len(plain) and same_ints(got, plain), "permutation_job == permutation: " + String(c) + " descending " + String(desc))
+    var slow = permutation_job(f, f.column("v"))
+    pause(5000)
+    slow.cancel()
+    var t0 = perf_counter_ns()
+    expect(slow.wait() == JOB_CANCELLED, "a cancelled sort has no result")
+    var ms = Float64(perf_counter_ns() - t0) / 1e6
+    expect(ms < 400.0, "the sort stops within a few checks of the cancel: " + String(ms) + " ms")
+
+
+def test_cancel_latency() raises:
+    """A hashed group-by over a big table, and a join's probe side, are cut into ranges: a cancel is noticed within about 100 ms."""
+    var t = big_table(30_000_000)
+    var u = Table.empty()
+    var uv = u.add_column("v", INT)
+    var ug = u.add_column("grp", INT)
+    for i in range(-1000, 1001):
+        u.append(uv, Int64(i))
+        u.append(ug, Int64(abs(i) % 5))
+    var cat = Catalog()
+    cat.add_table("t", t)
+    cat.add_table("u", u^.share())
+    var hashed = PlannerOptions()
+    hashed.group = GROUP_HASHED
+    var texts: List[String] = ["SELECT k, name, count(*), sum(v), min(w) FROM t GROUP BY k, name ORDER BY k, name",
+                               "SELECT b.grp, count(*), sum(a.w) FROM t a JOIN u b ON a.v = b.v GROUP BY b.grp ORDER BY b.grp"]
+    for qi in range(len(texts)):
+        var want = sql(cat, texts[qi], hashed)
+        var full = sql_job(cat, texts[qi], hashed)
+        _ = watch(full, "latency " + String(qi))
+        expect(same_table(full.result().table, want.table), "ranged hashed / joined sql job == sql: " + texts[qi])
+        var worst = 0.0
+        var hit = 0
+        var stopped_early = 0
+        for k in range(6):
+            var job = sql_job(cat, texts[qi], hashed)
+            pause(20000 + 15000 * k)
+            job.cancel()
+            var t0 = perf_counter_ns()
+            if job.wait() == JOB_CANCELLED:
+                hit += 1
+                var pr = job.progress()
+                if pr.done < pr.total:                       # the work stopped between ranges, not after its one call
+                    stopped_early += 1
+            worst = max(worst, Float64(perf_counter_ns() - t0) / 1e6)
+        print("cancel latency, query", qi, ": worst", worst, "ms,", hit, "of 6 cancels reached a running job; a whole run takes", want.ms, "ms")
+        comptime if not SERIAL:
+            expect(hit >= 3, "the cancels reached running jobs (" + String(hit) + ")")
+            expect(stopped_early >= 1, "a cancelled job stopped part way through its rows (" + String(stopped_early) + " of " + String(hit) + ")")
+        expect(worst < 250.0, "a cancel stops the job within about 100 ms (worst " + String(worst) + " ms): " + texts[qi])
+
+
 def main() raises:
     makedirs(DIR, exist_ok=True)
     test_compute_equals_plain()
@@ -623,4 +728,7 @@ def main() raises:
     test_cancelled_save_keeps_the_old_file()
     test_concurrent_jobs()
     test_job_over_edited_frame()
+    test_save_restart_and_two_saves()
+    test_permutation_job()
+    test_cancel_latency()
     print("test_jobs ok")
