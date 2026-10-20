@@ -243,6 +243,7 @@ var s = range_aggregate(t, cols, 0, t.rows())                # no order: the row
 var values = List[Int64](length=len(cols) * (b - a), fill=0)
 var nulls = List[UInt8](length=len(cols) * (b - a), fill=0)
 read_block(f, order, cols, a, b, values, nulls)              # cell (column k, row i) is values[k * (b - a) + i]; nulls[...] == 1 for a null (its value is 0)
+                                                            # after an error the buffers' contents are unspecified (writes stay inside the block)
 ```
 
 Both calls come in four forms: a `SharedTable` or a `Frame`, with an `order` list or without (then position p is row p; over a Frame that holds a removed row the range must not

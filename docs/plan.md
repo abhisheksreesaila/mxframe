@@ -1473,7 +1473,7 @@ Needs: F-138a, F-138b (can start on Linux before them)
 
 ## Ready for later: the queue (owner, 2026-10-20: stop at a good point, keep every ticket ready)
 Resume in this order when the owner says go. Each ticket below has its full entry further down.
-1. **Finish the app's showcase needs:** F-175 background queries and F-176 range aggregates / block reads (finishing now), then F-177 stddev / quantile bins / ISO week, F-179 undo for formulas, F-180 compressed Parquet everywhere, F-178 streamed CSV.
+1. **Finish the app's showcase needs:** F-175 background queries and F-176 range aggregates / block reads (finishing now), then F-176 follow-ups (formula columns in range / block reads, cached frame patches), F-177 stddev / quantile bins / ISO week, F-179 undo for formulas, F-180 compressed Parquet everywhere, F-178 streamed CSV.
 2. **M8 to its gate:** F-158 joins over streamed files (WIP on branch `worktree-agent-a27f985ecf9ff3560` at 4a9c93f; first bisect a Mojo compiler crash), F-159 CTEs / correlated subqueries / UNION ALL, F-160 named views + result cache, F-161 join speed (star-aware planner, filters inside joins, Python on the shared kernel), F-162 gate: TPC-H 22 through `mx` equal to DuckDB.
 3. **Scoreboard and gaps:** F-166 quiet-machine scoreboard vs DuckDB / Polars (needs the owner's go), F-167 sort / large outputs / parallel text building / spill, F-168 window functions.
 4. **Release:** F-165 rename to omxcore + 0.7.0 (PyPI needs the owner's yes), F-169 MCP server for `mx`.
@@ -1690,7 +1690,7 @@ Owner: "if you want the absolute best performance, we ship Omarchy Linux with th
 - [x] start a query (builder, SQL, scan, frame) off the caller's thread and get a handle: `poll()` / `wait()` / an optional completion callback, `cancel()` (checked between morsels / row groups / blocks, no partial result), `progress()` (rows done of rows, per stage); CSV / Parquet open and save as jobs too; cancelling frees everything (lifetime lint); equal results to the synchronous call
 - Built: `job.mojo` (the handle, `JobCtl`), `jobs.mojo` (`compute_job`, `sql_job`, `read_csv_job`, `read_parquet_job`, `save_job`, `write_parquet_job`), checks and progress in query / sql / rows / csv / parquet / frame; `docs/mxframe-mojo-api.md` section 8c. Limits: a cancel is seen between ranges / blocks / chunks, so one kernel call over a whole table (hashed groups, a join) runs to its end after `cancel()` has already answered; a float64 sum over a table keeps its one call.
 
-## F-176 Range aggregates and block reads over a sort order [review] (mxframe #8, #9)
+## F-176 Range aggregates and block reads over a sort order [done] (mxframe #8, #9)
 - [x] sum / count / mean / min / max over rows a..b of a permutation (or a row list) for a set of columns, exact at each column's scale, without per-cell calls
 - [x] read rows a..b (in a permutation) of n columns in one call: typed values and null flags into caller buffers
 
@@ -1702,6 +1702,7 @@ NaN / -0.0 as the engine's other aggregates. Errors are plain sentences. Rules, 
 - Tests: `mojo/tests/test_blocks.mojo` (per-cell oracle: table, frame with 300 edits / appends / removes / a merge and again after undo, a 13-row-group scan frame, ranges empty / single / whole / across morsels and row groups, bad ranges and rows, int64 total checks, timings),
   `tests/test_mojo_range.py` (DuckDB `row_number() OVER (ORDER BY ...)` oracle through `mojo/tools/range_probe.mojo`: 4 sources x 10 orders x 10 ranges, aggregates and blocks; float sums equal between a threaded and an `-D MXFRAME_SERIAL` build), `mojo/tools/range_bench.mojo` (cost of edits). `scripts/check_mac_link.sh` OK (the probe calls both).
 - Not done, on purpose: formula columns raise (`column `m` is a formula`; the work is per-row evaluation and belongs with F-179); the SQL path gives no row numbers, so an app that orders with `ORDER BY` passes the row ids of its own id column; a long range over a Frame with 300,000 edited cells pays ~120 ms to apply them.
+- Review: PASS (314 adversarial runs equal DuckDB and the per-cell loop over table / scan / edited frame / edited scan frame; exact int64 boundary; FLOAT min / max / NaN as DuckDB; bits equal threaded vs serial; too-small buffers, bad ranges, rows and columns refused with writes inside the block; 8 concurrent callers). Ready for later: formula columns (serial per-row evaluation now, batched in F-179), cache the frame patch arrays by edit counter (a long range over 300k edited cells costs 80-120 ms per call), pin the reviewer's safety cases in test_blocks, a plain C record for RangeAgg
 
 ## F-177 More aggregates and keys: stddev / variance, quantile bins, ISO week [todo] (mxframe #10, #11)
 - [ ] `stddev` / `stddev_pop` / `variance` / `var_pop` per group and whole column, as DuckDB (numerically stable, float result); quantile bins (`ntile`-style edges from exact quantiles) as group keys; ISO week and ISO year
