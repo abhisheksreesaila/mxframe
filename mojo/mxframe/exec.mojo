@@ -554,6 +554,19 @@ def _open_chunks(src: SqlSource, used: List[Int]) raises -> _Chunks:
     return ch^
 
 
+def chunk_rows_total(src: SqlSource, ch: _Chunks) -> Int:
+    """The rows the chunks hold in all (a job's progress total), without loading them."""
+    var n = 0
+    if ch.scan_mode:
+        for g in ch.groups:
+            n += src.scan.value().group_rows(g)
+    elif ch.base:
+        n += ch.override.value().rows() if ch.override else src.rows()
+    if ch.has_delta:
+        n += len(src.overlay.delta)
+    return n
+
+
 def _load_chunk(src: SqlSource, mut ch: _Chunks, i: Int) raises -> SharedTable:
     var nb = len(ch.groups) if ch.scan_mode else (1 if ch.base else 0)
     if i >= nb:                                                   # the frame's changed and appended rows

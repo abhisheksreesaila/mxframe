@@ -12,6 +12,7 @@ What it decides today: the group strategy.
   the group directly: no hashing, the fastest path while the domain is not much bigger than the rows;
 - hashed: key words go through per-worker hash tables and a partitioned merge (`hashagg_cpu`): any keys, any range.
 """
+from .job import JobCtl                                   # F-175
 from .table import TEXT, BOOL, FLOAT
 from .plan import LogicalPlan, P_SORT, P_LIMIT
 from .bind import (BoundQuery, SRC_TABLE, SRC_FRAME, SRC_SCAN, B_COL, B_LIT, B_NULL, B_ADD, B_SUB, B_MUL, B_IDIV, B_IMOD,
@@ -39,6 +40,7 @@ comptime SMALL_DOMAIN = 65_536               # a domain this small is always den
 
 
 struct PlannerOptions(Copyable, Movable):
+    var job: JobCtl                          # F-175: the background job this query runs for (cancel and progress); JobCtl() for a plain call
     var group: Int                           # GROUP_AUTO, GROUP_DENSE or GROUP_HASHED
     var dense_limit: Int
     var threads: Int                         # 0: every core
@@ -51,6 +53,7 @@ struct PlannerOptions(Copyable, Movable):
     var stay_within: Float64                 # the written order is kept when the best order's estimated cost is not this much cheaper
 
     def __init__(out self):
+        self.job = JobCtl()
         self.written_order = False
         self.join_order = List[Int]()
         self.build_side = BUILD_AUTO

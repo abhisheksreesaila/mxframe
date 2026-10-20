@@ -19,6 +19,7 @@ from std.memory import ArcPointer
 from std.atomic import Atomic
 from .table import Table, SharedTable, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT
 from .frame import text_ranks, _radix_order
+from .job import JobCtl, STAGE_AGGREGATE, STAGE_FINISH      # F-175
 from .query import Program, MAGIC, SRC_WORDS, CTL_REG, OVERFLOW_MESSAGE, overflow_message
 from .kernels._fpenv import core_count
 from .kernels.pipeline_cpu import IP, LP, FP, BP, VEC, E_OVERFLOW, pipeline_keyed
@@ -30,11 +31,14 @@ from .sqleval import ValCol
 from .kargs import KernelRun
 from .jfront import FusedJoin, front_spec, jf_front
 from .holistic import float_key
-from .exec import (_put_column_owned, _table_addresses, _alias_lists, _Chunks, _open_chunks, _load_chunk, _check_footer, _Inputs, _inputs, _gather,
+from .exec import (_put_column_owned, _table_addresses, _alias_lists, _Chunks, _open_chunks, _load_chunk, chunk_rows_total, _check_footer, _Inputs, _inputs, _gather,
                    _order_rows, _to_table)
 
 
 # ── the hook ─────────────────────────────────────────────────────────────────────────────────────────
+
+comptime JOB_SLICE_ROWS = 1 << 20      # F-175: rows a background job's row query runs between two cancel checks
+
 
 def _rows_hook(chunk: Int, row0: Int, sel: IP, nsel: Int, use_sel: Bool, dst: IP, regs: FP) -> Bool:
     """Writes a block's selected rows: their numbers in the chunk and the values of the computed registers, packed at the block's
@@ -557,7 +561,10 @@ def run_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOpt
     var has_delta = ch.has_delta
     ch.delta_first = plan.early_stop
     var ords = List[Int64]()                                     # the frame row number of each collected row (an edited frame only)
+    opts.job.stage(STAGE_AGGREGATE)
+    opts.job.add_total(chunk_rows_total(src, ch))
     for kc in range(ch.n()):
+        opts.job.check()                                         # F-175: between chunks
         var i = ch.pick(kc)
         if plan.early_stop and (base_in if has_delta else rows_in) >= need:
             stop_early = True
@@ -572,8 +579,11 @@ def run_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOpt
         var step = n_rows
         if plan.early_stop:                                     # read the chunk in slices, so a LIMIT stops it early
             step = max(VEC * 16, ((need * 4) // VEC + 1) * VEC)
+        elif opts.job.active():                                 # a background job: slices, so a cancel is seen between them
+            step = max(VEC * 16, JOB_SLICE_ROWS)
         var at = 0
         while at < n_rows:
+            opts.job.check()
             if plan.early_stop and (base_in if has_delta else rows_in) >= need:
                 stop_early = True
                 break
@@ -596,6 +606,7 @@ def run_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOpt
                 else:
                     _append_gathered(cols[k], chunk, inp.pos[it.col], IP(unsafe_from_address=Int(rc.ids.unsafe_ptr())), rc.n)
             rows_in += rc.n
+            opts.job.advance(end - at)
             at = end
     var ms_run = Float64(perf_counter_ns() - t_run) / 1e6
     if src.kind == SRC_FRAME:
@@ -718,7 +729,10 @@ def run_topk_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: Plann
     var ns_load = 0
     var has_delta = ch.has_delta
     var best_ord = List[Int64]()                                 # an edited frame: the frame row of each kept row (ties go to the earlier row)
+    opts.job.stage(STAGE_AGGREGATE)
+    opts.job.add_total(chunk_rows_total(src, ch))
     for i in range(ch.n()):
+        opts.job.check()                                         # F-175: between chunks
         var t_load = perf_counter_ns()
         var chunk = _load_chunk(src, ch, i)
         if trust:
@@ -729,6 +743,7 @@ def run_topk_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: Plann
         if chunk.rows() == 0:
             continue
         var rc = _run_topk(chunk, sp, ch.mask_addr, K, key_slot, key_desc, key_nf, key_rank, opts.threads, fj)
+        opts.job.advance(chunk.rows())
         if rc.n == 0:
             continue
         # the candidates, in the order of their rows in the chunk (ties between equal keys keep the source order)

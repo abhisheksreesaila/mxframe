@@ -146,6 +146,40 @@ def test_cancel() raises:
     expect(c.value() == 1, "the body was freed")
 
 
+struct Committer(JobBody):
+    """A save's shape: work, the point of no return (`commit`), then the rename, which takes a while."""
+    comptime Out = Int
+    var work_us: Int
+    var after_us: Int
+
+    def __init__(out self, work_us: Int, after_us: Int):
+        self.work_us = work_us
+        self.after_us = after_us
+
+    def run(mut self, ctl: JobCtl) raises -> Int:
+        ctl.add_total(2)
+        pause(self.work_us)
+        ctl.check()
+        ctl.commit()
+        ctl.advance(1)                      # "committed": the test cancels after seeing this
+        pause(self.after_us)
+        ctl.advance(1)
+        return 7
+
+
+def test_cancel_after_commit_does_nothing() raises:
+    var late = start_job(Committer(0, 100_000))
+    while late.progress().done < 1:
+        pause(200)
+    late.cancel()                           # the file is being moved into place: too late to stop it
+    expect(late.poll() == JOB_RUNNING, "a cancel after the point of no return changes nothing")
+    expect(late.result() == 7 and late.poll() == JOB_DONE, "the job ends done with its result")
+    var early = start_job(Committer(100_000, 0))
+    pause(2000)
+    early.cancel()                          # before the commit: the work stops there
+    expect(early.wait() == JOB_CANCELLED and early.progress().done == 0, "a cancel before the commit stops the job before it")
+
+
 def test_cancel_after_done_is_nothing() raises:
     var job = start_job(Steps(10, 0, 0))
     _ = job.wait()
@@ -207,6 +241,7 @@ def main() raises:
     test_failure()
     comptime if not SERIAL:
         test_cancel()
+        test_cancel_after_commit_does_nothing()
         test_callback()
         test_drop_cancels_and_frees()
     test_cancel_after_done_is_nothing()

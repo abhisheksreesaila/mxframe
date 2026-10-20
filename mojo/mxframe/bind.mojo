@@ -79,6 +79,13 @@ struct Catalog(Movable):
     def __init__(out self):
         self.sources = List[SqlSource]()
 
+    def copy(self) -> Catalog:
+        """A catalog of the same sources (tables and scans are shared handles, a frame's snapshot is copied): what a background job (F-175) works on."""
+        var out = Catalog()
+        for s in self.sources:
+            out.sources.append(s.copy())
+        return out^
+
     def _put(mut self, var s: SqlSource):
         var key = lower_ascii(s.name)
         for i in range(len(self.sources)):

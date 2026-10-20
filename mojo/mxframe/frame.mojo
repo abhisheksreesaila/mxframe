@@ -22,6 +22,7 @@ would hold the file) and `save(path)` streams the edited file out, a row group a
 """
 from std.collections import Dict, Set
 from std.memory import ArcPointer
+from .job import JobCtl, STAGE_WRITE      # F-175
 from .table import Table, SharedTable, Column, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT
 from .expr import (Expr, Node, col, least, greatest, N_COL, N_LIT, N_LITF, N_DIV, N_I2F, N_ADD, N_SUB, N_MUL, N_FLOORDIV, N_MOD, N_NEG,
                    N_LEAST, N_GREATEST, N_LT, N_LE, N_GT, N_GE, N_EQ, N_NE, N_AND, N_OR, N_NOT, N_BOOL2INT, N_SCALE_TO)
@@ -864,7 +865,7 @@ struct Frame(Movable):
                     t.append(c, self.alias(c, cell[0]))
         return t^
 
-    def save(self, path: String, metadata: String = "", compression: Int = ZSTD, allow_narrowing: Bool = False) raises:
+    def save(self, path: String, metadata: String = "", compression: Int = ZSTD, allow_narrowing: Bool = False, job: JobCtl = JobCtl()) raises:
         """Writes the edited rows to a new Parquet file (`metadata` under the key "omx"; the file replaces `path` by
         rename, so `path` may be the file this frame reads). A frame over a scan streams: one row group of the file at
         a time (all its columns decoded, edits applied, encoded and written; appended rows follow in groups of
@@ -874,9 +875,12 @@ struct Frame(Movable):
         source's types). A column whose type reading changed but whose every value it kept (DECIMAL(9, 2) as DECIMAL(18, 2), ENUM
         or JSON as text, a narrower or unsigned integer as int64: `scan.type_change(c)`) is written as held. Only a loss
         of values (a TIMESTAMP held as its UTC day: `scan.narrowing(c)`) makes `save` raise, before writing anything and
-        naming the column, unless `allow_narrowing`."""
+        naming the column, unless `allow_narrowing`.
+
+        `job` (F-175, job.mojo `save_job`): the background job this saves for. A cancel is seen between row groups and the old file
+        stays (the temporary file is removed); progress counts the rows written."""
         if not self.scan:
-            write_parquet(path, self.bake(), metadata, compression)
+            write_parquet(path, self.bake(), metadata, compression, DEFAULT_ROW_GROUP, job)
             return
         ref scan = self.scan.value()
         var stored = self.stored()
@@ -915,7 +919,10 @@ struct Frame(Movable):
         try:
             var changed = self.changed_rows()                # ascending; the rows whose values are not the file's
             var ci = 0
+            job.stage(STAGE_WRITE)
+            job.add_total(self.nbase + len(self.added))
             for g in range(scan.row_groups()):
+                job.check()                                  # F-175: between row groups
                 var n = scan.group_rows(g)
                 if n == 0:
                     continue
@@ -942,6 +949,7 @@ struct Frame(Movable):
                                     _push(out, c, tbl, c, r, remap[c])
                         r += 1
                 w.write_group(out)
+                job.advance(n)
             _clear_rows(out)
             for row in range(self.nbase, self.rows()):
                 if not self.alive(row):
@@ -950,10 +958,14 @@ struct Frame(Movable):
                     var hit = self.cells.get((row << 20) | c)        # an appended row can be edited too
                     _push_value(out, c, hit.value() if hit else self.added[row - self.nbase][c], remap[c])
                 if out.rows() >= DEFAULT_ROW_GROUP:
+                    job.check()
+                    job.advance(out.rows())
                     w.write_group(out)
                     _clear_rows(out)
             if out.rows() > 0 or w.group_count() == 0:
+                job.advance(out.rows())
                 w.write_group(out)
+            job.commit()                                     # (raises when cancelled: the temporary file goes, the old one stays)
             w.finish(metadata, scan.extra_metadata())
         except e:
             w.abort()

@@ -27,9 +27,11 @@ Linux, or `-D MXFRAME_NO_CODECS` on Linux to test it) `write_parquet` saves UNCO
 and `read_parquet` refuses a zstd or snappy column chunk with an error naming the column. No codec symbol is
 referenced, so nothing links. On Linux both codecs work as before.
 """
+from std.atomic import Atomic
 from std.ffi import external_call
 from std.sys import is_defined, CompilationTarget
 from std.bit import pop_count, byte_swap
+from .job import JobCtl, STAGE_READ, STAGE_WRITE      # F-175
 from .kernels._fpenv import par_n, core_count
 from std.collections import Dict
 from std.memory import ArcPointer
@@ -190,14 +192,15 @@ struct _Chunk(Copyable, Movable):
 
 
 def write_parquet(path: String, t: SharedTable, metadata: String = "", compression: Int = ZSTD,
-                  row_group_rows: Int = DEFAULT_ROW_GROUP) raises:
-    """Writes the table to `path`; `metadata` (a JSON string) is stored under the key "omx"."""
-    _write(path, t._table[], metadata, compression, row_group_rows)
+                  row_group_rows: Int = DEFAULT_ROW_GROUP, job: JobCtl = JobCtl()) raises:
+    """Writes the table to `path`; `metadata` (a JSON string) is stored under the key "omx". `job` (F-175): the background job it
+    runs for; a cancel is seen between row groups, and a cancelled write leaves `path` as it was."""
+    _write(path, t._table[], metadata, compression, row_group_rows, job)
 
 
 def write_parquet(path: String, t: Table, metadata: String = "", compression: Int = ZSTD,
-                  row_group_rows: Int = DEFAULT_ROW_GROUP) raises:
-    _write(path, t, metadata, compression, row_group_rows)
+                  row_group_rows: Int = DEFAULT_ROW_GROUP, job: JobCtl = JobCtl()) raises:
+    _write(path, t, metadata, compression, row_group_rows, job)
 
 
 def _page_header(mut b: List[UInt8], kind: Int, uncompressed: Int, compressed: Int, values: Int, encoding: Int):
@@ -323,7 +326,7 @@ def _column_pages(mut file: List[UInt8], col: Column, lo: Int, hi: Int, optional
     return chunk^
 
 
-def _write(path: String, t: Table, metadata: String, requested: Int, row_group_rows: Int) raises:
+def _write(path: String, t: Table, metadata: String, requested: Int, row_group_rows: Int, job: JobCtl = JobCtl()) raises:
     t.check()
     if t.columns() == 0:
         raise Error("a table with no columns cannot be written as Parquet")
@@ -336,12 +339,17 @@ def _write(path: String, t: Table, metadata: String, requested: Int, row_group_r
     try:
         var n = t.rows()
         var lo = 0
+        job.stage(STAGE_WRITE)
+        job.add_total(n)
         while lo < n or (n == 0 and w.group_count() == 0):
+            job.check()                                      # F-175: between row groups
             var hi = min(lo + row_group_rows, n)
             w.write_rows(t, lo, hi)
+            job.advance(hi - lo)
             if n == 0:
                 break
             lo = hi
+        job.commit()                                         # (raises when cancelled: the temporary file goes, the old one stays)
         w.finish(metadata)
     except e:
         w.abort()
@@ -816,8 +824,9 @@ def _to_stored(leaf: _Leaf, raw: Int64) raises -> Int64:
     return raw
 
 
-def read_parquet(path: String) raises -> ParquetResult:
-    """Reads a Parquet file (written by MX frame, pyarrow, DuckDB, ...) into a Table, plus its "omx" metadata."""
+def read_parquet(path: String, job: JobCtl = JobCtl()) raises -> ParquetResult:
+    """Reads a Parquet file (written by MX frame, pyarrow, DuckDB, ...) into a Table, plus its "omx" metadata. `job` (F-175): the
+    background job it runs for; a cancel is seen between row groups."""
     var file = _open_file(path)
     var n = _file_size(file, path)
     if n < 12:
@@ -859,16 +868,20 @@ def read_parquet(path: String) raises -> ParquetResult:
             _check_claim("`" + path + "` row group " + String(g), n_g, len(cols))
             total += n_g                                        # each part checked, so the sum cannot wrap
             _check_claim("`" + path + "`", total, len(cols))
+    job.stage(STAGE_READ)
+    job.add_total(total)
     for c in range(len(cols)):                                  # size every column once; the pages write every row
         t.cols[c].values = List[Int64](unsafe_uninit_length=total)
     var row0 = 0
     for g in range(len(groups)):
+        job.check()                                             # F-175: between row groups
         if len(groups[g]) != len(cols):
             raise Error("`" + path + "`: row group " + String(g) + " has " + String(len(groups[g])) +
                         " columns, the schema " + String(len(cols)))
         _decode_group(bases, ns, groups[g], ids, ids, widxs, True, cols, row0, t)
         if len(cols) > 0:
             row0 += groups[g][0].values
+            job.advance(groups[g][0].values)
     for c in range(len(cols)):                                  # (a presized column holds exactly the rows read)
         if len(t.cols[c].values) > row0:
             t.cols[c].values.shrink(row0)
@@ -2414,6 +2427,7 @@ struct _ScanInfo(Movable):
     var widx: List[_WordIndex]       # and their indexes by bytes
     var loaded: List[Bool]
     var extra: List[String]          # the file's other key-value metadata (key, value, ...)
+    var build_lock: List[Int64]      # F-175: one word, 1 while a thread builds a dictionary (a job and its caller share a scan)
 
     def __init__(out self, path: String, var file: FileHandle, size: Int, var leaves: List[_Leaf],
                  var groups: List[List[_ChunkMeta]], var rows_of: List[Int], var metadata: String, var dicts: Table):
@@ -2421,6 +2435,7 @@ struct _ScanInfo(Movable):
         self.file = file^
         self.size = size
         self.loaded = List[Bool](length=len(leaves), fill=False)
+        self.build_lock = List[Int64](length=1, fill=0)
         self.extra = List[String]()
         self.widx = List[_WordIndex]()
         for _ in range(len(leaves)):
@@ -2589,15 +2604,27 @@ struct ParquetScan(Copyable, Movable):
         if self.schema.kind(c) != TEXT or self._info[].loaded[c]:
             return
         ref info = self._info[]
-        info.check_unchanged()
-        info.widx[c].col = Int(info.dicts.cols.unsafe_ptr() + c)
-        for g in range(len(info.groups)):
-            var maps = List[_Mapped]()
-            var src = _chunk_source(info.file._get_raw_fd(), info.size, info.path, info.groups[g][c], info.leaves[c], maps)
-            _decode_group([src[0]], [src[1]], [info.groups[g][c].copy()], [c], [c], [Int(info.widx.unsafe_ptr() + c)], True,
-                          info.leaves, 0, info.dicts, words_only=True)
-            _ = maps^
-        info.loaded[c] = True
+        # F-175: a background job and its caller may ask for the same dictionary at once: one builds it, the other waits for it
+        var lock = Pointer[Int64, MutUntrackedOrigin](unsafe_from_address=Int(info.build_lock.unsafe_ptr()))
+        while True:
+            var free = Int64(0)
+            if Atomic[Scalar[DType.int64]].compare_exchange(lock, free, 1):
+                break
+        try:
+            if not info.loaded[c]:
+                info.check_unchanged()
+                info.widx[c].col = Int(info.dicts.cols.unsafe_ptr() + c)
+                for g in range(len(info.groups)):
+                    var maps = List[_Mapped]()
+                    var src = _chunk_source(info.file._get_raw_fd(), info.size, info.path, info.groups[g][c], info.leaves[c], maps)
+                    _decode_group([src[0]], [src[1]], [info.groups[g][c].copy()], [c], [c], [Int(info.widx.unsafe_ptr() + c)], True,
+                                  info.leaves, 0, info.dicts, words_only=True)
+                    _ = maps^
+                info.loaded[c] = True
+        except e:
+            Atomic[Scalar[DType.int64]].store(lock, 0)
+            raise e^
+        Atomic[Scalar[DType.int64]].store(lock, 0)
 
     def word_count(self, c: Int) raises -> Int:
         """A TEXT column's number of words in the whole file: the `groups=` of a query keyed by it."""

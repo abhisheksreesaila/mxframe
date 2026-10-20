@@ -56,6 +56,10 @@ comptime W_ABANDONED = 6
 comptime W_BYTES = 7                 # progress counts bytes, not rows (a CSV file's rows are not known before they are parsed)
 comptime WORDS = 8
 
+comptime CANCEL_NONE = 0             # W_CANCEL: nobody asked
+comptime CANCEL_ASKED = 1            # cancel() or a dropped handle
+comptime CANCEL_COMMITTED = 2        # a save passed its point of no return: a later cancel() does nothing
+
 comptime _A = Atomic[Scalar[DType.int64]]
 comptime _P = Pointer[Int64, MutUntrackedOrigin]
 
@@ -105,12 +109,21 @@ struct JobCtl(ImplicitlyCopyable):
     def cancelled(self) -> Bool:
         if self.words == 0:
             return False
-        return _A.load(_P(unsafe_from_address=self.words) + W_CANCEL) != 0
+        return _A.load(_P(unsafe_from_address=self.words) + W_CANCEL) == CANCEL_ASKED
 
     def check(self) raises:
         """Raises when the job was cancelled: the work unwinds, freeing what it owns, and returns no result."""
         if self.cancelled():
             raise Error(CANCELLED_MESSAGE)
+
+    def commit(self) raises:
+        """The point of no return of a save (just before its file is renamed into place): raises if a cancel got in first, else
+        from here on `cancel()` changes nothing and the job ends done. A cancelled save therefore always leaves the old file."""
+        if self.words != 0:
+            var expect = Int64(CANCEL_NONE)
+            if not _A.compare_exchange(_P(unsafe_from_address=self.words) + W_CANCEL, expect, CANCEL_COMMITTED):
+                if expect == CANCEL_ASKED:
+                    raise Error(CANCELLED_MESSAGE)
 
     def stage(self, s: Int):
         if self.words != 0:
@@ -224,6 +237,8 @@ def _run_task[B: JobBody, CB: JobDone](tp: Pointer[_Task[B, CB], MutUntrackedOri
         if ctl.cancelled():
             final = _finish_state(w, JOB_CANCELLED)
         else:
+            if _A.load(w + W_DONE) < _A.load(w + W_TOTAL):         # (a LIMIT that stopped early, a skipped range: done is done)
+                _A.store(w + W_DONE, _A.load(w + W_TOTAL))
             out[].value = v^
             final = _finish_state(w, JOB_DONE)
     except e:
@@ -289,10 +304,12 @@ struct Job[T: Movable & Deinitable](Movable):
         return slot[].value.take()
 
     def cancel(self):
-        """Asks the work to stop at its next check. The state is JOB_CANCELLED from this call on, unless the job had already ended."""
+        """Asks the work to stop at its next check. The state is JOB_CANCELLED from this call on, unless the job had already ended
+        (or a save had passed `commit()`: its file is being moved into place and the job ends done)."""
         var w = _P(unsafe_from_address=self.words)
-        _A.store(w + W_CANCEL, 1)
-        _ = _finish_state(w, JOB_CANCELLED)
+        var expect = Int64(CANCEL_NONE)
+        if _A.compare_exchange(w + W_CANCEL, expect, CANCEL_ASKED) or expect == CANCEL_ASKED:
+            _ = _finish_state(w, JOB_CANCELLED)
 
     def progress(self) -> JobProgress:
         var w = _P(unsafe_from_address=self.words)
@@ -303,7 +320,8 @@ struct Job[T: Movable & Deinitable](Movable):
     def __del__(deinit self):
         var w = _P(unsafe_from_address=self.words)
         _A.store(w + W_ABANDONED, 1)
-        _A.store(w + W_CANCEL, 1)
+        var expect = Int64(CANCEL_NONE)
+        _ = _A.compare_exchange(w + W_CANCEL, expect, CANCEL_ASKED)
         comptime if not SERIAL:
             if self.threaded and not self.joined:
                 _ = external_call["pthread_detach", c_int](self.tid)
