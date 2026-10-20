@@ -39,3 +39,23 @@ def test_no_gradients_glass_or_blur_on_chrome():
     css = PAGE[PAGE.index("<style>"):PAGE.index("</style>")]
     for banned in ["gradient(", "backdrop-filter", "blur("]:
         assert banned not in css, banned
+
+
+DECK = (SITE / "deck.html").read_text()
+
+
+def test_deck_is_linked_and_pinned():
+    assert 'href="deck.html"' in PAGE and 'href="deck.html"' in (SITE / "index.html").read_text()
+    assert "deck.html" in (ROOT / "README.md").read_text()
+    cdn = re.findall(r'https://cdn\.jsdelivr\.net/npm/reveal\.js@([\d.]+)/', DECK)
+    assert cdn and set(cdn) == {"5.2.1"}, "reveal.js is pinned to one version"
+
+
+def test_deck_keeps_the_story_honest():
+    assert DECK.count("<section") >= 12
+    assert "Q21" in DECK and "written down" in DECK, "the numbers slide says where it's behind"
+    soon = DECK[DECK.index("Coming soon"):]
+    assert "MCP server" in soon and "MCP server" not in DECK[:DECK.index("Coming soon")]
+    assert "prefers-reduced-motion" in DECK and "mx-theme" in DECK
+    for src in re.findall(r'<img[^>]+src="([^"]+)"', DECK):
+        assert (SITE / src).is_file(), src

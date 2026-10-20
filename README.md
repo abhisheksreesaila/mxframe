@@ -5,7 +5,7 @@
 omxcore runs SQL on your CPU *and* your GPU, over the CSV and Parquet files you already have. It's one native library,
 written in Mojo, with no Python inside. Apps link it like SQLite. Agents talk to it in JSON.
 
-### ✨ [Read the story →](https://abhisheksreesaila.github.io/omxcore/story.html)
+### ✨ [Read the story →](https://abhisheksreesaila.github.io/omxcore/story.html) · ▶ [Watch it as slides](https://abhisheksreesaila.github.io/omxcore/deck.html)
 The journey, why Mojo, why it's built for agents, the numbers, and where it's going.
 
 [![Story](https://img.shields.io/badge/the%20story-read-0e7c86)](https://abhisheksreesaila.github.io/omxcore/story.html) [![Mojo](https://img.shields.io/badge/written%20in-Mojo%201.1-0e7c86)](https://github.com/abhisheksreesaila/omxcore/tree/main/mojo) [![PyPI](https://img.shields.io/pypi/v/mxframe?label=PyPI%20(mxframe)&color=5d6571)](https://pypi.org/project/mxframe/) [![License](https://img.shields.io/badge/license-Apache--2.0-5d6571)](LICENSE)

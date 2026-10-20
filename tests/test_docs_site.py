@@ -48,7 +48,7 @@ def test_bench_link_reaches_benchmark_files():
     assert (SITE / "bench" / "m2s-engine.csv").is_file()
 
 
-LANDING = {"story.html"}   # the landing page: its own top bar instead of the docs sidebar, the same tokens (below)
+LANDING = {"story.html", "deck.html"}   # the story and its slides: their own frame instead of the docs top bar, the same tokens (below)
 
 
 @pytest.mark.parametrize("page", [p for p in PAGES if p.name not in LANDING], ids=lambda p: p.name)
