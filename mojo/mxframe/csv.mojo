@@ -68,6 +68,7 @@ from std.sys import CompilationTarget
 from std.memory import Pointer
 from std.time import perf_counter_ns
 from std.collections import Dict
+from .job import JobCtl, STAGE_READ, STAGE_FINISH      # F-175
 from .utf8 import utf8_seq_len
 from .table import Table, Column, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT
 from .kernels._fpenv import par_n, core_count
@@ -1031,9 +1032,11 @@ struct ChunkSink(CellSink, Movable):
 # ── the reader ──────────────────────────────────────────────────────────────────────────────────
 
 
-def read_csv(path: String, options: CsvOptions = CsvOptions()) raises -> CsvResult:
+def read_csv(path: String, options: CsvOptions = CsvOptions(), job: JobCtl = JobCtl()) raises -> CsvResult:
     """Reads a CSV or TSV file into a `Table` with an import report. Raises (readable message) only when the file
-    cannot be opened or the options are unusable; bad values never raise, they become nulls and failed rows."""
+    cannot be opened or the options are unusable; bad values never raise, they become nulls and failed rows.
+    `job` (F-175, job.mojo): the background job this runs for. Its progress counts the file's bytes (the rows are not known
+    before they are parsed), and a cancel is seen between the chunks the file is cut into (a file read by one thread is one chunk)."""
     var start_ns = perf_counter_ns()
     var delim = _delimiter(path, options.delimiter)
     if options.max_columns < 1:
@@ -1061,8 +1064,11 @@ def read_csv(path: String, options: CsvOptions = CsvOptions()) raises -> CsvResu
         if addr == -1:
             raise Error("couldn't read `" + path + "`: the file could not be mapped into memory")
         try:
+            job.stage(STAGE_READ)
+            job.count_bytes()
+            job.add_total(size)
             _check_text_encoding(BP(unsafe_from_address=addr), size, path)
-            _parse(BP(unsafe_from_address=addr), size, delim, options, result)
+            _parse(BP(unsafe_from_address=addr), size, delim, options, result, job)
         except e:
             _ = external_call["munmap", Int32](addr, size)
             raise Error(String(e))
@@ -1084,7 +1090,7 @@ def _delimiter(path: String, requested: String) raises -> UInt8:
     return b
 
 
-def _parse(data: BP, size: Int, delim: UInt8, options: CsvOptions, mut result: CsvResult) raises:
+def _parse(data: BP, size: Int, delim: UInt8, options: CsvOptions, mut result: CsvResult, job: JobCtl = JobCtl()) raises:
     var body = 0
     if size >= 3 and data[0] == 0xEF and data[1] == 0xBB and data[2] == 0xBF:
         body = 3
@@ -1118,6 +1124,7 @@ def _parse(data: BP, size: Int, delim: UInt8, options: CsvOptions, mut result: C
         for c in range(ncols, head.cells):
             result.skipped.append(head.names[c])
     var first_row = after_first if options.has_header else body
+    job.advance(first_row)                                       # (the bytes before the first row count as done)
 
     # kinds from the first `infer_rows` rows
     var infer = InferSink(ncols)
@@ -1193,6 +1200,8 @@ def _parse(data: BP, size: Int, delim: UInt8, options: CsvOptions, mut result: C
         var ends_at = Int(ends.unsafe_ptr())
         var bounds_at = Int(bounds.unsafe_ptr())
         def run_states(i: Int) {imm}:
+            if job.cancelled():
+                return
             var b = Pointer[Int, MutUntrackedOrigin](unsafe_from_address=bounds_at)
             var out = Pointer[Int, MutUntrackedOrigin](unsafe_from_address=ends_at)
             var lo = first_row if i == 0 else b[i] - 1
@@ -1218,6 +1227,8 @@ def _parse(data: BP, size: Int, delim: UInt8, options: CsvOptions, mut result: C
         var rstart_at = Int(rstart.unsafe_ptr())
         var state_at = Int(state.unsafe_ptr())
         def find_start(t: Int) {imm}:
+            if job.cancelled():
+                return
             var i = t + 1  # task t finds where chunk t + 1 starts
             var b = Pointer[Int, MutUntrackedOrigin](unsafe_from_address=bounds_at)
             var st = Pointer[Int, MutUntrackedOrigin](unsafe_from_address=state_at)
@@ -1248,20 +1259,24 @@ def _parse(data: BP, size: Int, delim: UInt8, options: CsvOptions, mut result: C
     var sinks_at = Int(sinks.unsafe_ptr())
     var rstart_at2 = Int(rstart.unsafe_ptr())
     def parse_chunk(i: Int) {imm}:
+        if job.cancelled():                                      # F-175: between chunks
+            return
         var rs = Pointer[Int, MutUntrackedOrigin](unsafe_from_address=rstart_at2)
         var sp = Pointer[ChunkSink, MutUntrackedOrigin](unsafe_from_address=sinks_at)
         _ = _walk(data, rs[i], rs[i + 1], delim, Int.MAX, (sp + i)[])
+        job.advance(rs[i + 1] - rs[i])
     if nch == 1:
         parse_chunk(0)
     else:
         par_n(parse_chunk, nch, workers)
     _ = rstart^  # (the tasks read it by address)
-
-    _stitch(sinks, names, kinds, scales, infer, result)
+    job.check()                                                  # a cancelled round left chunks unparsed: none is used
+    job.stage(STAGE_FINISH)
+    _stitch(sinks, names, kinds, scales, infer, result, job)
 
 
 def _stitch(mut sinks: List[ChunkSink], names: List[String], kinds: List[Int], mut scales: List[Int],
-            infer: InferSink, mut result: CsvResult) raises:
+            infer: InferSink, mut result: CsvResult, job: JobCtl = JobCtl()) raises:
     """Joins the chunks, in file order, into the table and the report."""
     var nch = len(sinks)
     var ncols = len(names)
@@ -1292,6 +1307,8 @@ def _stitch(mut sinks: List[ChunkSink], names: List[String], kinds: List[Int], m
     var offsets_at = Int(offsets.unsafe_ptr())
     var tbl = Int(result.table.cols.unsafe_ptr())
     def copy_chunk(i: Int) {imm}:
+        if job.cancelled():
+            return
         var sp = Pointer[ChunkSink, MutUntrackedOrigin](unsafe_from_address=sinks_at)
         var off = Pointer[Int, MutUntrackedOrigin](unsafe_from_address=offsets_at)
         var cols = Pointer[Column, MutUntrackedOrigin](unsafe_from_address=tbl)
@@ -1325,6 +1342,7 @@ def _stitch(mut sinks: List[ChunkSink], names: List[String], kinds: List[Int], m
         copy_chunk(0)
     else:
         par_n(copy_chunk, nch, core_count())
+    job.check()
 
     for c in range(ncols):
         var report = CsvColumn(names[c], kind_of[c], scales[c])

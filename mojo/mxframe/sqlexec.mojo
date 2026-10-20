@@ -16,7 +16,8 @@ min / max combine; hashed groups merge by key) folds into one.
 from std.time import perf_counter_ns
 from .table import Table, SharedTable, Column, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT, F32_COLUMN
 from .frame import NULL_EDIT, text_ranks, _radix_order
-from .query import (Program, QueryResult, _run_cpu, _run_mat, _key_from_reg0, _make_result, _merge_partial, _identity_partial, _ScanMask, _group_mask,
+from .job import JobCtl, STAGE_PLAN, STAGE_AGGREGATE, STAGE_FINISH      # F-175
+from .query import (Program, QueryResult, _run_cpu, _run_cpu_job, _run_mat, _key_from_reg0, _make_result, _merge_partial, _identity_partial, _ScanMask, _group_mask,
                     OVERFLOW_MESSAGE, overflow_message, CPU, MAGIC, A_MIN, A_MAX, A_FSUM, MORSEL_ROWS, WINDOW_BYTES, SRC_WORDS, fold_float, slot_identity)
 from .kernels._fpenv import core_count, par_n
 from .kernels.pipeline_cpu import IP, LP, FP, BP, VEC, E_OVERFLOW, _no_front, _no_keys, pipeline_keyed
@@ -42,7 +43,7 @@ from .sqlprog import SqlProgram, DictAccess, lower_sql, collect_columns, PHASE_A
 from .sqleval import ValCol, float_bits, ld_div
 from .exec import (_table_addresses, _column_range, _is_range_kind, _key_columns, prepare_ranges, _alias_lists, _delta_nulls, make_stats,
                    delta_table, _gather, _sort_keys, _order_rows, _SortCols, _top_rows, _fill_column, _unique_name, _to_table, _ones_mask,
-                   _Chunks, _open_chunks, _load_chunk, LIE, _check_footer, _all, _Inputs, _inputs)
+                   _Chunks, _open_chunks, _load_chunk, chunk_rows_total, LIE, _check_footer, _all, _Inputs, _inputs)
 
 
 struct SqlResult(Movable):
@@ -408,18 +409,20 @@ def _run_dense_fused(t: SharedTable, sp: SqlProgram, mask_addr: Int, threads: In
 
 
 def _fold(sp: SqlProgram, plan: PhysicalPlan, chunk: SharedTable, mask_addr: Int, mut hs: HolStates, ops: List[Int], threads: Int,
-          mut acc: Partial, mut dense_acc: QueryResult, mut ix: _KeyIndex, fj: Optional[ArcPointer[FusedJoin]]) raises:
-    """Runs the program over one chunk and folds its partial result into the accumulator."""
+          mut acc: Partial, mut dense_acc: QueryResult, mut ix: _KeyIndex, fj: Optional[ArcPointer[FusedJoin]], job: JobCtl = JobCtl()) raises:
+    """Runs the program over one chunk and folds its partial result into the accumulator. `job` (F-175) moves by the chunk's rows."""
     if plan.group == G_HASHED:
         _merge_hashed(acc, _run_hashed(chunk, sp, mask_addr, plan.key_words(), threads, fj), ops, ix)
+        job.advance(chunk.rows())
         return
     var r: QueryResult
     if fj:
         r = _run_dense_fused(chunk, sp, mask_addr, threads, fj.value())
+        job.advance(chunk.rows())
     elif sp.p.mat:
-        r = _run_mat(chunk, sp.p, mask_addr, hs, 0)
+        r = _run_mat(chunk, sp.p, mask_addr, hs, 0, 0, job)
     else:
-        r = _run_cpu(chunk, sp.p, mask_addr, 0, -1, 0, threads)
+        r = _run_cpu_job(chunk, sp.p, mask_addr, threads, job)              # (row ranges for a big table: a cancel is seen between them)
     _merge_partial(dense_acc, r, ops)
 
 
@@ -618,13 +621,16 @@ def _execute(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOpt
     var delta_rows = len(src.overlay.delta)
     var t_run = perf_counter_ns()
     var ns_load = 0
+    opts.job.stage(STAGE_AGGREGATE)
+    opts.job.add_total(chunk_rows_total(src, ch))
     for i in range(ch.n()):
+        opts.job.check()                                              # F-175: between chunks (a scan's row groups)
         var t_load = perf_counter_ns()
         var chunk = _load_chunk(src, ch, i)
         if trust:
             _check_footer(src, ch, i, chunk)
         ns_load += perf_counter_ns() - t_load
-        _fold(sp, plan, chunk, ch.mask_addr, hs, ops, threads, acc, dense_acc, ix, fj)
+        _fold(sp, plan, chunk, ch.mask_addr, hs, ops, threads, acc, dense_acc, ix, fj, opts.job)
     if sp.guard_slot >= 0 and dense_acc.counts[sp.guard_slot] > 0:
         raise Error(LIE + String(dense_acc.counts[sp.guard_slot]) + (" row lies" if dense_acc.counts[sp.guard_slot] == 1 else " rows lie") +
                     " outside the range of a group key that the footer gave")
@@ -651,9 +657,12 @@ def _execute(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOpt
         var look = _GroupLookup(acc)
         var hs2 = _holistic_states(q, max(acc.groups(), 1), sp2, dicts, rows_total)
         var ch2 = _open_chunks(src, used)
+        opts.job.add_total(chunk_rows_total(src, ch2))
         for i in range(ch2.n()):
+            opts.job.check()
             var chunk = _load_chunk(src, ch2, i)
             _run_hol_hashed(chunk, sp2, look, ch2.mask_addr, hs2, threads)
+            opts.job.advance(chunk.rows())
         notes.append("ran: holistic second pass over the " + String(ch2.n()) + (" chunk" if ch2.n() == 1 else " chunks") + " mapped each row to one of " +
                      commas(acc.groups()) + " groups")
         hres = hs2.finish()
@@ -664,6 +673,8 @@ def _execute(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOpt
         for h in range(len(hs.specs)):
             hol_of[hs.specs[h].agg] = h
     var t_fin = perf_counter_ns()
+    opts.job.check()
+    opts.job.stage(STAGE_FINISH)
     var table = _finish(q, plan, sp, acc, hres, hol_of, dicts, opts, notes)
     notes.append("time: " + ("decode " + _ms(ms_load) + " ms, " if scan_mode else "") + "kernel " + _ms(ms_run - ms_load) + " ms, holistic states " + _ms(Float64(t_fin - t_hol) / 1e6) + " ms, finish " + _ms(Float64(perf_counter_ns() - t_fin) / 1e6) + " ms")
     return table^
@@ -1618,6 +1629,7 @@ def run_sql[P: Planner](mut catalog: Catalog, q: BoundQuery, planner: P, opts: P
     """Runs the query. A Parquet footer's min / max and null counts are a hint that lets the planner use dense groups and skip NULL
     checks; they are verified as the row groups are read (a null count that is wrong, a row outside a stated range), and when one
     is wrong the query runs again without the statistics, which the notes say."""
+    opts.job.stage(STAGE_PLAN)
     if q.explain == EXPLAIN_ANALYZE:
         return _explain_analyze(catalog, q, planner, opts)
     try:

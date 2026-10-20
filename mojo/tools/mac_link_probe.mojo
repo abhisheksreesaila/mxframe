@@ -5,7 +5,8 @@
 from std.ffi import c_int
 from mxframe import (Table, SharedTable, Frame, INT, DECIMAL, TEXT, Query, col, sum, count, CPU, GPU, AUTO,
                      DeviceTable, gpu_available, read_csv, write_parquet, read_parquet, scan_parquet, UNCOMPRESSED, ZSTD,
-                     count_distinct, median, percentile, top_k, Catalog, PlannerOptions, GROUP_HASHED, sql, range_aggregate, read_block)
+                     count_distinct, median, percentile, top_k, Catalog, PlannerOptions, GROUP_HASHED, sql, range_aggregate, read_block,
+                     compute_job, sql_job, read_csv_job, read_parquet_job, save_job, write_parquet_job, JOB_DONE)
 
 
 def run() raises:
@@ -78,6 +79,15 @@ def run() raises:
     read_block(f, rcols, 0, 10, bvals, bnulls)
     read_block(sf, rorder, rcols, 0, len(rorder), bvals, bnulls)
     print(ra.columns[1].sum, rb.columns[1].sum, rc.columns[1].sum, bvals[3])
+    # F-175: background jobs. The serial build runs each job in the call and hands back a finished handle (no thread, no runtime symbol).
+    var j1 = compute_job(Query(f).group_by(col("k"), 3).agg(sum(col("v")), count()), AUTO)
+    var j2 = sql_job(cat, "SELECT k, count(*), sum(v) FROM t GROUP BY k ORDER BY k")
+    var j3 = read_csv_job("probe.csv")
+    var j4 = read_parquet_job("probe.parquet")
+    var j5 = save_job(sf, "probe-job.parquet", "{}", ZSTD)
+    var j6 = write_parquet_job(shared, "probe-job2.parquet", "{}", UNCOMPRESSED)
+    print(j1.wait() == JOB_DONE, j2.wait(), j3.wait(), j4.wait(), j5.wait(), j6.wait())
+    print(j1.result().counts[0], j2.result().table.rows(), j3.result().rows, j4.result().table.rows(), j5.result(), j6.result(), j1.progress().stage)
 
 
 @export("mojo_entry")

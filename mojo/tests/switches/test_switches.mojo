@@ -6,7 +6,9 @@ from std.sys import argv
 from std.os import getenv
 from mxframe import (Table, SharedTable, Frame, Query, QueryResult, INT, DECIMAL, col, sum, count, CPU, GPU, AUTO, DeviceTable,
                      gpu_available, read_csv, CsvOptions, write_parquet, read_parquet, scan_parquet, min_of, max_of, ZSTD, SNAPPY,
-                     count_distinct, median, percentile, top_k, Catalog, PlannerOptions, GROUP_HASHED, GROUP_DENSE, sql)
+                     count_distinct, median, percentile, top_k, Catalog, PlannerOptions, GROUP_HASHED, GROUP_DENSE, sql,
+                     compute_job, sql_job, read_csv_job, read_parquet_job, save_job, write_parquet_job, JOB_DONE, JOB_FAILED, JOB_CANCELLED)
+from mxframe.job import THREADS
 from mxframe.query import AUTO_GPU_MIN_ROWS
 from mxframe.kernels._fpenv import core_count
 
@@ -207,6 +209,43 @@ def main() raises:
     sframe.save(path + ".edited", "", ZSTD)
     var resaved = read_parquet(path + ".edited")
     expect(resaved.table.rows() == 999 and resaved.table.get(0, 5) == 42, "and the saved file holds them")
+
+    # F-175: no thread pool to run a job on: by default every job runs inside its start call and the handle comes back finished (with
+    # -D MXFRAME_JOB_THREADS it gets a thread of its own whose kernels still run in a loop); either way the plain call's answer, its
+    # progress at the total, and nothing left to cancel
+    var jq = compute_job(Query(shared).group_by(col("k"), groups=3).agg(sum(col("v")), count()), AUTO)
+    comptime if not THREADS:
+        expect(jq.poll() == JOB_DONE, "a job on a serial build is done when it is started")
+    expect(jq.wait() == JOB_DONE, "the job is done")
+    var jr = jq.result()
+    expect(jr.counts[0] == auto.counts[0] and jr.sums[0] == auto.sums[0], "compute_job gives the plain answer")
+    var jp = jq.progress()
+    expect(jp.done == jp.total and jp.total == n, "and its progress is at the total: " + String(jp.done) + "/" + String(jp.total))
+    jq.cancel()
+    expect(jq.poll() == JOB_DONE, "cancel on a finished job changes nothing")
+    var js = sql_job(cat, "SELECT k, count(*) FROM t GROUP BY k ORDER BY k")
+    expect(js.wait() == JOB_DONE and js.result().table.get(1, 0) == Int64((n + 2) // 3), "sql_job")
+    var jc = read_csv_job(csv)
+    expect(jc.wait() == JOB_DONE and jc.result().rows == 50_000, "read_csv_job")
+    var jbad = read_csv_job("mxframe-switches-no-such.csv")
+    expect(jbad.wait() == JOB_FAILED, "a failing job is failed, not raised at the start")
+    var jw = write_parquet_job(shared, path + ".job", "", ZSTD)
+    expect(jw.wait() == JOB_DONE and jw.result() == n, "write_parquet_job")
+    var jrd = read_parquet_job(path + ".job")
+    expect(jrd.wait() == JOB_DONE and jrd.result().table.rows() == n, "read_parquet_job")
+    var jv = save_job(sframe, path + ".job-edited", "", ZSTD)
+    var vstate = jv.wait()
+    var vmsg = String()
+    try:
+        var wrote = jv.result()
+        vmsg = "wrote " + String(wrote)
+    except e:
+        vmsg = String(e)
+    expect(vstate == JOB_DONE and vmsg == "wrote 999", "save_job: state " + String(vstate) + ", " + vmsg)
+    comptime if THREADS:                                   # a job thread with serial kernels, cancelled mid-run
+        var slow = compute_job(Query(shared).group_by(col("k"), groups=3).agg(sum(col("v")), count_distinct(col("v")), median(col("v"))), AUTO)
+        slow.cancel()
+        expect(slow.wait() == JOB_CANCELLED or slow.poll() == JOB_DONE, "a job thread on a serial build can be cancelled")
 
     # ... and refuses a compressed file, naming the column
     expect(len(args) >= 3, "run with a zstd file and a snappy file")

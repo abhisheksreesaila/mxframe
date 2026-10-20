@@ -597,6 +597,59 @@ keys are packed into one int64 when the build side's ranges multiply to fewer th
 out. `hj_build` picks a direct array (range at most max(8n, 2^20) and 2^28; CSR rows when keys repeat) or radix partitions sized from L2 with linear probing and a presence bitmap; the build
 is parallel without atomics. `hj_probe_unique`, `hj_probe_pairs` (budgeted; `outer` adds a LEFT join's unmatched rows as build row -1) and `hj_probe_block` / `hj_probe_left_block` (fused) probe it; `hj_build(presence=True)` and `hj_probe_select` / `hj_filter_block` (modes semi, anti, null-aware anti, none) are the semi and anti joins' form. The engine-level steps (`normalize_keys`, `join_pairs`, `gather_join`) are in `joincore.mojo`.
 
+## 8c. Background jobs (F-175, `job.mojo`, `jobs.mojo`)
+
+An app runs a query, a file read or a save off its UI thread, polls it (or takes a callback), shows progress and can cancel. Every job is a `Job[T]` for the `T` the plain call returns.
+
+```mojo
+var job = compute_job(query, AUTO)                                  # Job[QueryResult]  : Query.compute
+var job = sql_job(catalog, "SELECT ...", options)                   # Job[SqlResult]    : sql(catalog, text, options)
+var job = read_csv_job(path, options)                               # Job[CsvResult]    : read_csv
+var job = read_parquet_job(path)                                    # Job[ParquetResult]: read_parquet
+var job = save_job(frame, path, metadata, compression, allow_narrowing)   # Job[Int]     : Frame.save, the result is the rows written
+var job = write_parquet_job(table, path, metadata, compression, row_group_rows)   # Job[Int]: write_parquet
+
+job.poll()        # JOB_RUNNING, JOB_DONE, JOB_FAILED or JOB_CANCELLED (state_name(s) is the word)
+job.wait()        # blocks until the job's thread has ended; returns the state
+job.result()      # waits, then moves the result out (once). Raises the job's own error when it failed, "cancelled" when it was
+job.cancel()      # JOB_CANCELLED from this call on (unless the job had ended); the work stops at its next check
+job.progress()    # JobProgress: .done of .total rows, .stage ("planning", "reading", "aggregating", "writing", "finishing"), .bytes
+```
+
+A completion callback is a struct of the app's with `done(mut self, state: Int)` (`JobDone`), passed as the last argument (`compute_job(q, AUTO, MyCallback(token))`). It runs once, on the job's thread,
+after the state is final (`poll()` already answers it), with JOB_DONE, JOB_FAILED or JOB_CANCELLED. It is skipped when the handle was dropped first. It must not block, and the UI wakes itself from it (an event post), never draws.
+
+**What a job owns.** The start function takes what the job needs by value or copies it: a `Query` is moved in (build it again for another run), `sql_job` works on a copy of the `Catalog` (frames in a catalog are
+snapshots already), `save_job` takes a snapshot of the `Frame` (`frame_snapshot`: its edits as of the call; later edits are not in the file), and tables, files and scans are shared read only handles. The caller can
+read cells, edit the frame and register new sources while a job runs; only a `ParquetScan` stays shared with the job, and its lazy TEXT dictionary build is guarded by a lock, so both may ask for it.
+Nothing of the job's is the caller's address: the job's body (a struct) owns its inputs and frees them the moment the work ends, and the result lives in a slot freed by the last of the two owners (the handle and the thread).
+
+**Cancel.** `cancel()` answers at once and never returns a partial result. The work checks between:
+- *queries over a table*: row ranges of 2M rows (integer sums, counts, min and max merge exactly, so the answer is the one call's; a query with a float sum or a reproducible plan keeps its one call, since its float64 sum has one defined order); the windows of count_distinct / percentile / top_k;
+- *over a Parquet file or a Frame over one*: the blocks of a morsel (32,768 rows by default), the waves of row groups, the row groups;
+- *SQL*: the chunks (a table is one chunk, a scan's row groups are many, so a table's hashed group-by or a join's kernel call runs to its end; dense-group aggregates over a table and row queries use ranges / slices of 1M rows);
+- *CSV*: the chunks the file is cut into (`CsvOptions.chunk_bytes`, 4 MB; a file read by one thread is one chunk);
+- *Parquet read and write*: row groups.
+The thread that notices unwinds (everything it owns is freed on the way) and the job ends. Dropping the handle is a cancel that waits for nothing: the thread ends by itself and frees the rest.
+A save writes a temporary file and renames it; `cancel()` before the rename removes the temporary file and the old file stays whole. Just before the rename the save passes its point of no return
+(`JobCtl.commit()`): a `cancel()` after that changes nothing and the job ends JOB_DONE with the new file in place, so a job that says "cancelled" never replaced a file.
+
+**Progress.** `done` and `total` count rows (`bytes` is True for a CSV, whose rows are unknown before they are parsed, so it counts the file's bytes). One atomic add per block, never per row. `done` only grows; `total` can grow
+while the job finds more work (a join reads its sides one after another, a hashed holistic query makes a second pass); a job that ends done has `done == total`.
+
+**Threads.** A job is a `pthread` of its own (`pthread_create`, then the work calls the pool as any caller does: `start_pool` first), so jobs run side by side with each other and with the caller. A plain
+call with no job passes `JobCtl()`: never cancelled, nothing counted, the code path unchanged.
+**The serial build** (`MXFRAME_SERIAL`, and every target but Linux) has no async runtime and, by default, no job threads: the job runs to its end inside its start call and the handle comes back done (or failed), progress at the
+total, the callback already called; `cancel()` then has nothing to stop. No new symbol: the Mac link check (`scripts/check_mac_link.sh`) lists the same libSystem calls as before the jobs (`pthread_*` is compiled out of that build).
+**Jobs with threads on a serial build** (`-D MXFRAME_JOB_THREADS`, for the app that wants its Mac UI free): the job gets a `pthread` with a 16 MB stack and its kernels still run in a loop (no async runtime, no `AsyncRT_*` symbol);
+the app's libSystem stub and its `ALLOWED` set then need `pthread_create`, `pthread_join`, `pthread_detach`, `pthread_attr_init`, `pthread_attr_setstacksize` and `pthread_attr_destroy` (`scripts/check_mac_link.sh` prints them under "with job threads").
+To add a job for another kind of work: a struct with `comptime Out = T` and `def run(mut self, ctl: JobCtl) raises -> T` (`JobBody`), started with `start_job(body)` or `start_job_then(body, callback)`; call `ctl.check()`,
+`ctl.add_total(n)` and `ctl.advance(n)` at block boundaries.
+
+Tests: `mojo/tests/test_job.mojo` (the handle with made-up work: state, error, cancel, commit, callback, dropped handles, memory over 300 cycles), `mojo/tests/test_jobs.mojo` (every kind of query, read and save equal to the plain call, progress
+monotonic and ending at the total, a cancel storm with the memory watched, cancelled saves keeping the old file byte for byte, jobs at once, a job over an edited Frame while the caller reads cells),
+`mojo/tests/switches/test_switches.mojo` (the serial build).
+
 ## 9. Later (Query and Explore modes)
 RIGHT / FULL joins, LEFT / SEMI / ANTI with three tables, scalar subqueries, expression functions (M8: F-156 to F-162); pipelines with cached steps; versioned column
 chunks for a time machine and branches; TPC-H through SQL.

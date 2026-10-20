@@ -42,6 +42,7 @@ from .holistic import HolStates, HolSpec, HolResult, window_blocks, heap_offer, 
 from .joincore import JoinKeys, JoinSide, normalize_keys, join_pairs, select_rows, gather_join, JOIN_BUDGET_BYTES
 from .kernels.hashjoin_cpu import hj_build, PM_SEMI, PM_ANTI
 from .frame import text_ranks
+from .job import JobCtl, STAGE_PLAN, STAGE_AGGREGATE, STAGE_FINISH      # F-175
 
 # plan node kinds
 comptime P_SCAN = 0
@@ -373,10 +374,12 @@ struct Query(Movable):
         out._window_rows = self._window_rows
         return out^
 
-    def compute(self, device: Int = AUTO) raises -> QueryResult:
+    def compute(self, device: Int = AUTO, job: JobCtl = JobCtl()) raises -> QueryResult:
         """Runs the plan. `device`: CPU, GPU (raises without a live attached DeviceTable) or AUTO (the GPU when a
         live DeviceTable is attached and the table has `AUTO_GPU_MIN_ROWS` rows or more, else the CPU). The result is
-        the same either way, edits of a frame included."""
+        the same either way, edits of a frame included. `job` (F-175, job.mojo): the background job this runs for, whose cancel
+        is checked between row ranges, windows, row groups and blocks and whose progress it advances; a plain call passes none."""
+        job.stage(STAGE_PLAN)
         if self.scan:
             var scan_nodes = self.nodes.copy()
             if self.framed:                              # formulas inlined, merges remapped (as below)
@@ -386,7 +389,7 @@ struct Query(Movable):
                     for k in range(len(scan_nodes[i].aggs)):
                         scan_nodes[i].aggs[k].arg = self.overlay.expand(scan_nodes[i].aggs[k].arg)
             return _compute_scan(self.scan.value(), scan_nodes, device, self.nodes, self.overlay, self.framed,
-                                 self._morsels, self._block_rows, self._gpu_ops, self._threads)
+                                 self._morsels, self._block_rows, self._gpu_ops, self._threads, job)
         var holistic = False
         for node in self.nodes:
             for a in node.aggs:
@@ -417,6 +420,9 @@ struct Query(Movable):
                 for k in range(len(nodes[i].aggs)):
                     nodes[i].aggs[k].arg = self.overlay.expand(nodes[i].aggs[k].arg)
         var prog = _lower(self.table, nodes, self.framed, len(self.overlay.mask) > 0)
+        job.check()
+        job.stage(STAGE_AGGREGATE)
+        job.add_total(self.table.rows())
         if use_gpu and prog.has_float:
             if device == GPU:
                 raise Error("device GPU: a FLOAT column or float arithmetic runs on the CPU (a float64 sum has one defined order there)")
@@ -430,6 +436,7 @@ struct Query(Movable):
         if use_gpu:
             comptime if HAS_GPU:
                 var g = _run_gpu(self.device.value(), self.table, prog, self.overlay.mask, device == GPU, fallback)
+                job.advance(self.table.rows())
                 if g:
                     r = g.take()
                     r.device = GPU
@@ -437,10 +444,12 @@ struct Query(Movable):
         if not done:
             var mask_addr = Int(self.overlay.mask.unsafe_ptr()) if len(self.overlay.mask) > 0 else 0
             if prog.mat:
-                r = _run_mat(self.table, prog, mask_addr, hs, self._window_rows, self._threads)
+                r = _run_mat(self.table, prog, mask_addr, hs, self._window_rows, self._threads, job)
             else:
-                r = _run_cpu(self.table, prog, mask_addr, 0, -1, 0, self._threads)
+                r = _run_cpu_job(self.table, prog, mask_addr, self._threads, job)
             r.fallback_reason = fallback^
+        job.check()
+        job.stage(STAGE_FINISH)
         if self.framed and len(self.overlay.delta) > 0:
             _add_delta(r, self.table, nodes, self.overlay, hs)
         if prog.mat:
@@ -1363,6 +1372,50 @@ def _run_cpu(t: SharedTable, p: Program, mask_addr: Int, start: Int = 0, end: In
     return r^
 
 
+comptime JOB_RANGE_ROWS = 1 << 21        # F-175: rows a background job's plain query runs between two cancel checks
+
+
+def _run_cpu_job(t: SharedTable, p: Program, mask_addr: Int, threads: Int, job: JobCtl) raises -> QueryResult:
+    """`_run_cpu` over all rows; for a background job over a big table, in row ranges whose partial results are merged (as the
+    windows of `_run_mat` and the row groups of a scan are), so a cancel is seen between ranges and progress moves. Integer
+    sums, counts, min and max merge exactly, so the answer is the one call's. A query with a float sum or a reproducible plan
+    (`p.repro`) keeps its one call: its float64 sum has one defined order, which ranges would change. Any error from the ranges
+    (a partial total that passed int64 where the whole does not) is settled by the one call."""
+    var n = t.rows()
+    var ops = _slot_ops(p)
+    var exact = job.active() and not p.repro
+    for o in ops:
+        exact = exact and o < A_FSUM
+    var step = max(JOB_RANGE_ROWS, 8 * p.groups) // MORSEL_ROWS * MORSEL_ROWS
+    if not exact or n <= 2 * step:
+        var r = _run_cpu(t, p, mask_addr, 0, -1, 0, threads)
+        job.advance(n)
+        return r^
+    var at = 0
+    try:
+        var acc = QueryResult()
+        while at < n:
+            job.check()
+            var end = min(n, at + step)
+            var r = _run_cpu(t, p, mask_addr, at, end, 0, threads)
+            if at == 0:
+                acc = r^
+            else:
+                _merge_partial(acc, r, ops)
+            job.advance(end - at)
+            at = end
+        for i in range(len(acc.kinds)):
+            if acc.kinds[i] == A_SUM:
+                acc.sums = acc.slots[acc.slot_of[i]].copy()
+                break
+        return acc^
+    except e:
+        job.check()
+        var r = _run_cpu(t, p, mask_addr, 0, -1, 0, threads)
+        job.advance(n - at)
+        return r^
+
+
 def _make_result(p: Program, out_vals: List[Float64], out_cnt: List[Int64]) -> QueryResult:
     """The kernel's output (slot words are int64 bits, per slot then group; counts per group) as a QueryResult."""
     var r = QueryResult()
@@ -1454,7 +1507,7 @@ def _merge_partial(mut acc: QueryResult, r: QueryResult, ops: List[Int]) raises:
         acc.counts[x] += r.counts[x]
 
 
-def _run_mat(t: SharedTable, p: Program, mask_addr: Int, mut hs: HolStates, window_rows: Int = 0, threads: Int = 0) raises -> QueryResult:
+def _run_mat(t: SharedTable, p: Program, mask_addr: Int, mut hs: HolStates, window_rows: Int = 0, threads: Int = 0, job: JobCtl = JobCtl()) raises -> QueryResult:
     """A query with count_distinct / percentile / top_k over `t`: the kernel runs over windows of rows, aggregating
     the plain aggregates as always (partial results merged) and, through `_mat_hook`, writing the (group, value) pairs
     of each value source, which `hs` takes in (the states keep what later windows must merge with). A window is as many
@@ -1470,6 +1523,7 @@ def _run_mat(t: SharedTable, p: Program, mask_addr: Int, mut hs: HolStates, wind
     var done = 0
     var first = True
     while first or done < n:
+        job.check()                                      # F-175: between windows
         var end = min(n, done + rows)
         var nblk = (end - done + VEC - 1) // VEC
         var gids = List[List[Int32]]()
@@ -1518,6 +1572,7 @@ def _run_mat(t: SharedTable, p: Program, mask_addr: Int, mut hs: HolStates, wind
         else:
             _merge_partial(acc, rw, ops)
         first = False
+        job.advance(end - done)
         done = end
     for i in range(len(acc.kinds)):                      # `sums` was copied from the first window's slot
         if acc.kinds[i] == A_SUM:
@@ -1934,7 +1989,7 @@ struct _MorselRun(Movable):
 
 def _morsel_task(plan: _GroupPlan, gfile: Int, r0: Int, r1: Int, used: List[Int], nodes: List[PlanNode], n_slots: Int,
                  groups: Int, ops: List[Int], block: Int, sm: _ScanMask, mut part: QueryResult, mut tally: List[Int],
-                 mut kernel_error: String) raises:
+                 mut kernel_error: String, job: JobCtl = JobCtl()) raises:
     """Rows [r0, r1) of row group `gfile` on one worker: decode block after block, run the kernel (one thread) on each,
     fold the block's partial into the morsel's in block order. A kernel error is kept and the remaining blocks are still
     decoded (not aggregated), so a decode error later in the range is the one raised, as when the group was decoded first.
@@ -1949,10 +2004,13 @@ def _morsel_task(plan: _GroupPlan, gfile: Int, r0: Int, r1: Int, used: List[Int]
     var gm = _range_mask(sm, gfile, r0, r1)          # F-147: the morsel's slice of the frame mask; r0 and a block start at multiples of 8
     var gm_addr = Int(gm.unsafe_ptr()) if len(gm) > 0 else 0
     while True:
+        if job.cancelled():                              # F-175: between blocks; the caller raises "cancelled" after the round
+            break
         var b0 = reader.at
         var rows = reader.next_block(shared._table[])
         if rows == 0:
             break
+        job.advance(rows)
         if kernel_error.byte_length() > 0:
             continue
         try:
@@ -1966,7 +2024,7 @@ def _morsel_task(plan: _GroupPlan, gfile: Int, r0: Int, r1: Int, used: List[Int]
 
 
 def _scan_morsels(scan: ParquetScan, nodes: List[PlanNode], used: List[Int], todo: List[Int], n_slots: Int, groups: Int,
-                  ops: List[Int], block: Int, sm: _ScanMask) raises -> _MorselRun:
+                  ops: List[Int], block: Int, sm: _ScanMask, job: JobCtl = JobCtl()) raises -> _MorselRun:
     """The row groups of `todo`: with at least a group a core, one morsel per group; with fewer, in waves of two groups a
     core: the wave's groups are opened in parallel (headers walked, dictionaries decoded once and then shared read only),
     then cut into row-range morsels of whole blocks (about MORSELS_PER_WORKER a worker) that all the cores take in turn.
@@ -1997,6 +2055,8 @@ def _scan_morsels(scan: ParquetScan, nodes: List[PlanNode], used: List[Int], tod
         var ge1 = Int(run.gerrs.unsafe_ptr())
         var sm1 = Int(UnsafePointer(to=sm))
         def whole_group(i: Int) {imm}:
+            if job.cancelled():
+                return
             var plan = _GroupPlan(Pointer[ParquetScan, MutUntrackedOrigin](unsafe_from_address=sp1)[].copy(),
                                  Pointer[List[Int], MutUntrackedOrigin](unsafe_from_address=up1)[])
             try:
@@ -2014,13 +2074,14 @@ def _scan_morsels(scan: ParquetScan, nodes: List[PlanNode], used: List[Int], tod
                              Pointer[_ScanMask, MutUntrackedOrigin](unsafe_from_address=sm1)[],
                              (Pointer[QueryResult, MutUntrackedOrigin](unsafe_from_address=pa1) + i)[],
                              (Pointer[List[Int], MutUntrackedOrigin](unsafe_from_address=na1) + i)[],
-                             (Pointer[String, MutUntrackedOrigin](unsafe_from_address=ke1) + i)[])
+                             (Pointer[String, MutUntrackedOrigin](unsafe_from_address=ke1) + i)[], job)
             except e:
                 (Pointer[String, MutUntrackedOrigin](unsafe_from_address=de1) + i)[] = String(e)
         par_n(whole_group, len(todo), min(len(todo), workers))
         return run^
     var w0 = 0
     while w0 < len(todo):
+        job.check()
         var nb = min(batch, len(todo) - w0)
         var plans = List[_GroupPlan]()
         for _ in range(nb):
@@ -2032,6 +2093,8 @@ def _scan_morsels(scan: ParquetScan, nodes: List[PlanNode], used: List[Int], tod
         var ge = Int(run.gerrs.unsafe_ptr())
         var base = w0
         def open_job(i: Int) {imm}:
+            if job.cancelled():
+                return
             try:
                 (Pointer[_GroupPlan, MutUntrackedOrigin](unsafe_from_address=pl) + i)[] = _open_plan(
                     Pointer[ParquetScan, MutUntrackedOrigin](unsafe_from_address=sp)[],
@@ -2079,6 +2142,8 @@ def _scan_morsels(scan: ParquetScan, nodes: List[PlanNode], used: List[Int], tod
         var r0a = Int(tr0.unsafe_ptr())
         var r1a = Int(tr1.unsafe_ptr())
         def task(t: Int) {imm}:
+            if job.cancelled():
+                return
             var gi = Pointer[Int, MutUntrackedOrigin](unsafe_from_address=tga)[t]
             var at = first + t
             try:
@@ -2092,7 +2157,7 @@ def _scan_morsels(scan: ParquetScan, nodes: List[PlanNode], used: List[Int], tod
                              Pointer[_ScanMask, MutUntrackedOrigin](unsafe_from_address=smp)[],
                              (Pointer[QueryResult, MutUntrackedOrigin](unsafe_from_address=pa) + at)[],
                              (Pointer[List[Int], MutUntrackedOrigin](unsafe_from_address=na) + at)[],
-                             (Pointer[String, MutUntrackedOrigin](unsafe_from_address=ke) + at)[])
+                             (Pointer[String, MutUntrackedOrigin](unsafe_from_address=ke) + at)[], job)
             except e:
                 (Pointer[String, MutUntrackedOrigin](unsafe_from_address=de) + at)[] = String(e)
         if nt > 0:
@@ -2203,7 +2268,8 @@ def _range_mask(m: _ScanMask, g: Int, r0: Int, r1: Int) -> List[UInt8]:
 # ── a Parquet scan: one row group at a time (F-140) ──────────────────────────────────────────────────
 
 def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int, orig: List[PlanNode], o: Overlay,
-                  framed: Bool, morsels: Int = 0, block_rows: Int = 0, gpu_ops: Int = AUTO_GPU_OPS_PER_CORE_COLUMN, threads: Int = 0) raises -> QueryResult:
+                  framed: Bool, morsels: Int = 0, block_rows: Int = 0, gpu_ops: Int = AUTO_GPU_OPS_PER_CORE_COLUMN, threads: Int = 0,
+                  job: JobCtl = JobCtl()) raises -> QueryResult:
     """The plan over a file, a row group at a time: decode the columns the plan reads, run the CPU kernel on that
     group, merge its partial result into the running one (sums and counts add, min / max combine; a sum passing
     int64 raises, as one run does). Each group is lowered on its own table, so its null-free columns skip the null
@@ -2280,6 +2346,10 @@ def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int, orig: L
         if scan.group_rows(g) > 0:
             todo.append(g)
     var todo_all = todo.copy()
+    job.stage(STAGE_AGGREGATE)
+    for g in todo:
+        job.add_total(scan.group_rows(g))
+    job.check()
     for c in used:                           # every dictionary the plan needs is built before groups decode beside the kernel
         scan.ensure_words(c)
     var hs = _build_states(orig, nodes, scan.schema, o.words, Optional[ParquetScan](scan.copy()), -1 if framed else scan.rows(), shape.src_float.copy())    # (text order needs the words)
@@ -2298,7 +2368,8 @@ def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int, orig: L
     var block = (block_rows if block_rows > 0 else SCAN_BLOCK_ROWS) // 8 * 8      # a multiple of 8: a block's frame mask slice starts on a byte (F-147)
     block = max(block, 64)
     if not shape.mat and not use_gpu and not shape.repro and _use_morsels(morsels, scan.rows(), block):      # (a float64 sum is folded row group by row group, in file order: the one order that does not depend on the cores)
-        var run = _scan_morsels(scan, nodes, used, todo, shape.n_slots, shape.groups, ops, block, sm)
+        var run = _scan_morsels(scan, nodes, used, todo, shape.n_slots, shape.groups, ops, block, sm, job)
+        job.check()                                      # a cancelled round left partial morsels: none of them is merged
         var ti = 0
         for i in range(len(todo)):
             if run.gerrs[i].byte_length() > 0:
@@ -2327,6 +2398,7 @@ def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int, orig: L
         else:
             cur = scan.read_group(todo[0], used)
     for ix in range(len(todo)):
+        job.check()                                      # F-175: between row groups
         for k in range(len(used)):
             nulls[k] += cur.null_count(k)
         var part = cur^.share()
@@ -2396,8 +2468,11 @@ def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int, orig: L
         cur = nxt^
         ext_cur = ext_nxt^
         _merge_partial(acc, r, ops)
+        job.advance(rows_cur)
         if pending.byte_length() > 0:                # only now, after this group's partial was merged (its overflow comes first)
             raise Error(pending)
+    job.check()
+    job.stage(STAGE_FINISH)
     # the layout of a whole-file run: lowered over the columns with the null counts the file turned out to have
     var proto = Table.empty()
     for k in range(len(used)):

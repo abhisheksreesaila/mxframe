@@ -18,3 +18,7 @@ from .planner import (Planner, RulePlanner, PlannerOptions, PhysicalPlan, KeyLay
 from .plan import LogicalPlan, PlanNode, build_plan
 from .sqlexec import sql, sql_with, SqlResult
 from .blocks import range_aggregate, read_block, RangeResult, RangeAgg, MORSEL
+# F-175: background jobs (jobs.mojo holds the start functions)
+from .job import (Job, JobCtl, JobProgress, JobBody, JobDone, NoCallback, start_job, start_job_then, JOB_RUNNING, JOB_DONE, JOB_FAILED, JOB_CANCELLED, CANCELLED_MESSAGE,
+                  STAGE_START, STAGE_PLAN, STAGE_READ, STAGE_AGGREGATE, STAGE_WRITE, STAGE_FINISH, state_name)
+from .jobs import compute_job, sql_job, read_csv_job, read_parquet_job, save_job, write_parquet_job, frame_snapshot
