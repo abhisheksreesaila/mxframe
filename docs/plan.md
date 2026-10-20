@@ -1473,7 +1473,7 @@ Needs: F-138a, F-138b (can start on Linux before them)
 
 ## Ready for later: the queue (owner, 2026-10-20: stop at a good point, keep every ticket ready)
 Resume in this order when the owner says go. Each ticket below has its full entry further down.
-1. **Finish the app's showcase needs:** F-175 background queries and F-176 range aggregates / block reads (finishing now), then F-176 follow-ups (formula columns in range / block reads, cached frame patches), F-177 stddev / quantile bins / ISO week, F-179 undo for formulas, F-180 compressed Parquet everywhere, F-178 streamed CSV.
+1. **Finish the app's showcase needs:** F-175 and F-176 are done (2026-10-20); next F-176 follow-ups (formula columns in range / block reads, cached frame patches), F-177 stddev / quantile bins / ISO week, F-179 undo for formulas, F-180 compressed Parquet everywhere, F-178 streamed CSV.
 2. **M8 to its gate:** F-158 joins over streamed files (WIP on branch `worktree-agent-a27f985ecf9ff3560` at 4a9c93f; first bisect a Mojo compiler crash), F-159 CTEs / correlated subqueries / UNION ALL, F-160 named views + result cache, F-161 join speed (star-aware planner, filters inside joins, Python on the shared kernel), F-162 gate: TPC-H 22 through `mx` equal to DuckDB.
 3. **Scoreboard and gaps:** F-166 quiet-machine scoreboard vs DuckDB / Polars (needs the owner's go), F-167 sort / large outputs / parallel text building / spill, F-168 window functions.
 4. **Release:** F-165 rename to omxcore + 0.7.0 (PyPI needs the owner's yes), F-169 MCP server for `mx`.
@@ -1686,9 +1686,10 @@ Owner: "if you want the absolute best performance, we ship Omarchy Linux with th
 
 ## App requests (omxplorer, GitHub issues #6-#18, 2026-10-20): generic engine features; app-only parts stay in the app or a plugin
 
-## F-175 Background queries: a handle, done / callback, cancel, progress [review] (mxframe #6)
+## F-175 Background queries: a handle, done / callback, cancel, progress [done] (mxframe #6)
 - [x] start a query (builder, SQL, scan, frame) off the caller's thread and get a handle: `poll()` / `wait()` / an optional completion callback, `cancel()` (checked between morsels / row groups / blocks, no partial result), `progress()` (rows done of rows, per stage); CSV / Parquet open and save as jobs too; cancelling frees everything (lifetime lint); equal results to the synchronous call
 - Built: `job.mojo` (the handle, `JobCtl`), `jobs.mojo` (`compute_job`, `sql_job`, `read_csv_job`, `read_parquet_job`, `save_job`, `write_parquet_job`), checks and progress in query / sql / rows / csv / parquet / frame; `docs/mxframe-mojo-api.md` section 8c. Limits: a cancel is seen between ranges / blocks / chunks, so one kernel call over a whole table (hashed groups, a join) runs to its end after `cancel()` has already answered; a float64 sum over a table keeps its one call.
+- Review round 1: NEEDS WORK (saves to one path shared a temp file: a restart or two concurrent saves failed or tore the file; an unordered dictionary flag), fixed: a temp file per writer, atomic flag, yielding lock, docs, JOBS_ARE_THREADED, permutation_job, ranged hashed group-by and fused join probes. Round 2: PASS (cancel-then-restart 0/60 failed, two concurrent saves 0/40 failed or torn; ASan clean; ranged results equal the plain call; cancel stops in 29-360 ms at 20M rows). Ready for later: an atomic counter in the temp name; a materialised join's pair build checks cancel only between steps (~2 s at 100M rows); verify overflow that only a range partial hits falls back as the dense path does; the threaded Apple path is link-checked only (run test_switches_threads on a Mac)
 
 ## F-176 Range aggregates and block reads over a sort order [done] (mxframe #8, #9)
 - [x] sum / count / mean / min / max over rows a..b of a permutation (or a row list) for a set of columns, exact at each column's scale, without per-cell calls
