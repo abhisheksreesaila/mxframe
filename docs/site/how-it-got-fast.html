@@ -1,30 +1,31 @@
 <!doctype html>
-<html lang="en" data-theme="light">
+<html lang="en" class="oq-root oq-light oq-family-dev oq-top" data-theme="light">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>How omxcore got fast</title>
 <meta name="description" content="The CPU engine's optimizations one at a time: what was slow, what changed, the before and after numbers, and which wins come from Mojo and which are ordinary engineering.">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="omxqua/src/fonts.css">
+<link rel="stylesheet" href="omxqua/src/tokens.css">
+<link rel="stylesheet" href="omxqua/src/components.css">
 <link rel="stylesheet" href="site.css">
+<script src="omxqua/src/omxqua.js" defer></script>
 <script src="site.js"></script>
 <style>
   .card .pair { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
   .card .pair p { margin: 2px 0 10px; font-size: 14px; }
-  .card h4 { margin: 0; font: 700 10.5px var(--font-mono); letter-spacing: .12em; text-transform: uppercase; color: var(--text-dim); }
-  .card .tag { font: 700 11px var(--font-mono); color: var(--accent); }
+  .card h4 { margin: 0; font: 700 10.5px var(--oq-font-mono); letter-spacing: .12em; text-transform: uppercase; color: var(--oq-ink-2); }
+  .card .tag { font: 600 11px var(--oq-font-mono); color: var(--oq-ink); }
   .card-h .sp { flex: 1; }
-  .card-h .ttl { text-transform: none; letter-spacing: 0; font: 600 14px var(--font-sans); }
+  .card-h .ttl { text-transform: none; letter-spacing: 0; font: 600 14px var(--oq-font); }
   .card-h { flex-wrap: wrap; }
   .card.hide { display: none; }
-  .src { font: 11.5px var(--font-mono); color: var(--text-dim); }
-  .mark { margin: 0 0 6px; }
+  .from { font: 11.5px var(--oq-font-mono); color: var(--oq-ink-2); }
   .feat { margin: 10px 0 0; }
   .feat td:first-child { white-space: nowrap; }
   .chart-wrap { margin: 6px 0 0; }
   #progress svg { min-width: 0; max-width: 100%; }
-  .note-honest { border-left: 2px solid var(--yellow); background: var(--yellow-dim); padding: 8px 12px; margin: 10px 0 0; font-size: 13.5px; border-radius: 0 var(--radius-sm) var(--radius-sm) 0; }
+  .note-honest { border-left: 2px solid var(--oq-warn); background: color-mix(in srgb, var(--oq-warn) 12%, transparent); padding: 8px 12px; margin: 10px 0 0; font-size: 13.5px; border-radius: 0 var(--oq-radius-in) var(--oq-radius-in) 0; }
   svg .hit { cursor: pointer; fill: transparent; }
   .card-b { overflow-x: auto; }
   @media (max-width: 820px) {
@@ -32,14 +33,13 @@
     .feat td:first-child { white-space: normal; }
     .feat, .feat tr, .feat td { display: block; }
     .feat td { border: 0; padding: 2px 10px; }
-    .feat tr { border-bottom: 1px solid var(--border); padding: 6px 0; }
+    .feat tr { border-bottom: 1px solid var(--oq-line-2); padding: 6px 0; }
   }
 </style>
 </head>
 <body>
-<div class="shell">
-<nav class="side"></nav>
-<main>
+<div class="screen">
+<main class="main" id="main">
 
   <span class="kick">the optimization story</span>
   <h1>How omxcore got fast</h1>
@@ -51,8 +51,8 @@
     <div class="card-h">TPC-H · total of 22 queries · engine only · lower is faster</div>
     <div class="card-b">
       <div class="btns" id="sf-btns" role="group" aria-label="Scale factor">
-        <button class="btn on" type="button" data-sf="10">SF10 (60M rows)</button>
-        <button class="btn" type="button" data-sf="1">SF1 (6M rows)</button>
+        <button class="chip on" type="button" data-sf="10">SF10 (60M rows)</button>
+        <button class="chip" type="button" data-sf="1">SF1 (6M rows)</button>
       </div>
       <div class="legend" id="progress-legend"></div>
       <div class="chart chart-wrap" id="progress"><div class="status">loading benchmark files…</div></div>
@@ -62,24 +62,25 @@
         <div id="progress-table"></div>
       </details>
     </div>
+    <div class="src note">bench/m1-*.csv · m2*-engine.csv · m2s-engine.csv · first_ms summed per milestone</div>
   </div>
   <p style="font-size:13px">Polars and DuckDB are drawn from the latest run (<a href="bench/m2s-engine.csv">m2s-engine.csv</a>), the same as the progress chart in the README; omxcore is measured at each milestone. Earlier runs of DuckDB included DuckDB's own pyarrow import (see the F-044 card), which is why the reference lines are not taken from the early files.</p>
 
   <h2>Which Mojo features the engine uses</h2>
   <div class="card"><div class="card-b" style="padding:6px 16px">
-    <table class="t feat">
+    <table class="tbl feat">
       <tr><td><b>AOT shared libraries over the Arrow C Data Interface</b></td><td><code>mojo build --emit shared-lib</code>, called from Python with <code>ctypes</code>; Mojo reads Arrow buffers in place and Arrow wraps the result without a copy. No JIT warm-up inside a query.</td></tr>
       <tr><td><b>Closures inlined into <code>parallelize</code></b></td><td>Every pass over the rows is a capturing closure run on all cores (morsel-driven, work-stealing through an atomic counter).</td></tr>
       <tr><td><b>Compile-time specialization</b></td><td>One interpreter body, compiled into specialized versions (<code>keyed</code>, <code>shared</code>); the key encoder closure is inlined, with no virtual call per row.</td></tr>
       <tr><td><b>SIMD widths</b></td><td><code>SIMD[DType.float64, W]</code> with <code>W = simd_width_of[...]()</code>: aggregation lanes sized for the CPU it was compiled for.</td></tr>
     </table>
-  </div></div>
+  </div><div class="src note">docs/mojo-engine.md</div></div>
 
   <h2>One card per optimization</h2>
   <div class="btns" id="filter-btns" role="group" aria-label="Filter cards">
-    <button class="btn on" type="button" data-f="all">All</button>
-    <button class="btn" type="button" data-f="mojo">Mojo feature</button>
-    <button class="btn" type="button" data-f="plain">Plain engineering</button>
+    <button class="chip on" type="button" data-f="all">All</button>
+    <button class="chip" type="button" data-f="mojo">Mojo feature</button>
+    <button class="chip" type="button" data-f="plain">Plain engineering</button>
     <span class="label" id="filter-count"></span>
   </div>
   <div class="grid" id="cards"></div>
@@ -89,8 +90,8 @@
     <div class="card-h">omxcore speed against DuckDB, per TPC-H query · log scale · before and after the latest milestone</div>
     <div class="card-b">
       <div class="btns" id="pq-btns" role="group" aria-label="Scale factor">
-        <button class="btn on" type="button" data-sf="10">SF10</button>
-        <button class="btn" type="button" data-sf="1">SF1</button>
+        <button class="chip on" type="button" data-sf="10">SF10</button>
+        <button class="chip" type="button" data-sf="1">SF1</button>
       </div>
       <div class="legend" id="pq-legend"></div>
       <div class="chart chart-wrap" id="pq"><div class="status">loading benchmark files…</div></div>
@@ -100,6 +101,7 @@
         <div id="pq-table"></div>
       </details>
     </div>
+    <div class="src note">bench/m2s-engine.csv · duckdb first_ms / mx-cpu first_ms, per query</div>
   </div>
   <p style="font-size:13px">A dot to the right of the 1x line means omxcore was faster than DuckDB on that query. "Before" is the F-043 run, "after" is the F-046 run; each run measured omxcore and DuckDB together in one session. Speed is DuckDB's time divided by omxcore's time.</p>
 
@@ -349,7 +351,7 @@ function drawProgress() {
   const vals = pts.map((p) => p["t" + sf]);
   const ymax = Math.max(...vals, ref.polars, ref.duckdb) * 1.08, step = niceStep(ymax);
   const x = (i) => L + (i * pw) / (pts.length - 1), y = (v) => T + ph - (v / ymax) * ph;
-  const css = { mx: cssVar("--mx"), dk: cssVar("--dk"), pl: cssVar("--pl"), grid: cssVar("--border"), axis: cssVar("--border-hi"), bg: cssVar("--surface"), txt: cssVar("--text") };
+  const css = { mx: cssVar("--mx"), dk: cssVar("--dk"), pl: cssVar("--pl"), grid: cssVar("--oq-line-2"), axis: cssVar("--oq-line"), bg: cssVar("--oq-surface-1"), txt: cssVar("--oq-ink") };
   const s = svg("svg", { viewBox: `0 0 ${W} ${H}`, width: W, height: H, role: "img", "aria-label": `omxcore SF${sf} total of 22 TPC-H queries per milestone, against Polars and DuckDB` });
   for (let v = 0; v <= ymax; v += step) {
     s.append(svg("line", { x1: L, x2: L + pw, y1: y(v), y2: y(v), stroke: v === 0 ? css.axis : css.grid, "stroke-width": 1 }));
@@ -371,7 +373,7 @@ function drawProgress() {
     const hit = svg("circle", { class: "hit", cx: x(i), cy: y(v), r: 14, tabindex: 0, role: "link", "aria-label": `${p.title}: ${fmtS(v)}` });
     const tip = () => `<b>${p.title}</b><br><span class="num">${fmtS(v)}</span> total of 22 queries at SF${sf}` +
       (prev ? `<br>${v < prev ? "−" : "+"}${Math.abs(((v - prev) / prev) * 100).toFixed(0)}% against the previous milestone (${fmtS(prev)})` : "") +
-      `<br><span class="src">source: bench/${p["sf" + sf].file}</span>` + (p["drift" + sf] ? `<br><span style="color:var(--red)">page data differs from the file</span>` : "");
+      `<br><span class="from">source: bench/${p["sf" + sf].file}</span>` + (p["drift" + sf] ? `<br><span style="color:var(--oq-bad)">page data differs from the file</span>` : "");
     hover(hit, tip);
     hit.addEventListener("click", () => document.getElementById("card-" + p.card)?.scrollIntoView({ behavior: "smooth", block: "start" }));
     hit.addEventListener("keydown", (e) => { if (e.key === "Enter") hit.dispatchEvent(new Event("click")); });
@@ -385,18 +387,18 @@ function drawProgress() {
     `The biggest single steps are ${steps.map((t) => `${t.id} (−${fmtS(t.d)})`).join(" and ")}.` +
     (sf === "1" ? " The SF1 line barely moves at first: small data is dominated by fixed costs, not kernels." : "");
   const drift = pts.filter((p) => p["drift" + sf]);
-  if (drift.length) document.getElementById("progress-note").innerHTML += ` <span style="color:var(--red)">Check: ${drift.map((p) => p.id).join(", ")} differs from the value written on this page.</span>`;
+  if (drift.length) document.getElementById("progress-note").innerHTML += ` <span style="color:var(--oq-bad)">Check: ${drift.map((p) => p.id).join(", ")} differs from the value written on this page.</span>`;
 }
 
 function progressTable() {
   const rows = state.progress.map((p, i) => {
     const prev = i ? state.progress[i - 1] : null;
-    return `<tr><td>${p.title}</td><td class="r num">${fmtS(p.t10)}</td><td class="src">bench/${p.sf10.file}</td><td class="r num">${fmtS(p.t1)}</td><td class="src">bench/${p.sf1.file}</td></tr>`;
+    return `<tr><td>${p.title}</td><td class="r num">${fmtS(p.t10)}</td><td class="from">bench/${p.sf10.file}</td><td class="r num">${fmtS(p.t1)}</td><td class="from">bench/${p.sf1.file}</td></tr>`;
   }).join("");
   const r = state.ref;
-  document.getElementById("progress-table").innerHTML = `<table class="t"><tr><th>Milestone</th><th class="r">SF10 total</th><th>SF10 source</th><th class="r">SF1 total</th><th>SF1 source</th></tr>${rows}` +
-    `<tr><td>Polars (reference)</td><td class="r num">${fmtS(r["10"].polars)}</td><td class="src">bench/${DATA.reference.file}</td><td class="r num">${fmtS(r["1"].polars)}</td><td class="src">bench/${DATA.reference.file}</td></tr>` +
-    `<tr><td>DuckDB (reference)</td><td class="r num">${fmtS(r["10"].duckdb)}</td><td class="src">bench/${DATA.reference.file}</td><td class="r num">${fmtS(r["1"].duckdb)}</td><td class="src">bench/${DATA.reference.file}</td></tr></table>`;
+  document.getElementById("progress-table").innerHTML = `<table class="tbl"><tr><th>Milestone</th><th class="r">SF10 total</th><th>SF10 source</th><th class="r">SF1 total</th><th>SF1 source</th></tr>${rows}` +
+    `<tr><td>Polars (reference)</td><td class="r num">${fmtS(r["10"].polars)}</td><td class="from">bench/${DATA.reference.file}</td><td class="r num">${fmtS(r["1"].polars)}</td><td class="from">bench/${DATA.reference.file}</td></tr>` +
+    `<tr><td>DuckDB (reference)</td><td class="r num">${fmtS(r["10"].duckdb)}</td><td class="from">bench/${DATA.reference.file}</td><td class="r num">${fmtS(r["1"].duckdb)}</td><td class="from">bench/${DATA.reference.file}</td></tr></table>`;
 }
 
 // ---------- per-query chart ----------
@@ -414,7 +416,7 @@ function drawPerQuery() {
   const all = rows.flatMap((r) => [r.rb, r.ra]);
   const lo = Math.floor(Math.log2(Math.min(...all, 0.5))), hi = Math.ceil(Math.log2(Math.max(...all, 2)));
   const x = (r) => L + ((Math.log2(r) - lo) / (hi - lo)) * pw;
-  const css = { mx: cssVar("--mx"), grid: cssVar("--border"), mid: cssVar("--mid"), bg: cssVar("--surface"), txt: cssVar("--text") };
+  const css = { mx: cssVar("--mx"), grid: cssVar("--oq-line-2"), mid: cssVar("--mid"), bg: cssVar("--oq-surface-1"), txt: cssVar("--oq-ink") };
   const s = svg("svg", { viewBox: `0 0 ${W} ${H}`, width: "100%", role: "img", "aria-label": `Per-query speed of omxcore against DuckDB at SF${sf}, before and after ${DATA.perquery.after.label}` });
   for (let k = lo; k <= hi; k++) {
     s.append(svg("line", { x1: x(2 ** k), x2: x(2 ** k), y1: T - 8, y2: T + rowH * rows.length, stroke: k === 0 ? css.mid : css.grid, "stroke-width": k === 0 ? 1.5 : 1 }));
@@ -430,7 +432,7 @@ function drawPerQuery() {
     s.append(svg("circle", { cx: x(r.ra), cy: yy, r: 5, fill: css.mx, stroke: css.bg, "stroke-width": 1.5 }));
     const hit = svg("rect", { class: "hit", x: 0, y: yy - rowH / 2, width: W, height: rowH });
     hover(hit, () => `<b>Q${r.q} ${r.title}</b><br>${DATA.perquery.before.label}: omxcore ${fmtMs(r.mb)}, DuckDB ${fmtMs(r.db)} (${r.rb.toFixed(2)}x)` +
-      `<br>${DATA.perquery.after.label}: omxcore ${fmtMs(r.ma)}, DuckDB ${fmtMs(r.da)} (<b>${r.ra.toFixed(2)}x</b>)<br><span class="src">source: bench/${DATA.perquery.before.file}, bench/${DATA.perquery.after.file}</span>`);
+      `<br>${DATA.perquery.after.label}: omxcore ${fmtMs(r.ma)}, DuckDB ${fmtMs(r.da)} (<b>${r.ra.toFixed(2)}x</b>)<br><span class="from">source: bench/${DATA.perquery.before.file}, bench/${DATA.perquery.after.file}</span>`);
     s.append(hit);
   });
   host.replaceChildren(s);
@@ -441,26 +443,26 @@ function drawPerQuery() {
   document.getElementById("pq-note").innerHTML = `<b>omxcore is faster than DuckDB on ${wins("rb")} of ${rows.length} queries before, ${wins("ra")} after</b> at SF${sf}.` +
     (gained.length ? ` Newly won: ${gained.join(", ")}.` : "") + (lost.length ? ` Newly lost: ${lost.join(", ")}.` : "") +
     (duckLeads.length ? ` DuckDB still leads most on ${duckLeads.join(", ")}.` : "");
-  document.getElementById("pq-table").innerHTML = `<table class="t"><tr><th>Query</th><th class="r">omxcore before</th><th class="r">DuckDB before</th><th class="r">omxcore after</th><th class="r">DuckDB after</th><th class="r">Speed before / after</th></tr>` +
+  document.getElementById("pq-table").innerHTML = `<table class="tbl"><tr><th>Query</th><th class="r">omxcore before</th><th class="r">DuckDB before</th><th class="r">omxcore after</th><th class="r">DuckDB after</th><th class="r">Speed before / after</th></tr>` +
     rows.map((r) => `<tr><td>Q${r.q} ${r.title}</td><td class="r num">${fmtMs(r.mb)}</td><td class="r num">${fmtMs(r.db)}</td><td class="r num">${fmtMs(r.ma)}</td><td class="r num">${fmtMs(r.da)}</td><td class="r num">${r.rb.toFixed(2)}x / ${r.ra.toFixed(2)}x</td></tr>`).join("") +
-    `</table><p class="src">Sources: bench/${DATA.perquery.before.file} (before), bench/${DATA.perquery.after.file} (after). Speed is DuckDB's time divided by omxcore's.</p>`;
+    `</table><p class="from">Sources: bench/${DATA.perquery.before.file} (before), bench/${DATA.perquery.after.file} (after). Speed is DuckDB's time divided by omxcore's.</p>`;
 }
 
 // ---------- cards ----------
 function badge(b) {
-  return b.kind === "mojo" ? `<span class="badge brand">Mojo feature: ${b.name}</span>` : `<span class="badge warn">plain engineering</span>`;
+  return b.kind === "mojo" ? `<span class="badge">Mojo feature: ${b.name}</span>` : `<span class="badge warn"><i></i>plain engineering</span>`;
 }
 function renderCards() {
   document.getElementById("cards").innerHTML = DATA.cards.map((c) => {
     const nums = c.nums.length
-      ? `<table class="t"><tr><th>What</th><th class="r">Before</th><th class="r">After</th><th>Source</th></tr>` +
-        c.nums.map((n) => `<tr><td>${n.label}</td><td class="r num">${n.before} ${n.unit}</td><td class="r num">${n.after} ${n.unit}</td><td class="src">${n.source}</td></tr>`).join("") + `</table>`
-      : `<p class="src" style="margin:0">No separate before / after number is recorded for this step.</p>`;
+      ? `<table class="tbl"><tr><th>What</th><th class="r">Before</th><th class="r">After</th><th>Source</th></tr>` +
+        c.nums.map((n) => `<tr><td>${n.label}</td><td class="r num">${n.before} ${n.unit}</td><td class="r num">${n.after} ${n.unit}</td><td class="from">${n.source}</td></tr>`).join("") + `</table>`
+      : `<p class="from" style="margin:0">No separate before / after number is recorded for this step.</p>`;
     const detail = c.detail.length ? `<details><summary class="label">More detail</summary>${c.detail.map((d) => `<p>${d}</p>`).join("")}</details>` : "";
     const kinds = [...new Set(c.badges.map((b) => b.kind))].join(" ");
     return `<div class="card" id="card-${c.id}" data-kinds="${kinds}"><div class="card-h"><span class="tag">${c.tag}</span><span class="ttl">${c.title}</span><span class="sp"></span>${c.badges.map(badge).join(" ")}</div>` +
       `<div class="card-b"><div class="pair"><div><h4>What was slow</h4><p>${c.slow}</p></div><div><h4>What the engine does now</h4><p>${c.now}</p></div></div>` +
-      `${nums}${c.honest ? `<div class="note-honest"><b>Honestly:</b> ${c.honest}</div>` : ""}${detail}</div></div>`;
+      `${nums}${c.honest ? `<div class="note-honest"><b>Honestly:</b> ${c.honest}</div>` : ""}${detail}</div><div class="src note">docs/optimizations.md · ${c.tag}</div></div>`;
   }).join("");
   applyFilter("all");
 }
@@ -472,19 +474,19 @@ function applyFilter(f) {
     n += show;
   });
   document.getElementById("filter-count").textContent = `${n} of ${DATA.cards.length} optimizations`;
-  document.querySelectorAll("#filter-btns .btn").forEach((b) => b.classList.toggle("on", b.dataset.f === f));
+  document.querySelectorAll("#filter-btns .chip").forEach((b) => b.classList.toggle("on", b.dataset.f === f));
 }
 
 // ---------- wiring ----------
 function toggleGroup(id, key, redraw) {
-  document.querySelectorAll(`#${id} .btn`).forEach((b) => (b.onclick = () => {
+  document.querySelectorAll(`#${id} .chip`).forEach((b) => (b.onclick = () => {
     state[key] = b.dataset.sf;
-    document.querySelectorAll(`#${id} .btn`).forEach((o) => o.classList.toggle("on", o === b));
+    document.querySelectorAll(`#${id} .chip`).forEach((o) => o.classList.toggle("on", o === b));
     redraw();
   }));
 }
 renderCards();
-document.querySelectorAll("#filter-btns .btn").forEach((b) => (b.onclick = () => applyFilter(b.dataset.f)));
+document.querySelectorAll("#filter-btns .chip").forEach((b) => (b.onclick = () => applyFilter(b.dataset.f)));
 toggleGroup("sf-btns", "sf", drawProgress);
 toggleGroup("pq-btns", "pqsf", drawPerQuery);
 const redrawAll = () => { drawProgress(); drawPerQuery(); };

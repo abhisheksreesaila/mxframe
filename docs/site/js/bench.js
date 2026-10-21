@@ -83,13 +83,13 @@ if (typeof document !== "undefined") (function () {
   const ratioTxt = (r) => (r >= 1 ? r.toFixed(2) + "x" : "1/" + (1 / r).toFixed(2) + "x");
   const engRows = () => ENGINES.filter(([e]) => state.on.has(e));
   const dot = (c) => `<i style="display:inline-block;width:9px;height:9px;border-radius:50%;background:var(${c});margin-right:6px"></i>`;
-  const verdictBadge = (v) => v === "wrong" ? '<span class="badge error">wrong result</span>'
-    : v === "drift" ? '<span class="badge warn">drift</span>' : v === "ref" ? '<span class="badge brand">reference</span>' : "";
+  const verdictBadge = (v) => v === "wrong" ? '<span class="badge bad"><i></i>wrong result</span>'
+    : v === "drift" ? '<span class="badge warn"><i></i>drift</span>' : v === "ref" ? '<span class="badge">reference</span>' : "";
   const matrix = () => queryMatrix(data.csv[state.order], state.sf);
   const chartWidth = (el, min) => Math.max(el.clientWidth || 0, min);
 
   function button(group, value, label, on) {
-    return `<button class="btn${on ? " on" : ""}" type="button" data-g="${group}" data-v="${value}" aria-pressed="${on}">${label}</button>`;
+    return `<button class="chip${on ? " on" : ""}" type="button" data-g="${group}" data-v="${value}" aria-pressed="${on}">${label}</button>`;
   }
   function controls() {
     $("controls").innerHTML =
@@ -115,10 +115,10 @@ if (typeof document !== "undefined") (function () {
     $("totals").innerHTML = list.map(([e, n, c]) => {
       const w = wrongQueries(m, e);
       return `<div class="card stat"><span class="label">${dot(c)}${n}</span><span class="num">${t[e] == null ? "n/a" : sec(t[e])}</span>` +
-        (t[e] === best && list.length > 1 ? '<span class="badge ok">lowest total</span> ' : "") +
-        (w.length ? `<span class="badge error">Q${w.join(", Q")} wrong</span>` : "") +
-        `<div style="font-size:13px;margin-top:6px;color:var(--text-mid)">without Q21: <span class="num" style="font-size:15px">${t21[e] == null ? "n/a" : sec(t21[e])}</span>` +
-        (t21[e] === best21 && list.length > 1 && !tied(t21, e) ? ' <span class="badge ok">lowest</span>' : "") + `</div></div>`;
+        (t[e] === best && list.length > 1 ? '<span class="badge ok"><i></i>lowest total</span> ' : "") +
+        (w.length ? `<span class="badge bad"><i></i>Q${w.join(", Q")} wrong</span>` : "") +
+        `<div style="font-size:13px;margin-top:6px;color:var(--oq-ink-2)">without Q21: <span class="num" style="font-size:15px">${t21[e] == null ? "n/a" : sec(t21[e])}</span>` +
+        (t21[e] === best21 && list.length > 1 && !tied(t21, e) ? ' <span class="badge ok"><i></i>lowest</span>' : "") + `</div></div>`;
     }).join("");
     const mx = total(m, "mx-cpu"), dk = total(m, "duckdb"), mx21 = total(m, "mx-cpu", 21), dk21 = total(m, "duckdb", 21);
     const sfTxt = "SF" + state.sf;
@@ -152,19 +152,19 @@ if (typeof document !== "undefined") (function () {
     const X = (v) => L + ((Math.log10(v) - Math.log10(lo)) / (Math.log10(hi) - Math.log10(lo))) * (W - L - R);
     const s = frame(el, W, H);
     for (let g = lo; g <= hi * 1.001; g *= 10) {
-      s.append(svg("line", { x1: X(g), x2: X(g), y1: T, y2: H - 22, stroke: cssVar("--border") }));
+      s.append(svg("line", { x1: X(g), x2: X(g), y1: T, y2: H - 22, stroke: cssVar("--oq-line-2") }));
       s.append(svg("text", { x: X(g), y: H - 8, "text-anchor": "middle" }, fmtTick(Math.round(g))));
     }
     m.queries.forEach((q, i) => {
       const y = T + i * rh + rh / 2;
       const vals = list.map(([e]) => m.ms[e] && m.ms[e][q]).filter((v) => v != null);
       s.append(svg("text", { x: L - 8, y: y + 3, "text-anchor": "end" }, "Q" + q));
-      if (vals.length > 1) s.append(svg("line", { x1: X(Math.min(...vals)), x2: X(Math.max(...vals)), y1: y, y2: y, stroke: cssVar("--border-hi"), "stroke-width": 1.5 }));
+      if (vals.length > 1) s.append(svg("line", { x1: X(Math.min(...vals)), x2: X(Math.max(...vals)), y1: y, y2: y, stroke: cssVar("--oq-line"), "stroke-width": 1.5 }));
       [...list].reverse().forEach(([e, , c]) => {          // omxcore drawn last, on top
         const v = m.ms[e] && m.ms[e][q];
         if (v == null) return;
-        s.append(svg("circle", { cx: X(v), cy: y, r: 4, fill: cssVar(c), stroke: cssVar("--surface"), "stroke-width": 1.5, "pointer-events": "none" }));
-        if (m.verdict[e][q] === "wrong") s.append(svg("circle", { cx: X(v), cy: y, r: 7.5, fill: "none", stroke: cssVar("--red"), "stroke-width": 1.5, "pointer-events": "none" }));
+        s.append(svg("circle", { cx: X(v), cy: y, r: 4, fill: cssVar(c), stroke: cssVar("--oq-surface-1"), "stroke-width": 1.5, "pointer-events": "none" }));
+        if (m.verdict[e][q] === "wrong") s.append(svg("circle", { cx: X(v), cy: y, r: 7.5, fill: "none", stroke: cssVar("--oq-bad"), "stroke-width": 1.5, "pointer-events": "none" }));
       });
       const hit = svg("rect", { x: 0, y: y - rh / 2, width: W, height: rh, fill: "transparent" });
       hover(hit, () => `<b>Q${q}</b><br>` + list.map(([e, n, c]) => {
@@ -174,7 +174,7 @@ if (typeof document !== "undefined") (function () {
       s.append(hit);
     });
     $("legendB").innerHTML = list.map(([, n, c]) => `<span><i style="background:var(${c})"></i>${n}</span>`).join("") +
-      (list.some(([e]) => wrongQueries(m, e).length) ? `<span><i style="background:none;border:1.5px solid var(--red)"></i>wrong result (differs from the reference)</span>` : "");
+      (list.some(([e]) => wrongQueries(m, e).length) ? `<span><i style="background:none;border:1.5px solid var(--oq-bad)"></i>wrong result (differs from the reference)</span>` : "");
     table("tblB", ["Query", ...list.map(([, n]) => n + " ms"), "Verdicts"],
       m.queries.map((q) => [`Q${q}`, ...list.map(([e]) => m.ms[e][q] == null ? "n/a" : m.ms[e][q].toFixed(1)),
         list.map(([e, n]) => (m.verdict[e][q] === "wrong" || m.verdict[e][q] === "drift") ? `${n}: ${verdictBadge(m.verdict[e][q])}` : "").filter(Boolean).join(" ")]));
@@ -191,7 +191,7 @@ if (typeof document !== "undefined") (function () {
     const X = (r) => C + (Math.log10(r) / lg) * half;
     const s = frame(el, W, H);
     for (let k = 2; k <= span; k *= 2) for (const r of [k, 1 / k]) {
-      s.append(svg("line", { x1: X(r), x2: X(r), y1: T, y2: H - 30, stroke: cssVar("--border") }));
+      s.append(svg("line", { x1: X(r), x2: X(r), y1: T, y2: H - 30, stroke: cssVar("--oq-line-2") }));
       s.append(svg("text", { x: X(r), y: H - 18, "text-anchor": "middle" }, (r < 1 ? "1/" + 1 / r : r) + "x"));
     }
     s.append(svg("text", { x: C - 6, y: H - 3, "text-anchor": "end" }, "← DuckDB faster"));
@@ -228,7 +228,7 @@ if (typeof document !== "undefined") (function () {
       const s = frame(el, W, H);
       s.style.minWidth = "0";
       for (const r of [1 / span, span]) {
-        s.append(svg("line", { x1: X(r), x2: X(r), y1: 0, y2: H - 28, stroke: cssVar("--border") }));
+        s.append(svg("line", { x1: X(r), x2: X(r), y1: 0, y2: H - 28, stroke: cssVar("--oq-line-2") }));
         s.append(svg("text", { x: X(r), y: H - 14, "text-anchor": "middle" }, (r < 1 ? "1/" + 1 / r : r) + "x"));
       }
       rows.forEach((row, i) => {

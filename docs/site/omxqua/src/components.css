@@ -1,0 +1,337 @@
+/* omxqua components: every reusable part, scoped under .oq-root.
+   Load after fonts.css and tokens.css, then omxqua.js (press, logo, helpers).
+   Selectors use :where(.oq-root) so scoping adds no specificity: a single class of yours still overrides a part.
+   Rules that start with a root class (.oq-root, .oq-night, .oq-family-*, .oq-skin-*, .oq-islands, .oq-top, .oq-dock) are left as is.
+   Phone rules are container queries: give the element that carries oq-root `container-type: inline-size`
+   (the showcase's .screen does this).
+   Never add press-squash rules (:active { transform: scale() }) here; omxqua.js presses everything. */
+
+/* =====================================================================
+   SKIN RESTYLES: the parts that change with a skin (variables live in tokens.css)
+   ===================================================================== */
+/* the display face (--oq-font-display) goes on titles and the brand */
+:where(.oq-root) .ph h1, :where(.oq-root) .card-h h3, :where(.oq-root) .brand, :where(.oq-root) .dialog h3 { font-family: var(--oq-font-display); }
+.oq-skin-azulejo .ph h1 { font-weight: 600; letter-spacing: -.02em; }
+.oq-skin-azulejo .card-h h3 { font-weight: 600; font-size: 1.12em; letter-spacing: -.005em; }
+.oq-skin-azulejo.oq-light .card { box-shadow: 0 0 0 1px var(--oq-line); }
+.oq-skin-golden .ph h1 { font-weight: 750; letter-spacing: -.045em; }
+.oq-skin-sticker .ph h1, .oq-skin-sticker .card-h h3 { font-weight: 850; }
+.oq-skin-sticker .btn, .oq-skin-crayon .btn { font-weight: 800; }
+.oq-skin-sticker .btn.fill, .oq-skin-sticker .btn.tonal { --oq-press: ledge; }
+.oq-skin-sticker .btn.fill { box-shadow: 0 4px 0 color-mix(in srgb, var(--oq-accent) 62%, #000); }
+.oq-skin-sticker .btn.fill:hover { transform: none; box-shadow: 0 4px 0 color-mix(in srgb, var(--oq-accent) 62%, #000); filter: brightness(1.05); }
+.oq-skin-sticker .btn.fill:active { box-shadow: 0 0 0 transparent; }
+.oq-skin-sticker .btn.tonal { box-shadow: inset 0 0 0 2px var(--oq-line), 0 4px 0 var(--oq-line); }
+.oq-skin-sticker .btn.tonal:active { box-shadow: inset 0 0 0 2px var(--oq-line); }
+.oq-skin-sticker .card { box-shadow: inset 0 0 0 2px var(--oq-line), 0 4px 0 var(--oq-line); }
+.oq-skin-sticker .side { box-shadow: inset -2px 0 0 var(--oq-line); }
+.oq-skin-sticker .nav.on { background: color-mix(in srgb, var(--oq-accent) 14%, transparent); color: var(--oq-accent); box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--oq-accent) 45%, transparent); }
+.oq-skin-sticker .prog { height: 16px !important; border-radius: 8px !important; }
+.oq-skin-crayon .ph h1 { font-weight: 850; }
+.oq-skin-crayon .card { box-shadow: none; background: var(--oq-surface-1); outline: 2px solid var(--oq-line-2); }
+/* =====================================================================
+   ISLANDS (our own): the Nav island replaces the sidebar; the Beacon is a live-activity pill at the top.
+   ===================================================================== */
+/* Nav island: a floating vertical pill of icons; it widens to show labels on hover or when pinned */
+.oq-islands .shell { grid-template-columns: 1fr; }
+.oq-islands .side { position: absolute; left: 14px; top: 76px; bottom: 14px; width: 60px; padding: 10px 8px; border-radius: 26px; background: var(--oq-surface-2); box-shadow: var(--oq-shadow-3); overflow: hidden; z-index: 25; gap: 4px;
+  transition: width 420ms var(--oq-island-spring); }
+.oq-islands .side:hover, .oq-islands .side.pinned { width: 224px; }
+.oq-islands .side .nav { white-space: nowrap; padding: 0 13px; gap: 14px; border-radius: 14px; flex: none; }
+.oq-islands .side:not(:hover):not(.pinned) .nav { width: 44px; color: transparent; }
+.oq-islands .side:not(:hover):not(.pinned) .nav .ico { color: var(--oq-ink-2); }
+.oq-islands .side:not(:hover):not(.pinned) .nav.on .ico { color: var(--oq-on-accent); }
+.oq-islands .side .nav .ico { color: inherit; }
+:where(.oq-root) .mark { flex: none; }
+.oq-islands .side .nav .n, .oq-islands .side .grp, .oq-islands .side .foot span:not(.avatar), .oq-islands .side .brand-name { opacity: 0; transition: opacity .18s; }
+.oq-islands .side:hover .nav .n, .oq-islands .side:hover .grp, .oq-islands .side:hover .foot span:not(.avatar), .oq-islands .side:hover .brand-name, .oq-islands .side.pinned .nav .n, .oq-islands .side.pinned .grp, .oq-islands .side.pinned .foot span:not(.avatar), .oq-islands .side.pinned .brand-name { opacity: 1; transition-delay: .08s; }
+.oq-islands .side .brand { padding: 4px 8px 10px; white-space: nowrap; }
+.oq-islands .side .grp { padding: 10px 13px 4px; white-space: nowrap; }
+.oq-islands .side .foot { padding: 6px 8px; white-space: nowrap; }
+.oq-islands .side .nav.on { background: var(--oq-accent); color: var(--oq-on-accent); }
+.oq-islands .main { padding-left: 100px; padding-top: 74px; }
+:where(.oq-root) .pin-btn { margin-left: auto; opacity: 0; transition: opacity .18s; border: 0; background: none; color: var(--oq-ink-2); width: 26px; height: 26px; border-radius: 8px; display: grid; place-items: center; }
+.oq-islands .side:hover .pin-btn, .oq-islands .side.pinned .pin-btn { opacity: 1; }
+:where(.oq-root) .pin-btn:hover { background: rgb(var(--oq-state) / .08); }
+:where(.oq-root) .side:not(.pinned) .pin-btn .on { display: none; } :where(.oq-root) .side.pinned .pin-btn .off { display: none; }
+.oq-root:not(.oq-islands) .pin-btn { display: none; }
+/* Beacon: always a near-black pill (both themes), centred at the top; it morphs between compact and open */
+:where(.oq-root) .beacon { position: absolute; top: 14px; left: 50%; transform: translateX(-50%); z-index: 35; background: #0b0b0d; color: #f4f4f5; border-radius: 22px; box-shadow: 0 10px 30px rgba(0,0,0,.35), 0 0 0 1px rgba(255,255,255,.06);
+  overflow: hidden; cursor: pointer; font-family: var(--oq-font); transition: width 460ms var(--oq-island-spring), height 460ms var(--oq-island-spring), border-radius 460ms var(--oq-island-spring); }
+.oq-root:not(.oq-islands) .beacon { display: none; }
+:where(.oq-root) .beacon.open { border-radius: 30px; cursor: default; }
+:where(.oq-root) .beacon .bc-compact, :where(.oq-root) .beacon .bc-open { position: absolute; left: 0; top: 0; transition: opacity 200ms; }
+:where(.oq-root) .beacon .bc-compact { display: flex; align-items: center; gap: 10px; height: 40px; padding: 0 16px 0 12px; white-space: nowrap; font-size: 13px; font-weight: 600; }
+:where(.oq-root) .beacon .bc-compact .mono { font-size: 12px; color: #a1a1aa; font-weight: 500; }
+:where(.oq-root) .beacon .bc-open { width: 400px; padding: 16px 18px 18px; opacity: 0; pointer-events: none; }
+:where(.oq-root) .beacon.open .bc-compact { opacity: 0; pointer-events: none; }
+:where(.oq-root) .beacon.open .bc-open { opacity: 1; pointer-events: auto; transition-delay: 120ms; }
+:where(.oq-root) .beacon .ring { width: 20px; height: 20px; flex: none; }
+:where(.oq-root) .beacon .live { width: 8px; height: 8px; border-radius: 50%; background: var(--oq-beacon-accent); box-shadow: 0 0 0 4px color-mix(in srgb, var(--oq-beacon-accent) 25%, transparent); }
+:where(.oq-root) .beacon .ico { color: var(--oq-beacon-accent); }
+:where(.oq-root) .beacon h4 { margin: 0; font-size: 16px; font-weight: 650; letter-spacing: -.01em; display: flex; align-items: center; gap: 10px; }
+:where(.oq-root) .beacon .sub2 { font: 12px var(--oq-font-mono); color: #a1a1aa; margin-top: 4px; }
+:where(.oq-root) .beacon .big { font: 600 40px/1 var(--oq-font); letter-spacing: -.04em; font-variant-numeric: tabular-nums; margin: 14px 0 10px; }
+:where(.oq-root) .beacon .bar2 { height: 6px; border-radius: 3px; background: #27272a; overflow: hidden; margin: 12px 0 14px; } :where(.oq-root) .beacon .bar2 i { display: block; height: 100%; background: var(--oq-beacon-accent); border-radius: 3px; transition: width .6s linear; }
+:where(.oq-root) .beacon .steps { list-style: none; margin: 12px 0 0; padding: 0; display: grid; gap: 6px; font-size: 13px; }
+:where(.oq-root) .beacon .steps li { display: flex; align-items: center; gap: 8px; color: #d4d4d8; } :where(.oq-root) .beacon .steps li span { margin-left: auto; font: 11.5px var(--oq-font-mono); color: #a1a1aa; }
+:where(.oq-root) .beacon .steps .d { width: 7px; height: 7px; border-radius: 50%; background: #52525b; } :where(.oq-root) .beacon .steps .d.ok { background: var(--oq-beacon-accent); } :where(.oq-root) .beacon .steps .d.run { background: #f5a524; }
+:where(.oq-root) .beacon .bacts { display: flex; gap: 8px; margin-top: 14px; }
+:where(.oq-root) .beacon .bbtn { border: 0; border-radius: 999px; height: 34px; padding: 0 14px; font: 600 13px var(--oq-font); background: #27272a; color: #f4f4f5; transition: transform var(--oq-spring-fast-dur) var(--oq-spring-fast); }
+:where(.oq-root) .beacon .bbtn.pri { background: var(--oq-beacon-accent); color: #0b0b0d; }
+:where(.oq-root) .beacon .x { position: absolute; top: 12px; right: 12px; border: 0; background: #27272a; color: #a1a1aa; width: 26px; height: 26px; border-radius: 50%; display: grid; place-items: center; }
+@container (max-width: 640px) {
+  .oq-islands .main { padding: 64px 14px 110px; }
+  :where(.oq-root) .beacon { top: 8px; }
+  :where(.oq-root) .beacon .bc-open { width: 350px; }
+}
+/* =====================================================================
+   SYMMETRIC SHELLS: content in a centred column; navigation is one centred island.
+   Top islands: brand left · nav pill centre · Beacon right.  Dock: nav pill bottom centre (same as phone) · Beacon top centre.
+   ===================================================================== */
+:where(.oq-root) .tabbar .tb-thumb { position: absolute; top: 5px; bottom: 5px; border-radius: 999px; background: var(--oq-accent); box-shadow: var(--oq-shadow-1); transition: left var(--oq-spring-fast-dur) var(--oq-spring-fast), width var(--oq-spring-fast-dur) var(--oq-spring-fast); z-index: 0; }
+:where(.oq-root) .tabbar button { position: relative; z-index: 1; }
+:where(.oq-root) .tabbar button.on { background: transparent !important; color: var(--oq-on-accent) !important; }
+:where(.oq-root) .brand-isl { display: none; position: absolute; top: 14px; left: 16px; z-index: 30; height: 44px; padding: 0 16px 0 8px; border-radius: 999px; background: var(--oq-surface-2); box-shadow: var(--oq-shadow-2);
+  align-items: center; gap: 10px; font: 650 15px var(--oq-font-display); letter-spacing: -.02em; }
+:where(.oq-root) .brand-isl .mark { width: 30px; height: 30px; border-radius: 50%; font-size: 13px; }
+@container (min-width: 641px) {
+  .oq-top .shell, .oq-dock .shell { grid-template-columns: 1fr; }
+  .oq-top .side, .oq-dock .side { display: none; }
+  .oq-top .brand-isl, .oq-dock .brand-isl { display: flex; }
+  .oq-top .main, .oq-dock .main { width: 100%; max-width: 1120px; margin: 0 auto; box-sizing: border-box; padding: 84px 28px 30px; }
+  .oq-dock .main { padding: 76px 28px 110px; }
+  .oq-top .tabbar, .oq-dock .tabbar { display: flex; position: absolute; left: 50%; transform: translateX(-50%); z-index: 30; gap: 2px; padding: 5px; border-radius: 999px; background: var(--oq-surface-2); box-shadow: var(--oq-shadow-2); }
+  .oq-top .tabbar { top: 14px; }
+  .oq-dock .tabbar { bottom: 20px; box-shadow: var(--oq-shadow-3); }
+  .oq-top .tabbar button, .oq-dock .tabbar button { border: 0; background: none; display: flex; align-items: center; gap: 8px; height: 34px; padding: 0 16px; border-radius: 999px; font-size: 13.5px; font-weight: 600; color: var(--oq-ink-2); transition: color .2s, transform var(--oq-spring-fast-dur) var(--oq-spring-fast); }
+  .oq-top .tabbar button:hover, .oq-dock .tabbar button:hover { color: var(--oq-ink); }
+  .oq-top .beacon { left: auto; right: 16px; transform: none; }
+  .oq-top .ph, .oq-dock .ph { padding-top: 6px; }
+}
+.oq-root:not(.oq-islands) .beacon { display: block; }
+.oq-root.oq-sidebar-only .beacon { display: none; }
+/* ---- Side island, collapsed: icons only, centred, no label space ---- */
+.oq-islands .side { width: 64px; padding: 10px; }
+.oq-islands .side:not(:hover):not(.pinned) { align-items: center; }
+.oq-islands .side:not(:hover):not(.pinned) .nav { width: 44px; justify-content: center; padding: 0; gap: 0; }
+.oq-islands .side:not(:hover):not(.pinned) :is(.lbl, .nav .n, .grp, .brand-name, .pin-btn, .foot span:not(.avatar), .foot .avatar + .avatar) { display: none; }
+.oq-islands .side:not(:hover):not(.pinned) .brand { padding: 4px 0 10px; justify-content: center; }
+.oq-islands .side:not(:hover):not(.pinned) .foot { padding: 6px 0; justify-content: center; }
+.oq-islands .side:not(:hover):not(.pinned) .grp { display: block !important; height: 1px; padding: 0; margin: 8px 10px; background: var(--oq-line); font-size: 0; opacity: 1; }
+.oq-islands .side .lbl { animation: lblIn .22s var(--oq-ease-in) both; }
+@keyframes lblIn { from { opacity: 0; transform: translateX(-4px); } }
+/* ---- Top nav pill: 4 items at rest; +N widens it to all; folds back a few seconds after you leave ---- */
+:where(.oq-root) .topnav { display: none; }
+@container (min-width: 641px) {
+  .oq-top .tabbar, .oq-dock .tabbar { display: none !important; }
+  .oq-top .topnav, .oq-dock .topnav { display: flex; position: absolute; left: 50%; transform: translateX(-50%); z-index: 30; padding: 5px; border-radius: 999px; background: var(--oq-surface-2); box-shadow: var(--oq-shadow-2);
+    overflow: hidden; white-space: nowrap; transition: width 520ms var(--oq-island-spring); }
+  .oq-top .topnav { top: 14px; }
+  .oq-dock .topnav { bottom: 20px; box-shadow: var(--oq-shadow-3); }
+}
+:where(.oq-root) .topnav .tb-thumb { position: absolute; top: 5px; bottom: 5px; border-radius: 999px; background: var(--oq-accent); box-shadow: var(--oq-shadow-1); transition: left var(--oq-spring-fast-dur) var(--oq-spring-fast), width var(--oq-spring-fast-dur) var(--oq-spring-fast); }
+:where(.oq-root) .topnav button { position: relative; z-index: 1; flex: none; border: 0; background: none; display: flex; align-items: center; gap: 8px; height: 34px; padding: 0 15px; border-radius: 999px; font-size: 13.5px; font-weight: 600; color: var(--oq-ink-2); transition: color .2s, transform var(--oq-spring-fast-dur) var(--oq-spring-fast), opacity .25s; }
+:where(.oq-root) .topnav button:hover { color: var(--oq-ink); }
+:where(.oq-root) .topnav button.on { color: var(--oq-on-accent); }
+:where(.oq-root) .topnav .more { color: var(--oq-ink-2); font: 600 12.5px var(--oq-font-mono); padding: 0 13px; }
+:where(.oq-root) .topnav .more span { font-family: var(--oq-font-mono); }
+:where(.oq-root) .topnav:not(.open) .extra:not(.keep) { opacity: 0; }
+:where(.oq-root) .topnav.open .more { opacity: 0; pointer-events: none; }
+/* =====================================================================
+   FIELD (.mo): ours, with Material's floating label in the border
+   ===================================================================== */
+:where(.oq-root) .mo .fl { position: absolute; left: 14px; top: 18px; color: var(--oq-ink-2); transform-origin: 0 0; transition: transform .2s var(--oq-ease-in), color .2s; pointer-events: none; white-space: nowrap; }
+/* outlined text field: label floats into a gap in the border */
+:where(.oq-root) .mo { position: relative; display: block; width: 100%; max-width: 260px; height: 52px; border-radius: 10px; box-shadow: inset 0 0 0 1px var(--oq-line); background: var(--oq-surface-1); cursor: text; transition: box-shadow .2s; }
+:where(.oq-root) .mo:hover { box-shadow: inset 0 0 0 1px var(--oq-ink-2); }
+:where(.oq-root) .mo:focus-within { box-shadow: inset 0 0 0 2px var(--oq-accent); }
+:where(.oq-root) .mo input { all: unset; position: absolute; inset: 0; padding: 0 14px; font: inherit; color: var(--oq-ink); box-sizing: border-box; width: 100%; }
+:where(.oq-root) .mo .fl { top: 16px; padding: 0 4px; margin-left: -4px; background: var(--oq-surface-1); }
+:where(.oq-root) .mo input:focus + .fl, :where(.oq-root) .mo input:not(:placeholder-shown) + .fl { transform: translateY(-24px) scale(.75); }
+:where(.oq-root) .mo input:focus + .fl { color: var(--oq-accent); }
+:where(.oq-root) .mf-help { font-size: .78em; color: var(--oq-ink-2); margin: 4px 0 0 14px; } :where(.oq-root) .mf-help.err { color: var(--oq-bad); }
+/* ---- Close: one standard button. 32 px circle, icon dead centre, inset equal to the container's padding ---- */
+:where(.oq-root) .xbtn { width: 32px; height: 32px; flex: none; border: 0; padding: 0; border-radius: 50%; display: grid; place-items: center; background: rgb(var(--oq-state) / .06); color: var(--oq-ink-2);
+  transition: background .15s, color .15s, transform var(--oq-spring-fast-dur) var(--oq-spring-fast); }
+:where(.oq-root) .xbtn:hover { background: rgb(var(--oq-state) / .12); color: var(--oq-ink); }
+:where(.oq-root) .xbtn .ico { width: 16px; height: 16px; stroke-width: 2; }
+:where(.oq-root) .beacon .x { top: 12px; right: 12px; width: 32px; height: 32px; transition: background .15s, transform var(--oq-spring-fast-dur) var(--oq-spring-fast); } :where(.oq-root) .beacon .x:hover { background: #3f3f46; color: #f4f4f5; }
+:where(.oq-root) .beacon .bc-open h4 { padding-right: 40px; }
+/* ---- Field: ours, with the label floating into the border (borrowed from Material's outlined field) ---- */
+:where(.oq-root) .mo { max-width: none; }
+:where(.oq-root) .mo.err { box-shadow: inset 0 0 0 1px var(--oq-bad); } :where(.oq-root) .mo.err .fl { color: var(--oq-bad) !important; } :where(.oq-root) .mo.err:focus-within { box-shadow: inset 0 0 0 2px var(--oq-bad); }
+:where(.oq-root) .mo .lead { position: absolute; left: 14px; top: 50%; transform: translateY(-50%); color: var(--oq-ink-2); }
+:where(.oq-root) .mo.has-lead input { padding-left: 40px; } :where(.oq-root) .mo.has-lead .fl { left: 40px; }
+:where(.oq-root) .mo.has-lead input:focus + .fl, :where(.oq-root) .mo.has-lead input:not(:placeholder-shown) + .fl { transform: translate(-26px, -24px) scale(.75); }
+:where(.oq-root) .mo kbd { position: absolute; right: 12px; top: 50%; transform: translateY(-50%); font: 11px var(--oq-font-mono); color: var(--oq-ink-2); border: 1px solid var(--oq-line); border-radius: 4px; padding: 1px 5px; }
+:where(.oq-root) .mo.sel { cursor: pointer; } :where(.oq-root) .mo.sel .val { position: absolute; left: 14px; top: 50%; transform: translateY(-50%); } :where(.oq-root) .mo.sel .fl { transform: translateY(-24px) scale(.75); } :where(.oq-root) .mo.sel .chev { position: absolute; right: 14px; top: 50%; transform: translateY(-50%); color: var(--oq-ink-2); }
+.oq-family-kids .mo { height: 56px; } .oq-family-dev .mo { height: 46px; } .oq-family-dev .mo .fl { top: 13px; } .oq-family-dev .mo input:focus + .fl, .oq-family-dev .mo input:not(:placeholder-shown) + .fl, .oq-family-dev .mo.sel .fl { transform: translateY(-21px) scale(.75); }
+.oq-family-dev .mo.has-lead input:focus + .fl, .oq-family-dev .mo.has-lead input:not(:placeholder-shown) + .fl { transform: translate(-26px, -21px) scale(.75); }
+/* =====================================================================
+   COMPONENTS
+   ===================================================================== */
+.oq-root button { font: inherit; color: inherit; cursor: pointer; }
+:where(.oq-root) .mono { font-family: var(--oq-font-mono); }
+:where(.oq-root) .ink2 { color: var(--oq-ink-2); }
+:where(.oq-root) .ico { width: 16px; height: 16px; stroke: currentColor; fill: none; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; flex: none; }
+.oq-family-kids .ico { width: 18px; height: 18px; stroke-width: 2; }
+/* buttons */
+:where(.oq-root) .btn { --h: var(--oq-target); height: var(--h); border: 0; border-radius: var(--oq-radius-full); padding: 0 16px; font-weight: 550; font-size: .95em; display: inline-flex; gap: 8px; align-items: center; justify-content: center; position: relative; isolation: isolate; white-space: nowrap;
+  transition: transform var(--oq-spring-fast-dur) var(--oq-spring-fast), box-shadow var(--oq-spring-fast-dur) var(--oq-spring-fast); }
+:where(.oq-root) .btn::after { content: ""; position: absolute; inset: 0; border-radius: inherit; background: rgb(var(--oq-state) / 0); transition: background .15s; z-index: -1; }
+:where(.oq-root) .btn:hover::after { background: rgb(var(--oq-state) / .08); }
+:where(.oq-root) .btn.fill { background: var(--oq-accent); color: var(--oq-on-accent); box-shadow: var(--oq-shadow-1); }
+:where(.oq-root) .btn.fill:hover { box-shadow: var(--oq-shadow-2); transform: translateY(-1px); }
+:where(.oq-root) .btn.fill:hover::after { background: transparent; }
+:where(.oq-root) .btn.tonal { background: var(--oq-surface-2); box-shadow: var(--oq-shadow-1); }
+:where(.oq-root) .btn.text { background: none; color: var(--oq-ink-2); }
+:where(.oq-root) .btn.danger { background: none; color: var(--oq-bad); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--oq-bad) 40%, transparent); }
+:where(.oq-root) .btn.icon { width: var(--h); padding: 0; }
+:where(.oq-root) .btn.sm { --h: calc(var(--oq-target) - 8px); padding: 0 12px; font-size: .88em; }
+:where(.oq-root) .btn.lg { --h: calc(var(--oq-target) + 10px); padding: 0 22px; font-size: 1.02em; }
+:where(.oq-root) .btn[disabled] { opacity: .45; pointer-events: none; }
+/* badges, chips, tags */
+:where(.oq-root) .badge { font: 500 11px/1 var(--oq-font-mono); padding: 4px 6px; border-radius: var(--oq-radius-xs); border: 1px solid var(--oq-line); background: var(--oq-surface-1); color: var(--oq-ink-2); white-space: nowrap; display: inline-flex; gap: 5px; align-items: center; }
+:where(.oq-root) .badge i { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+:where(.oq-root) .badge.ok { color: var(--oq-ok); } :where(.oq-root) .badge.warn { color: var(--oq-warn); } :where(.oq-root) .badge.bad { color: var(--oq-bad); } :where(.oq-root) .badge.info { color: var(--oq-info); }
+:where(.oq-root) .chip { height: calc(var(--oq-target) - 6px); padding: 0 12px; border-radius: var(--oq-radius-full); border: 1px solid var(--oq-line); background: var(--oq-surface-1); font-size: .9em; font-weight: 500; display: inline-flex; gap: 6px; align-items: center;
+  transition: transform var(--oq-spring-fast-dur) var(--oq-spring-fast), background .15s; }
+:where(.oq-root) .chip:hover { background: var(--oq-surface-2); }
+:where(.oq-root) .chip.on { background: rgb(var(--oq-state) / .1); border-color: transparent; font-weight: 600; }
+:where(.oq-root) .chip .x { opacity: .6; }
+/* fields */
+:where(.oq-root) .field { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+:where(.oq-root) .field label { font-size: .86em; font-weight: 500; }
+:where(.oq-root) .field .help { font-size: .8em; color: var(--oq-ink-2); }
+:where(.oq-root) .field .err { font-size: .8em; color: var(--oq-bad); }
+:where(.oq-root) .input { height: var(--oq-target); border-radius: var(--oq-radius-in); border: 1px solid var(--oq-line); background: var(--oq-surface-1); padding: 0 12px; display: flex; align-items: center; gap: 8px; color: var(--oq-ink); font: inherit; transition: box-shadow .15s, border-color .15s; }
+:where(.oq-root) .input input { all: unset; flex: 1; min-width: 0; font: inherit; color: inherit; }
+:where(.oq-root) .input input::placeholder { color: var(--oq-ink-2); }
+:where(.oq-root) .input:focus-within { border-color: var(--oq-accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--oq-accent) 22%, transparent); }
+:where(.oq-root) .input.is-err { border-color: var(--oq-bad); }
+:where(.oq-root) .input kbd { font: 11px var(--oq-font-mono); color: var(--oq-ink-2); border: 1px solid var(--oq-line); border-radius: 4px; padding: 1px 5px; }
+:where(.oq-root) .select { justify-content: space-between; cursor: pointer; }
+/* toggles */
+:where(.oq-root) .switch { width: 40px; height: 24px; border-radius: 999px; background: var(--oq-line); position: relative; border: 0; padding: 0; transition: background .2s; flex: none; }
+:where(.oq-root) .switch::after { content: ""; position: absolute; left: 3px; top: 3px; width: 18px; height: 18px; border-radius: 9px; background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.3); transition: transform var(--oq-spring-fast-dur) var(--oq-spring-fast), width var(--oq-spring-fast-dur) var(--oq-spring-fast); }
+/* press: the knob stretches toward where it will go (Apple-style), then settles */
+:where(.oq-root) .switch:active::after { width: 24px; } :where(.oq-root) .switch.on:active::after { transform: translateX(10px); }
+:where(.oq-root) .switch.on { background: var(--oq-accent); } :where(.oq-root) .switch.on::after { transform: translateX(16px); background: var(--oq-on-accent); }
+:where(.oq-root) .check { width: 18px; height: 18px; border-radius: 5px; box-shadow: inset 0 0 0 1.5px var(--oq-ink-2); display: inline-grid; place-items: center; border: 0; background: none; padding: 0; flex: none; transition: transform var(--oq-spring-fast-dur) var(--oq-spring-fast); }
+:where(.oq-root) .check.on { background: var(--oq-accent); box-shadow: none; }
+:where(.oq-root) .check.on::after { content: ""; width: 9px; height: 5px; border-left: 2px solid var(--oq-on-accent); border-bottom: 2px solid var(--oq-on-accent); transform: rotate(-45deg) translate(1px,-1px); }
+:where(.oq-root) .radio { width: 18px; height: 18px; border-radius: 50%; box-shadow: inset 0 0 0 1.5px var(--oq-ink-2); display: inline-grid; place-items: center; border: 0; background: none; padding: 0; flex: none; transition: transform var(--oq-spring-fast-dur) var(--oq-spring-fast); }
+:where(.oq-root) .radio::after { content: ""; width: 9px; height: 9px; border-radius: 50%; background: var(--oq-accent); transform: scale(0); transition: transform var(--oq-spring-fast-dur) var(--oq-spring-fast); }
+:where(.oq-root) .radio.on { box-shadow: inset 0 0 0 1.5px var(--oq-accent); } :where(.oq-root) .radio.on::after { transform: scale(1); }
+:where(.oq-root) .row-ctl { display: flex; align-items: center; gap: 10px; font-size: .92em; }
+:where(.oq-root) .seg2 { display: inline-flex; padding: 3px; border-radius: 999px; background: var(--oq-surface-0); box-shadow: inset 0 0 0 1px var(--oq-line); position: relative; }
+:where(.oq-root) .seg2 button { border: 0; background: none; height: calc(var(--oq-target) - 8px); padding: 0 14px; border-radius: 999px; font-size: .9em; font-weight: 500; color: var(--oq-ink-2); position: relative; z-index: 1; transition: color .2s; }
+:where(.oq-root) .seg2 button.on { color: var(--oq-ink); }
+:where(.oq-root) .seg2 > i { position: absolute; top: 3px; bottom: 3px; border-radius: 999px; background: var(--oq-surface-2); box-shadow: var(--oq-shadow-1); transition: left var(--oq-spring-fast-dur) var(--oq-spring-fast), width var(--oq-spring-fast-dur) var(--oq-spring-fast); }
+:where(.oq-root) .slider { -webkit-appearance: none; appearance: none; width: 100%; height: 6px; border-radius: 3px; background: linear-gradient(var(--oq-accent), var(--oq-accent)) 0/var(--v, 40%) 100% no-repeat, var(--oq-line); }
+:where(.oq-root) .slider::-webkit-slider-thumb { -webkit-appearance: none; width: 20px; height: 20px; border-radius: 50%; background: var(--oq-surface-2); box-shadow: var(--oq-shadow-2), 0 0 0 1px var(--oq-line); transition: transform var(--oq-spring-fast-dur) var(--oq-spring-fast); }
+:where(.oq-root) .slider:active::-webkit-slider-thumb { transform: scale(1.15); }
+:where(.oq-root) .slider::-moz-range-thumb { width: 20px; height: 20px; border-radius: 50%; background: var(--oq-surface-2); border: 0; box-shadow: var(--oq-shadow-2); }
+/* tabs */
+:where(.oq-root) .tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--oq-line); position: relative; }
+:where(.oq-root) .tabs button { border: 0; background: none; padding: 10px 12px; font-size: .92em; font-weight: 500; color: var(--oq-ink-2); }
+:where(.oq-root) .tabs button.on { color: var(--oq-ink); }
+:where(.oq-root) .tabs > i { position: absolute; bottom: -1px; height: 2px; border-radius: 2px; background: var(--oq-accent); transition: left var(--oq-spring-fast-dur) var(--oq-spring-fast), width var(--oq-spring-fast-dur) var(--oq-spring-fast); }
+/* surfaces */
+:where(.oq-root) .card { background: var(--oq-surface-1); border-radius: var(--oq-radius-card); box-shadow: var(--oq-shadow-1); display: flex; flex-direction: column; min-width: 0; }
+:where(.oq-root) .card-h { display: flex; align-items: center; gap: 10px; padding: 14px 16px 10px; }
+:where(.oq-root) .card-h h3 { margin: 0; font-size: 1.02em; font-weight: 600; letter-spacing: -.01em; }
+:where(.oq-root) .card-h .sp { flex: 1; }
+:where(.oq-root) .card-b { padding: 0 16px 14px; }
+:where(.oq-root) .src { font: 11.5px var(--oq-font-mono); color: var(--oq-ink-2); border-top: 1px solid var(--oq-line-2); padding: 9px 16px; display: flex; gap: 8px; align-items: center; margin-top: auto; }
+:where(.oq-root) .src::before { content: "$"; opacity: .6; }
+:where(.oq-root) .src.note::before { content: "↳"; }
+:where(.oq-root) .src .cp { margin-left: auto; border: 0; background: rgb(var(--oq-state) / .05); color: var(--oq-ink-2); font: 500 11px var(--oq-font-mono); height: 24px; padding: 0 10px; border-radius: 999px; }
+:where(.oq-root) .src .cp:hover { background: rgb(var(--oq-state) / .08); }
+/* tables and lists */
+:where(.oq-root) .tbl { width: 100%; border-collapse: collapse; font-size: .92em; }
+:where(.oq-root) .tbl th { text-align: left; font: 500 11px var(--oq-font-mono); color: var(--oq-ink-2); text-transform: uppercase; letter-spacing: .06em; padding: 8px 16px; border-bottom: 1px solid var(--oq-line); }
+:where(.oq-root) .tbl td { padding: 10px 16px; border-bottom: 1px solid var(--oq-line-2); }
+:where(.oq-root) .tbl tr:last-child td { border-bottom: 0; }
+:where(.oq-root) .tbl tbody tr { transition: background .12s; } :where(.oq-root) .tbl tbody tr:hover { background: rgb(var(--oq-state) / .04); }
+:where(.oq-root) .tbl .num { text-align: right; font-family: var(--oq-font-mono); font-variant-numeric: tabular-nums; }
+/* stats */
+:where(.oq-root) .stats { display: grid; grid-template-columns: repeat(4, 1fr); }
+:where(.oq-root) .stats > div { padding: 14px 16px; } :where(.oq-root) .stats > div + div { border-left: 1px solid var(--oq-line-2); }
+:where(.oq-root) .stats b { display: block; font-size: 1.85em; font-weight: 600; letter-spacing: -.035em; font-variant-numeric: tabular-nums; line-height: 1.15; }
+:where(.oq-root) .stats span { font: 11.5px var(--oq-font-mono); color: var(--oq-ink-2); }
+:where(.oq-root) .delta { font: 500 11px var(--oq-font-mono); margin-left: 6px; }
+:where(.oq-root) .delta.up { color: var(--oq-ok); } :where(.oq-root) .delta.down { color: var(--oq-bad); }
+/* progress, skeleton */
+:where(.oq-root) .prog { height: 8px; border-radius: 4px; background: var(--oq-line); overflow: hidden; }
+:where(.oq-root) .prog > i { display: block; height: 100%; border-radius: 4px; background: var(--oq-accent); transition: width .5s var(--oq-ease-in); }
+:where(.oq-root) .prog.indet > i { width: 30%; animation: indet 1.4s var(--oq-ease-in) infinite; }
+@keyframes indet { from { transform: translateX(-100%); } to { transform: translateX(340%); } }
+:where(.oq-root) .skel { height: 12px; border-radius: 6px; background: linear-gradient(90deg, var(--oq-line-2), var(--oq-line), var(--oq-line-2)); background-size: 200% 100%; animation: skel 1.6s linear infinite; }
+@keyframes skel { from { background-position: 100% 0; } to { background-position: -100% 0; } }
+/* overlays */
+:where(.oq-root) .menu { position: absolute; z-index: 40; background: var(--oq-surface-2); border-radius: var(--oq-radius-menu); box-shadow: var(--oq-shadow-3); padding: 6px; min-width: 220px; }
+:where(.oq-root) .menu[hidden] { display: none; }
+:where(.oq-root) .menu .mi { display: flex; align-items: center; gap: 10px; width: 100%; border: 0; background: none; text-align: left; padding: 8px 10px; border-radius: 8px; font-size: .93em; }
+:where(.oq-root) .menu .mi:hover { background: rgb(var(--oq-state) / .08); }
+:where(.oq-root) .menu .mi kbd { margin-left: auto; font: 11px var(--oq-font-mono); color: var(--oq-ink-2); }
+:where(.oq-root) .menu .mi.danger { color: var(--oq-bad); }
+:where(.oq-root) .menu hr { border: 0; border-top: 1px solid var(--oq-line-2); margin: 6px 4px; }
+:where(.oq-root) .menu .lab { font: 500 10.5px var(--oq-font-mono); color: var(--oq-ink-2); text-transform: uppercase; letter-spacing: .08em; padding: 6px 10px 4px; }
+:where(.oq-root) .tip { position: absolute; z-index: 45; background: var(--oq-ink); color: var(--oq-surface-1); font-size: 12px; padding: 5px 8px; border-radius: 6px; white-space: nowrap; pointer-events: none; }
+:where(.oq-root) .tip kbd { font: 11px var(--oq-font-mono); opacity: .7; margin-left: 6px; }
+:where(.oq-root) .toast { position: absolute; z-index: 50; left: 50%; bottom: 20px; transform: translateX(-50%); background: var(--oq-surface-3); box-shadow: var(--oq-shadow-3); border-radius: 12px; padding: 10px 10px 10px 14px; display: flex; gap: 12px; align-items: center; font-size: .92em; white-space: nowrap; }
+:where(.oq-root) .toast[hidden] { display: none; }
+:where(.oq-root) .scrim { position: absolute; inset: 0; z-index: 60; background: rgba(0,0,0,.42); display: grid; place-items: center; }
+:where(.oq-root) .scrim[hidden] { display: none; }
+:where(.oq-root) .dialog { width: min(420px, calc(100% - 32px)); background: var(--oq-surface-3); border-radius: calc(var(--oq-radius-card) + 4px); box-shadow: var(--oq-shadow-3); padding: 20px; }
+:where(.oq-root) .dialog h3 { margin: 0 0 6px; font-size: 1.15em; }
+:where(.oq-root) .dialog p { margin: 0 0 18px; color: var(--oq-ink-2); line-height: 1.5; }
+:where(.oq-root) .dialog .acts { display: flex; justify-content: flex-end; gap: 8px; }
+:where(.oq-root) .sheet { position: absolute; z-index: 61; left: 0; right: 0; bottom: 0; background: var(--oq-surface-1); border-radius: 26px 26px 0 0; box-shadow: var(--oq-shadow-3); padding: 10px 20px 24px; }
+:where(.oq-root) .sheet[hidden] { display: none; }
+:where(.oq-root) .grab { width: 38px; height: 5px; border-radius: 3px; background: var(--oq-line); margin: 0 auto 14px; }
+:where(.oq-root) .empty { text-align: center; padding: 26px 16px; color: var(--oq-ink-2); }
+:where(.oq-root) .empty b { display: block; color: var(--oq-ink); margin: 10px 0 4px; font-size: 1.02em; }
+:where(.oq-root) .empty .ring { width: 44px; height: 44px; margin: 0 auto; border-radius: 50%; display: grid; place-items: center; background: rgb(var(--oq-state) / .07); }
+:where(.oq-root) .avatar { width: 28px; height: 28px; border-radius: 50%; display: inline-grid; place-items: center; font-size: 11.5px; font-weight: 600; color: #fff; flex: none; }
+/* =====================================================================
+   SHELL: sidebar desktop; tab bar on narrow
+   ===================================================================== */
+:where(.oq-root) .shell { flex: 1; display: grid; grid-template-columns: 228px 1fr; min-height: 0; }
+:where(.oq-root) .side { background: var(--oq-surface-1); box-shadow: var(--oq-shadow-1); display: flex; flex-direction: column; padding: 12px 10px; gap: 2px; z-index: 2; }
+:where(.oq-root) .brand { display: flex; align-items: center; gap: 10px; padding: 6px 8px 14px; font-weight: 650; letter-spacing: -.02em; font-size: 1.05em; }
+:where(.oq-root) .mark { width: 28px; height: 28px; border-radius: 8px; background: var(--oq-accent); color: var(--oq-on-accent); display: grid; place-items: center; font: 700 13px var(--oq-font-mono); }
+.oq-family-kids .mark { border-radius: 50%; width: 34px; height: 34px; font-size: 16px; }
+:where(.oq-root) .nav { display: flex; align-items: center; gap: 10px; border: 0; background: none; height: var(--oq-target); padding: 0 10px; border-radius: 10px; font-size: .93em; font-weight: 500; color: var(--oq-ink-2); text-align: left; transition: background .15s, transform var(--oq-spring-fast-dur) var(--oq-spring-fast); }
+:where(.oq-root) .nav:hover { background: rgb(var(--oq-state) / .06); color: var(--oq-ink); }
+:where(.oq-root) .nav.on { background: rgb(var(--oq-state) / .1); color: var(--oq-ink); font-weight: 600; }
+:where(.oq-root) .nav .n { margin-left: auto; font: 11px var(--oq-font-mono); color: var(--oq-ink-2); }
+:where(.oq-root) .side .grp { font: 500 10.5px var(--oq-font-mono); color: var(--oq-ink-2); text-transform: uppercase; letter-spacing: .08em; padding: 14px 10px 6px; }
+:where(.oq-root) .side .foot { margin-top: auto; display: flex; align-items: center; gap: 10px; padding: 8px; font-size: .88em; }
+:where(.oq-root) .main { min-width: 0; overflow: auto; padding: 22px 26px 30px; display: flex; flex-direction: column; gap: 16px; }
+:where(.oq-root) .main > * { flex-shrink: 0; }
+:where(.oq-root) .ph { display: flex; align-items: flex-end; gap: 12px; flex-wrap: wrap; }
+:where(.oq-root) .ph h1 { margin: 0; font-size: var(--oq-title); letter-spacing: -.035em; font-weight: 650; line-height: 1.1; }
+:where(.oq-root) .ph .sub { font: 12.5px var(--oq-font-mono); color: var(--oq-ink-2); margin-top: 6px; }
+:where(.oq-root) .ph .sp { flex: 1; }
+:where(.oq-root) .ph .acts { display: flex; gap: 8px; }
+:where(.oq-root) .grid { display: grid; gap: 16px; }
+:where(.oq-root) .g-2 { grid-template-columns: 1.6fr 1fr; } :where(.oq-root) .g-3 { grid-template-columns: repeat(3, 1fr); } :where(.oq-root) .g-2e { grid-template-columns: 1fr 1fr; }
+:where(.oq-root) .tabbar { display: none; }
+@container (max-width: 640px) {
+  :where(.oq-root) .shell { grid-template-columns: 1fr; }
+  :where(.oq-root) .side { display: none; }
+  :where(.oq-root) .main { padding: 14px 14px 110px; }
+  :where(.oq-root) .g-2, :where(.oq-root) .g-3, :where(.oq-root) .g-2e { grid-template-columns: 1fr; }
+  :where(.oq-root) .stats { grid-template-columns: 1fr 1fr; }
+  :where(.oq-root) .stats > div:nth-child(3) { border-left: 0; }
+  :where(.oq-root) .stats > div:nth-child(n+3) { border-top: 1px solid var(--oq-line-2); }
+  :where(.oq-root) .ph .acts .hide-n { display: none; }
+  :where(.oq-root) .tabbar { display: flex; position: absolute; left: 50%; bottom: 22px; transform: translateX(-50%); z-index: 30; gap: 2px; padding: 5px; border-radius: 999px; background: var(--oq-surface-2); box-shadow: var(--oq-shadow-2); }
+  :where(.oq-root) .tabbar button { border: 0; background: none; display: flex; flex-direction: column; align-items: center; gap: 3px; padding: 8px 16px; border-radius: 999px; font-size: 11px; font-weight: 600; color: var(--oq-ink-2); transition: transform var(--oq-spring-fast-dur) var(--oq-spring-fast), background .2s, color .2s; }
+  :where(.oq-root) .tabbar button.on { background: var(--oq-accent); color: var(--oq-on-accent); }
+  :where(.oq-root) .hide-n { display: none !important; }
+}
+:where(.oq-root) .wrap-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }

@@ -97,7 +97,7 @@ def test_svgs_render_on_github(name):
 
 def test_page_is_in_the_nav_and_reads_the_one_data_file():
     js = (ROOT / "docs" / "site" / "site.js").read_text()
-    assert '["engine.html", "Engine"]' in js
+    assert '["engine.html", "Engine"' in js
     html = PAGE.read_text()
     assert '"bench/engine-informal.json"' in html
     assert "prefers-reduced-motion" in html

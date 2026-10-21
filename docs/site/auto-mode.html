@@ -1,52 +1,52 @@
 <!doctype html>
-<html lang="en" data-theme="light">
+<html lang="en" class="oq-root oq-light oq-family-dev oq-top" data-theme="light">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>How device="auto" decides · omxcore</title>
 <meta name="description" content="What omxcore does when you call compute(device=&quot;auto&quot;): the rules in order, a session replay you can change, the measured results, and the limits.">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="omxqua/src/fonts.css">
+<link rel="stylesheet" href="omxqua/src/tokens.css">
+<link rel="stylesheet" href="omxqua/src/components.css">
 <link rel="stylesheet" href="site.css">
+<script src="omxqua/src/omxqua.js" defer></script>
 <script src="site.js"></script>
 <style>
-/* page-local: device colours come from the shared tokens (cpu = omxcore blue, gpu = accent, auto = green) */
-:root { --d-cpu: var(--mx); --d-gpu: var(--accent); --d-auto: var(--green); }
+/* device colours (--d-cpu, --d-gpu, --d-auto) come from site.css */
 .ctl { display: grid; grid-template-columns: 150px minmax(0, 1fr); gap: 6px 14px; align-items: center; margin: 0 0 10px; }
 .ctl > .label { padding-top: 2px; }
 .ctl .btns { margin: 0; }
-.ctl .btn { padding: 7px 11px; }
-.ctl input[type=range] { width: min(100%, 360px); accent-color: var(--accent); }
-.ctl .val { font: 700 13px var(--font-mono); color: var(--text); margin-left: 10px; }
+.ctl .chip { padding: 7px 11px; }
+.ctl input[type=range] { width: min(100%, 360px); accent-color: var(--oq-accent); }
+.ctl .val { font: 700 13px var(--oq-font-mono); color: var(--oq-ink); margin-left: 10px; }
 .trace { list-style: none; margin: 0; padding: 0; }
-.trace li { display: grid; grid-template-columns: 22px minmax(0, 1fr); gap: 10px; padding: 9px 0; border-bottom: 1px solid var(--border); }
+.trace li { display: grid; grid-template-columns: 22px minmax(0, 1fr); gap: 10px; padding: 9px 0; border-bottom: 1px solid var(--oq-line-2); }
 .trace li:last-child { border-bottom: 0; }
-.trace .mark { font: 700 12px var(--font-mono); text-align: center; padding-top: 1px; color: var(--text-dim); }
-.trace li.pass .mark { color: var(--green); } .trace li.stop .mark { color: var(--accent); }
+.trace .ck { font: 700 12px var(--oq-font-mono); text-align: center; padding-top: 1px; color: var(--oq-ink-2); }
+.trace li.pass .ck { color: var(--oq-ok); } .trace li.stop .ck { color: var(--oq-ink); }
 .trace li.skip { opacity: .5; }
-.trace b { color: var(--text); font-weight: 600; }
-.trace .why { font-size: 13px; color: var(--text-dim); display: block; }
-.verdict { padding: 14px 16px; border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: var(--radius-sm); background: var(--surface-2); margin: 0 0 12px; }
-.verdict .big { font: 700 22px var(--font-mono); color: var(--text); }
+.trace b { color: var(--oq-ink); font-weight: 600; }
+.trace .why { font-size: 13px; color: var(--oq-ink-2); display: block; }
+.verdict { padding: 14px 16px; border: 1px solid var(--oq-line-2); border-left: 3px solid var(--oq-ink); border-radius: var(--oq-radius-in); background: var(--oq-surface-2); margin: 0 0 12px; }
+.verdict .big { font: 700 22px var(--oq-font-mono); color: var(--oq-ink); }
 .verdict .big i { display: inline-block; width: 11px; height: 11px; border-radius: 50%; margin-right: 8px; vertical-align: 0; }
-.cost { display: grid; grid-template-columns: 1fr auto; gap: 2px 14px; font: 13px var(--font-mono); margin: 8px 0 0; }
-.cost span:nth-child(even) { text-align: right; color: var(--text); }
+.cost { display: grid; grid-template-columns: 1fr auto; gap: 2px 14px; font: 13px var(--oq-font-mono); margin: 8px 0 0; }
+.cost span:nth-child(even) { text-align: right; color: var(--oq-ink); }
 .sub { font-size: 13.5px; }
-.callout { border: 1px solid var(--border-hi); border-radius: var(--radius-sm); padding: 12px 16px; background: var(--surface); }
+.callout { border: 1px solid var(--oq-line); border-radius: var(--oq-radius-in); padding: 12px 16px; background: var(--oq-surface-1); }
 .callout h3 { margin: 0 0 4px; font-size: 15px; }
 .callout p { margin: 4px 0; font-size: 14px; }
-.callout .chk { font: 12px var(--font-mono); color: var(--text-dim); }
+.callout .chk { font: 12px var(--oq-font-mono); color: var(--oq-ink-2); }
 table.t td.nowrap { white-space: nowrap; }
 .sw { display: inline-block; width: 10px; height: 10px; margin-right: 6px; vertical-align: -1px; }
 main, .grid > *, .card, .card-b { min-width: 0; }
-.tbl { overflow-x: auto; }
+.tblwrap { overflow-x: auto; }
 @media (max-width: 820px) { .ctl { grid-template-columns: minmax(0, 1fr); } .verdict .big { font-size: 18px; } }
 </style>
 </head>
 <body>
-<div class="shell">
-<nav class="side"></nav>
-<main>
+<div class="screen">
+<main class="main" id="main">
 
   <span class="kick">device="auto" · omxcore 0.6.0</span>
   <h1>How <code style="font-size:.8em">device="auto"</code> decides</h1>
@@ -55,7 +55,7 @@ main, .grid > *, .card, .card-b { min-width: 0; }
 
   <h2>1 · The decision, rule by rule</h2>
   <div class="card">
-    <div class="card-h">Replay the planner · <span style="text-transform:none;letter-spacing:0;font-family:var(--font-sans);color:var(--text-dim)">prices use the built-in default fits, what you get before <code>mx.calibrate()</code></span></div>
+    <div class="card-h">Replay the planner · <span style="text-transform:none;letter-spacing:0;font-family:var(--oq-font);color:var(--oq-ink-2)">prices use the built-in default fits, what you get before <code>mx.calibrate()</code></span></div>
     <div class="card-b">
       <div class="ctl"><span class="label">Query shape</span><div class="btns" id="c-shape" role="group" aria-label="Query shape"></div></div>
       <div class="ctl"><span class="label">Rows scanned</span><div><div class="btns" id="c-rows" role="group" aria-label="Rows scanned"></div><input type="range" id="c-rows-r" min="4" max="8.6" step="0.01" aria-label="Rows scanned, log scale"><span class="val" id="c-rows-v"></span></div></div>
@@ -75,6 +75,7 @@ main, .grid > *, .card, .card-b { min-width: 0; }
         </div>
       </div>
     </div>
+    <div class="src note">auto_mode.py · every threshold on this page is read from the code</div>
   </div>
 
   <h3 style="margin-top:26px">The same session, five queries in a row</h3>
@@ -82,8 +83,10 @@ main, .grid > *, .card, .card-b { min-width: 0; }
   <div class="card"><div class="card-b">
     <div class="legend" id="tl-legend"></div>
     <div class="chart" id="timeline"></div>
-    <div class="tbl"><table class="t" style="margin-top:12px;min-width:520px"><thead><tr><th>#</th><th>Device plan</th><th>Inside the plan</th><th class="r">Starts at</th></tr></thead><tbody id="session-rows"></tbody></table></div>
-  </div></div>
+    <div class="tblwrap"><table class="tbl" style="margin-top:12px;min-width:520px"><thead><tr><th>#</th><th>Device plan</th><th>Inside the plan</th><th class="r">Starts at</th></tr></thead><tbody id="session-rows"></tbody></table></div>
+  </div>
+  <div class="src note">auto_mode.py · the same rules, five queries in a row</div>
+  </div>
 
   <h3>The rules, and where they live</h3>
   <ol class="sub">
@@ -108,9 +111,10 @@ main, .grid > *, .card, .card-b { min-width: 0; }
       <div class="btns" id="m-view" role="group" aria-label="View"></div>
       <div class="legend" id="m-legend"></div>
       <div class="chart" id="m-chart"><div class="status">loading benchmark files…</div></div>
-      <details><summary>Data table</summary><div style="overflow-x:auto"><table class="t" id="m-table"></table></div></details>
+      <details><summary>Data table</summary><div style="overflow-x:auto"><table class="tbl" id="m-table"></table></div></details>
       <p class="sub" id="m-note"></p>
     </div>
+    <div class="src note">bench/final-sf1.csv · final-sf10.csv · engine-sf10.csv · m2s-engine.csv</div>
   </div>
 
   <h3 style="margin-top:30px">Co-processing: both devices at once</h3>
@@ -120,15 +124,17 @@ main, .grid > *, .card, .card-b { min-width: 0; }
       <div class="card-b">
         <div class="legend" id="cp-legend"></div>
         <div class="chart" id="cp-chart"><div class="status">loading benchmark files…</div></div>
-        <details><summary>Data table</summary><table class="t" id="cp-table"></table></details>
+        <details><summary>Data table</summary><table class="tbl" id="cp-table"></table></details>
       </div>
+      <div class="src note">bench/auto-coproc.json</div>
     </div>
     <div class="card">
       <div class="card-h" id="ss-title">One session</div>
       <div class="card-b">
-        <div class="tbl"><table class="t" id="ss-table"><tr><td class="status">loading benchmark files…</td></tr></table></div>
+        <div class="tblwrap"><table class="tbl" id="ss-table"><tr><td class="status">loading benchmark files…</td></tr></table></div>
         <p class="sub" id="ss-note"></p>
       </div>
+      <div class="src note">bench/auto-coproc.json</div>
     </div>
   </div>
   <p class="sub" id="cp-note"></p>
@@ -348,7 +354,7 @@ function simulate(cfg) {
 
 function btnGroup(id, items, key, onChange, labelOf = (x) => x[1]) {
   const el = $(id);
-  el.innerHTML = items.map((it, i) => `<button class="btn" type="button" data-i="${i}" aria-pressed="false">${labelOf(it)}</button>`).join("");
+  el.innerHTML = items.map((it, i) => `<button class="chip" type="button" data-i="${i}" aria-pressed="false">${labelOf(it)}</button>`).join("");
   el.onclick = (e) => { const b = e.target.closest("button"); if (!b) return; onChange(items[+b.dataset.i][0]); render(); };
   return () => [...el.children].forEach((b, i) => { const on = items[i][0] === S[key]; b.classList.toggle("on", on); b.setAttribute("aria-pressed", on); });
 }
@@ -366,13 +372,13 @@ $("c-gap").oninput = (e) => { S.gap = +e.target.value; render(); };
 function laneChart(sim) {
   const W = 760, H = 168, x0 = 56, x1 = W - 10, total = sim.q[4].e * 1.04 || 1, X = (t) => x0 + (t / total) * (x1 - x0);
   const lanes = [["CPU", 36], ["link", 76], ["GPU", 116]];
-  const c = { cpu: cssVar("--d-cpu"), gpu: cssVar("--d-gpu"), link: cssVar("--yellow"), dim: cssVar("--border-hi"), text: cssVar("--text"), line: cssVar("--border") };
+  const c = { cpu: cssVar("--d-cpu"), gpu: cssVar("--d-gpu"), link: cssVar("--oq-warn"), dim: cssVar("--oq-line"), text: cssVar("--oq-ink"), line: cssVar("--oq-line-2") };
   const s = svg("svg", { viewBox: `0 0 ${W} ${H}`, width: W, height: H, role: "img", "aria-label": "Timeline of five queries on the CPU, the link and the GPU" });
-  lanes.forEach(([n, y]) => { s.appendChild(svg("rect", { x: x0, y: y - 14, width: x1 - x0, height: 28, rx: 3, fill: cssVar("--surface-2") })); s.appendChild(svg("text", { x: 8, y: y + 4 }, n)); });
+  lanes.forEach(([n, y]) => { s.appendChild(svg("rect", { x: x0, y: y - 14, width: x1 - x0, height: 28, rx: 3, fill: cssVar("--oq-surface-2") })); s.appendChild(svg("text", { x: 8, y: y + 4 }, n)); });
   const block = (t0, t1, y, fill, tip, label, op = 1) => {
     const w = Math.max(2, X(t1) - X(t0)), r = svg("rect", { x: X(t0), y: y - 10, width: w, height: 20, rx: 2, fill, opacity: op });
     hover(r, tip); s.appendChild(r);
-    if (label && w > 22) s.appendChild(svg("text", { x: X(t0) + 4, y: y + 3.5, fill: "#fff", style: "fill:#fff;font-weight:700" }, label));
+    if (label && w > 22) s.appendChild(svg("text", { x: X(t0) + 4, y: y + 3.5, style: `fill:${textOn(fill)};font-weight:700` }, label));
   };
   sim.q.forEach((q) => {
     block(q.s, q.e, 36, q.d.device === "gpu" ? c.gpu : c.cpu, `<b>Query ${q.k}</b> · ${q.d.device === "gpu" ? "GPU plan" : "CPU plan"}<br>${q.inner.text}<br>est. ${ms1(q.e - q.s)}`, "Q" + q.k);
@@ -394,8 +400,8 @@ function laneChart(sim) {
   }
   [0, total / 2, total].forEach((t) => s.appendChild(svg("text", { x: X(t), y: H - 6, "text-anchor": t === 0 ? "start" : t === total ? "end" : "middle" }, ms1(t))));
   $("timeline").replaceChildren(s);
-  $("tl-legend").innerHTML = [["--d-cpu", "CPU plan"], ["--d-gpu", "GPU plan / GPU share"], ["--yellow", "column copy over the link"], ["--border-hi", "GPU start-up"]]
-    .map(([v, n]) => `<span><i class="sq" style="background:var(${v})"></i>${n}</span>`).join("") + `<span><i class="sq" style="border:1px dashed var(--border-hi)"></i>${K.IDLE_BEFORE_BACKGROUND_S * 1000} ms idle first</span>`;
+  $("tl-legend").innerHTML = [["--d-cpu", "CPU plan"], ["--d-gpu", "GPU plan / GPU share"], ["--oq-warn", "column copy over the link"], ["--oq-line", "GPU start-up"]]
+    .map(([v, n]) => `<span><i class="sq" style="background:var(${v})"></i>${n}</span>`).join("") + `<span><i class="sq" style="border:1px dashed var(--oq-line)"></i>${K.IDLE_BEFORE_BACKGROUND_S * 1000} ms idle first</span>`;
 }
 
 function render() {
@@ -405,7 +411,7 @@ function render() {
   $("c-gap-v").textContent = S.gap + " ms";
   $("c-groups-row").style.display = S.shape === "groupby" ? "" : "none";
   const sim = simulate(S), q = sim.q[S.which - 1], d = q.d;
-  $("trace").innerHTML = d.steps.map((st) => `<li class="${st.state}"><span class="mark">${st.state === "pass" ? "✓" : st.state === "stop" ? "■" : "·"}</span><div><b>${st.title}</b><span class="why">${st.state === "skip" ? "not reached" : st.state === "stop" ? "stops here: " + st.why : st.why}</span></div></li>`).join("");
+  $("trace").innerHTML = d.steps.map((st) => `<li class="${st.state}"><span class="ck">${st.state === "pass" ? "✓" : st.state === "stop" ? "■" : "·"}</span><div><b>${st.title}</b><span class="why">${st.state === "skip" ? "not reached" : st.state === "stop" ? "stops here: " + st.why : st.why}</span></div></li>`).join("");
   const col = d.device === "gpu" ? "--d-gpu" : "--d-cpu";
   const e = d.est;
   $("verdict").innerHTML = `<div class="big"><i style="background:var(${col})"></i>auto → ${d.device}</div><div class="sub">reason: <span class="mono">${d.reason}</span></div>` +
@@ -444,11 +450,11 @@ function drawMeasured() {
   if (!M) return;
   const rows = MS.sf === "sf10" ? M.sf10 : MS.sf === "sf1m" ? M.sf1med : M.sf1runs[+MS.sf.slice(3) - 1];
   const items = [["sf10", "SF10"], ["sf1m", "SF1 · median of 4 runs"], ...M.sf1runs.map((_, i) => ["run" + (i + 1), "SF1 · run " + (i + 1)])];
-  const grp = (id, list, key) => { $(id).innerHTML = list.map(([k, n]) => `<button class="btn${MS[key] === k ? " on" : ""}" type="button" data-k="${k}" aria-pressed="${MS[key] === k}">${n}</button>`).join(""); $(id).onclick = (e) => { const b = e.target.closest("button"); if (b) { MS[key] = b.dataset.k; drawMeasured(); } }; };
+  const grp = (id, list, key) => { $(id).innerHTML = list.map(([k, n]) => `<button class="chip${MS[key] === k ? " on" : ""}" type="button" data-k="${k}" aria-pressed="${MS[key] === k}">${n}</button>`).join(""); $(id).onclick = (e) => { const b = e.target.closest("button"); if (b) { MS[key] = b.dataset.k; drawMeasured(); } }; };
   grp("m-sf", items, "sf"); grp("m-view", [["ratio", "Ratio to the better device"], ["ms", "Milliseconds, all three"]], "view");
 
   const n = rows.length, W = 760, top = 22, rh = 20, H = top + n * rh + 34, x0 = 44, x1 = W - 120;
-  const c = { cpu: cssVar("--d-cpu"), gpu: cssVar("--d-gpu"), auto: cssVar("--d-auto"), slow: cssVar("--slow"), grid: cssVar("--border"), text: cssVar("--text") };
+  const c = { cpu: cssVar("--d-cpu"), gpu: cssVar("--d-gpu"), auto: cssVar("--d-auto"), slow: cssVar("--slow"), grid: cssVar("--oq-line-2"), text: cssVar("--oq-ink") };
   const s = svg("svg", { viewBox: `0 0 ${W} ${H}`, width: W, height: H, role: "img", "aria-label": "Per-query comparison of auto with cpu and gpu" });
   let X;
   if (MS.view === "ratio") {
@@ -463,7 +469,7 @@ function drawMeasured() {
     for (let p = Math.ceil(lo); p <= hi; p++) { s.appendChild(svg("line", { x1: X(10 ** p), x2: X(10 ** p), y1: top - 6, y2: H - 28, stroke: c.grid })); s.appendChild(svg("text", { x: X(10 ** p), y: H - 14, "text-anchor": "middle" }, fmtMs(10 ** p))); }
   }
   const mark = (kind, x, y, fill, open) => {
-    const a = open ? { fill: cssVar("--surface"), stroke: fill, "stroke-width": 2 } : { fill };
+    const a = open ? { fill: cssVar("--oq-surface-1"), stroke: fill, "stroke-width": 2 } : { fill };
     return kind === "cpu" ? svg("circle", { cx: x, cy: y, r: 4.5, ...a }) : kind === "gpu" ? svg("path", { d: `M${x},${y - 5.5} L${x + 5.5},${y} L${x},${y + 5.5} L${x - 5.5},${y} Z`, ...a }) : svg("rect", { x: x - 4.5, y: y - 4.5, width: 9, height: 9, ...a });
   };
   rows.forEach((r, i) => {
@@ -485,7 +491,7 @@ function drawMeasured() {
   $("m-chart").replaceChildren(s);
   const sw = (kind, v) => `<span><svg width="12" height="12" viewBox="-6 -6 12 12" style="vertical-align:-1px;margin-right:6px"><${kind === "cpu" ? "circle r='4.5'" : kind === "gpu" ? "path d='M0,-5.5 L5.5,0 L0,5.5 L-5.5,0Z'" : "rect x='-4.5' y='-4.5' width='9' height='9'"} fill="var(${v})"/></svg>`;
   $("m-legend").innerHTML = MS.view === "ratio"
-    ? `${sw("auto", "--d-auto")}auto, within 10%</span><span><svg width="12" height="12" viewBox="-6 -6 12 12" style="vertical-align:-1px;margin-right:6px"><rect x="-4.5" y="-4.5" width="9" height="9" fill="var(--surface)" stroke="var(--slow)" stroke-width="2"/></svg>auto, outside 10%</span><span><i class="sq" style="background:none;border-top:2px dashed var(--slow);height:0;width:16px;vertical-align:3px"></i>the 10% line</span>`
+    ? `${sw("auto", "--d-auto")}auto, within 10%</span><span><svg width="12" height="12" viewBox="-6 -6 12 12" style="vertical-align:-1px;margin-right:6px"><rect x="-4.5" y="-4.5" width="9" height="9" fill="var(--oq-surface-1)" stroke="var(--slow)" stroke-width="2"/></svg>auto, outside 10%</span><span><i class="sq" style="background:none;border-top:2px dashed var(--slow);height:0;width:16px;vertical-align:3px"></i>the 10% line</span>`
     : `${sw("cpu", "--d-cpu")}cpu</span>${sw("gpu", "--d-gpu")}gpu</span>${sw("auto", "--d-auto")}auto (hollow = outside 10%)</span>`;
   $("m-table").innerHTML = `<tr><th>Query</th><th class="r">cpu ms</th><th class="r">gpu ms</th><th class="r">auto ms</th><th>better</th><th class="r">auto ÷ better</th><th>within 10%</th></tr>` +
     rows.map((r) => `<tr><td>Q${r.q}</td><td class="r num">${r.cpu.toFixed(1)}</td><td class="r num">${r.gpu.toFixed(1)}</td><td class="r num">${r.auto.toFixed(1)}</td><td>${r.best}</td><td class="r num">${r.ratio.toFixed(3)}</td><td>${r.ok ? "yes" : "no"}</td></tr>`).join("");
@@ -507,7 +513,7 @@ function drawStale() {
 
 function drawTiles() {
   const n10 = count(M.sf10), n1 = count(M.sf1med), singles = M.sf1runs.map(count);
-  const tile = (label, big, sub, ok) => `<div class="card stat"><span class="label">${label}</span><span class="num">${big}</span><span class="badge ${ok ? "ok" : "warn"}">${sub}</span></div>`;
+  const tile = (label, big, sub, ok) => `<div class="card stat"><span class="label">${label}</span><span class="num">${big}</span><span class="badge ${ok ? "ok" : "warn"}"><i></i>${sub}</span></div>`;
   $("tiles").innerHTML = tile("SF10 · one run", `${n10}/22`, "within 10% of the better device", n10 >= 20) + tile("SF1 · median of 4 runs", `${n1}/22`, "within 10%", n1 >= 20) +
     tile("SF1 · each single run", singles.join(" · "), singles.filter((x) => x >= 20).length + " of 4 reach 20", false);
   $("tiles-note").innerHTML = `The SF1 queries take 50 to 400 ms, so one fresh-process run moves about 10% by itself and the queries that miss change from run to run. Judge it on the median of the four runs, and read the single runs as the spread. The three extra SF1 runs started while the machine was still busy from the SF10 run.`;
@@ -521,11 +527,11 @@ function drawCoproc() {
   const s = svg("svg", { viewBox: `0 0 ${W} ${H}`, width: W, height: H, role: "img", "aria-label": "Milliseconds for each execution strategy" });
   rows.forEach((r, i) => {
     const y = i * rh + 4, lo = r.ms ?? r.ms_lo, hi = r.ms ?? r.ms_hi, X = (v) => x0 + (v / max) * (x1 - x0), fill = cssVar(colOf[r.device]);
-    s.appendChild(svg("text", { x: x0, y: y + 9, style: `fill:${cssVar("--text-mid")}` }, r.label));
+    s.appendChild(svg("text", { x: x0, y: y + 9, style: `fill:${cssVar("--oq-ink-2")}` }, r.label));
     const bar = svg("rect", { x: x0, y: y + 14, width: Math.max(2, X(lo) - x0), height: 13, rx: 2, fill });
     s.appendChild(bar);
     if (hi !== lo) s.appendChild(svg("rect", { x: X(lo), y: y + 14, width: X(hi) - X(lo), height: 13, rx: 2, fill, opacity: 0.4 }));
-    s.appendChild(svg("text", { x: X(hi) + 6, y: y + 24, style: `fill:${cssVar("--text")};font-weight:700` }, hi !== lo ? `${lo}–${hi}` : String(lo)));
+    s.appendChild(svg("text", { x: X(hi) + 6, y: y + 24, style: `fill:${cssVar("--oq-ink")};font-weight:700` }, hi !== lo ? `${lo}–${hi}` : String(lo)));
     const hit = svg("rect", { x: 0, y: y - 2, width: W, height: rh, fill: "transparent" });
     hover(hit, `<b>${r.label}</b><br>${hi !== lo ? lo + "–" + hi : lo} ms`); s.appendChild(hit);
   });

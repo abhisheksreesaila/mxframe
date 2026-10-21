@@ -40,8 +40,9 @@ def test_site_has_index_and_shared_assets():
     assert (SITE / "index.html").is_file()
     assert (SITE / "site.css").is_file() and (SITE / "site.js").is_file()
     css = (SITE / "site.css").read_text()
-    for token in ("--bg", "--surface", "--accent", "--mx", "--dk", "--pl", '[data-theme="dark"]'):
-        assert token in css, token
+    for series, token in (("--mx", "--oq-accent"), ("--dk", "--oq-data-4"), ("--pl", "--oq-data-1")):
+        assert re.search(re.escape(series) + r":\s*var\(" + re.escape(token) + r"\)", css), \
+            f"{series} (a chart series) must read the omxqua token {token}"
 
 
 def test_bench_link_reaches_benchmark_files():
@@ -104,14 +105,50 @@ def test_pages_workflow_publishes_the_kernel_visualizer():
     assert "visualize/omxcore_pipeline.html" in (SITE / "site.js").read_text()
 
 
-def test_landing_page_and_docs_share_one_design_language():
-    """Story and docs are one product: the same Ledger / Graphite colours, the same two fonts, no gradients."""
-    story = (SITE / "story.html").read_text()
-    css = (SITE / "site.css").read_text()
-    for value in ["#eef0f3", "#ffffff", "#e1e4e8", "#1b1f24", "#0e7c86",            # Ledger: page, surface, line, ink, accent
-                  "#161618", "#1d1e21", "#ececee", "#3fb8c2",                       # Graphite (night)
-                  "JetBrains Mono", "Inter"]:
-        assert value in story and value in css, value
-    assert "gradient(" not in css.split("*/", 1)[1] and "Space Mono" not in css
-    for page in PAGES:
-        assert "Space+Mono" not in page.read_text(), page.name
+OMXQUA = ["omxqua/src/fonts.css", "omxqua/src/tokens.css", "omxqua/src/components.css", "omxqua/src/omxqua.js"]
+
+
+def test_vendored_omxqua_is_complete():
+    """omxqua ships with the site (bin/omxqua-sync docs/site/ --ref v0.1.4): nothing loads from a CDN."""
+    for ref in OMXQUA:
+        assert (SITE / ref).is_file(), ref
+    assert (SITE / "omxqua" / "VERSION").read_text().startswith("ref: v0.1.4")
+    for font in re.findall(r"url\(\.\./fonts/([\w.-]+)\)", (SITE / "omxqua/src/fonts.css").read_text()):
+        assert (SITE / "omxqua/fonts" / font).is_file(), font
+
+
+@pytest.mark.parametrize("page", PAGES, ids=lambda p: p.name)
+def test_every_page_loads_omxqua_in_order_with_the_dev_family(page):
+    """The four files in the documented order, root classes oq-root + oq-light + oq-family-dev (+ oq-top for the pages
+    with the shell), no font service and no omxqua CDN."""
+    text = page.read_text()
+    at = [text.index(f'"{ref}"') for ref in OMXQUA]
+    assert at == sorted(at), f"{page.name}: omxqua files out of order"
+    root = re.search(r"<html[^>]*class=\"([^\"]*)\"", text).group(1).split()
+    assert {"oq-root", "oq-light", "oq-family-dev"} <= set(root), root
+    if page.name != "deck.html":
+        assert "oq-top" in root, "the shell is Top islands"
+    assert "googleapis" not in text and "jsdelivr.net/gh/" not in text, page.name
+    assert "Space+Mono" not in text
+
+
+COLOUR = re.compile(r"#[0-9a-fA-F]{3,8}\b|\brgba?\(\s*\d|\bhsla?\(")
+
+
+def _style_and_script(text):
+    """The CSS and JS of a page (not its links like href="#journey")."""
+    parts = re.findall(r"<style>(.*?)</style>", text, re.S) + re.findall(r"<script>(.*?)</script>", text, re.S)
+    parts += re.findall(r'style="([^"]*)"', text)
+    return "\n".join(parts)
+
+
+@pytest.mark.parametrize("path", [*PAGES, SITE / "site.css", SITE / "site.js", SITE / "js" / "bench.js"], ids=lambda p: p.name)
+def test_no_page_defines_its_own_colour(path):
+    """Every colour is an omxqua --oq-* token. A literal hex, rgb() or hsl() in a page's CSS or JS would be a second palette
+    (charts read tokens through cssVar; they never carry a colour of their own); no gradients, blur or glass either."""
+    text = path.read_text()
+    code = _style_and_script(text) if path.suffix == ".html" else text
+    code = re.sub(r"/\*.*?\*/", "", code, flags=re.S)
+    assert not COLOUR.findall(code), f"{path.name}: {COLOUR.findall(code)}"
+    for banned in ("gradient(", "backdrop-filter", "blur("):
+        assert banned not in code, f"{path.name}: {banned}"

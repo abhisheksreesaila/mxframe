@@ -1,0 +1,6 @@
+/* omxqua fonts: self-hosted, never a font CDN. All four are SIL OFL 1.1 (licence files in ../fonts/).
+   Geist + Geist Mono: every family. Fraunces: the Azulejo skin's display face. Nunito: the Sticker and Crayon skins. */
+@font-face { font-family: "Geist"; src: url(../fonts/geist-variable.woff2) format("woff2"); font-weight: 100 900; }
+@font-face { font-family: "Fraunces"; src: url(../fonts/fraunces-variable.woff2) format("woff2"); font-weight: 100 900; }
+@font-face { font-family: "Nunito"; src: url(../fonts/nunito-variable.woff2) format("woff2"); font-weight: 200 1000; }
+@font-face { font-family: "Geist Mono"; src: url(../fonts/geist-mono-variable.woff2) format("woff2"); font-weight: 100 900; }
