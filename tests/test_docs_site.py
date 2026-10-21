@@ -125,7 +125,7 @@ def test_every_page_loads_omxqua_in_order_with_the_dev_family(page):
     at = [text.index(f'"{ref}"') for ref in OMXQUA]
     assert at == sorted(at), f"{page.name}: omxqua files out of order"
     root = re.search(r"<html[^>]*class=\"([^\"]*)\"", text).group(1).split()
-    assert {"oq-root", "oq-light", "oq-family-dev"} <= set(root), root
+    assert {"oq-root", "oq-light", "oq-family-dev", "oq-app-teal"} <= set(root), root   # teal accent: owner, 2026-10-20
     if page.name != "deck.html":
         assert "oq-top" in root, "the shell is Top islands"
     assert "googleapis" not in text and "jsdelivr.net/gh/" not in text, page.name

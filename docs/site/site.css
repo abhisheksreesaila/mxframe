@@ -3,7 +3,7 @@
    from omxqua's components.css. This file only adds what a documentation page needs on top of them.
    Load order on every page: omxqua/src/fonts.css, tokens.css, components.css, then this file, then omxqua.js. */
 
-/* chart series, named once. omxcore is the accent; DuckDB and Polars are data colours that pass contrast in both themes. */
+/* chart series, named once. omxcore is the accent (teal: oq-app-teal on every page); DuckDB and Polars are data colours that pass contrast in both themes. */
 .oq-root {
   --mx: var(--oq-accent); --dk: var(--oq-data-4); --pl: var(--oq-data-1); --pa: var(--oq-data-6);
   --d-cpu: var(--oq-data-2); --d-gpu: var(--oq-data-3); --d-auto: var(--oq-data-6);
@@ -31,11 +31,11 @@ code, pre, .mono { font-family: var(--oq-font-mono); }
 code, pre { font-size: 12.5px; }
 :not(pre) > code { background: rgb(var(--oq-state) / .07); padding: 1px 5px; border-radius: var(--oq-radius-xs); color: var(--oq-ink); }
 pre { margin: 0; padding: 14px 16px; overflow: auto; color: var(--oq-ink-2); }
-.tone2 { color: var(--oq-ink-2); }
+.tone2 { color: var(--oq-accent); }   /* owner, 2026-10-20: "a little colour": the accent also marks eyebrows and the second half of a headline */
 .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; }
 .k { color: var(--oq-data-1); } .s { color: var(--oq-ok); } .c { color: var(--oq-ink-2); }
 .num { font-variant-numeric: tabular-nums; font-weight: 650; }
-.kick { display: block; font: 500 12px var(--oq-font-mono); letter-spacing: .14em; text-transform: uppercase; color: var(--oq-ink-2); margin-bottom: 10px; }
+.kick { display: block; font: 500 12px var(--oq-font-mono); letter-spacing: .14em; text-transform: uppercase; color: var(--oq-accent); margin-bottom: 10px; }
 .label { font: 500 11px var(--oq-font-mono); letter-spacing: .12em; text-transform: uppercase; color: var(--oq-ink-2); }
 main > p.lede { font-size: 21px; line-height: 1.55; max-width: 680px; color: var(--oq-ink-2); }
 .btns { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 0 0 12px; }
