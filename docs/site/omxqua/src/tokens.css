@@ -1,0 +1,160 @@
+/* omxqua tokens: Material texture, Liquid motion.
+   Root: <html class="oq-root oq-night|oq-light oq-family-<dev|travel|kids> [oq-skin-<name>] [oq-top|oq-dock]">
+   (or oq-app-<accent> [oq-compact] for an app without a family).
+   Springs are Liquid's real spring curves (k/c in comments). Values follow docs/showcase.html;
+   keep these variable names so projects don't break. Load before components.css. */
+
+.oq-root {
+  /* ---- type: one sans + one mono, shipped with the app ---- */
+  --oq-font: "Geist", system-ui, sans-serif;
+  --oq-font-mono: "Geist Mono", ui-monospace, monospace;
+  --oq-font-display: var(--oq-font); /* a skin may swap in a display face (Azulejo: Fraunces) */
+  --oq-text: 14px;         /* body size; families set their own */
+  --oq-title: 28px;        /* page title */
+
+  /* ---- shape ---- */
+  --oq-radius-xs: 4px;     /* status badges and tags only */
+  --oq-radius-in: 10px;    /* inputs */
+  --oq-radius-card: 14px;  /* families set 12 / 16 / 22; 12px under .oq-compact */
+  --oq-radius-menu: 14px;  /* menu items 8px */
+  --oq-radius-full: 999px; /* pills = tappable */
+
+  /* ---- spacing (4px grid) ---- */
+  --oq-space-1: 4px; --oq-space-2: 8px; --oq-space-3: 12px; --oq-space-4: 16px;
+  --oq-space-5: 24px; --oq-space-6: 32px; --oq-space-7: 48px;
+  --oq-target: 36px;       /* families set 34 / 40 / 48; 34px under .oq-compact */
+
+  /* ---- motion: three springs + the quick tier (see LANGUAGE.md, Motion budget) ---- */
+  --oq-spring-fast: linear(0, 0.02, 0.071, 0.142, 0.226, 0.316, 0.407, 0.494, 0.577, 0.653, 0.72, 0.78, 0.831, 0.875, 0.911, 0.94, 0.964, 0.983, 0.997, 1.007, 1.014, 1.019, 1.021, 1.023, 1.023, 1.022, 1.02, 1.018, 1.017, 1.014, 1.012, 1.01, 1.009, 1.007, 1.006, 1.004, 1.003, 1.002, 1.002, 1.001, 1); /* k380 c30 */
+  --oq-spring: linear(0, 0.023, 0.079, 0.154, 0.237, 0.322, 0.405, 0.482, 0.553, 0.617, 0.674, 0.723, 0.766, 0.803, 0.835, 0.862, 0.885, 0.905, 0.921, 0.935, 0.946, 0.955, 0.963, 0.97, 0.975, 0.98, 0.983, 0.986, 0.989, 0.991, 0.993, 0.994, 0.995, 0.996, 0.997, 0.997, 0.998, 0.998, 0.999, 0.999, 1); /* k170 c26 */
+  --oq-spring-slow: linear(0, 0.045, 0.161, 0.317, 0.49, 0.66, 0.814, 0.941, 1.04, 1.108, 1.148, 1.165, 1.163, 1.147, 1.123, 1.095, 1.066, 1.04, 1.017, 0.999, 0.986, 0.977, 0.973, 0.973, 0.974, 0.978, 0.982, 0.987, 0.992, 0.996, 0.999, 1.002, 1.003, 1.004, 1.005, 1.004, 1.004, 1.003, 1.002, 1.002, 1); /* k260 c16 */
+  --oq-spring-fast-dur: 300ms; --oq-spring-dur: 710ms; --oq-spring-slow-dur: 790ms; /* phone */
+  --oq-gentle-in: 220ms;   /* menus, popovers, tooltips, toasts: fade + 4px drop + 3% scale, no overshoot */
+  --oq-gentle-out: 150ms;  /* they fade out, never vanish */
+  --oq-ease-in: cubic-bezier(.2, 0, 0, 1);   /* decelerate: arriving */
+  --oq-ease-out: cubic-bezier(.3, 0, 1, 1);  /* accelerate: leaving */
+  --oq-press-scale: 0.96;
+  --oq-island-spring: linear(0, 0.023, 0.079, 0.154, 0.237, 0.322, 0.405, 0.482, 0.553, 0.617, 0.674, 0.723, 0.766, 0.803, 0.835, 0.862, 0.885, 0.905, 0.921, 0.935, 0.946, 0.955, 0.963, 0.97, 0.975, 0.98, 0.983, 0.986, 0.989, 0.991, 0.993, 0.994, 0.995, 0.996, 0.997, 0.997, 0.998, 0.998, 0.999, 0.999, 1); /* = --oq-spring (k170 c26): islands, Beacon, top nav */
+
+  font-family: var(--oq-font);
+  color: var(--oq-ink);
+  background: var(--oq-surface-0);
+  font-size: var(--oq-text);
+  -webkit-font-smoothing: antialiased;
+}
+@media (pointer: fine) {  /* laptop: same curves, a notch calmer */
+  .oq-root { --oq-spring-fast-dur: 300ms; --oq-spring-dur: 450ms; --oq-spring-slow-dur: 520ms; }
+}
+.oq-root.oq-compact { --oq-radius-card: 12px; --oq-target: 34px; }
+
+/* ---- themes: depth = tone + one shadow scale; no glass, blur or gradients ---- */
+.oq-root.oq-night {
+  --oq-surface-0: #0b0b0d; --oq-surface-1: #151518; --oq-surface-2: #1d1d21; --oq-surface-3: #25252a;
+  --oq-ink: #ededef; --oq-ink-2: #a9a9b1; --oq-ink-faint: #3a3a40; /* faint is never text */
+  --oq-line: #2a2a30; --oq-line-2: #202025;
+  --oq-state: 237 237 239; /* state layers: rgb(var(--oq-state) / .08 hover, .12 press, .16 selected) */
+  --oq-shadow-1: 0 1px 0 rgba(255,255,255,.035) inset, 0 1px 2px rgba(0,0,0,.5);
+  --oq-shadow-2: 0 1px 0 rgba(255,255,255,.04) inset, 0 6px 18px rgba(0,0,0,.45);
+  --oq-shadow-3: 0 1px 0 rgba(255,255,255,.05) inset, 0 18px 48px rgba(0,0,0,.6);
+  --oq-shadow-4: 0 1px 0 rgba(255,255,255,.05) inset, 0 32px 80px rgba(0,0,0,.7);
+  --oq-ok: #3ccf6e; --oq-warn: #f5a524; --oq-bad: #f2555a; --oq-info: #52a9ff;
+  --oq-data-1: #8b7bff; --oq-data-2: #3aa0ff; --oq-data-3: #2bc3ad; --oq-data-4: #ff8a3d; --oq-data-5: #f2555a; --oq-data-6: #e0b400;
+}
+.oq-root.oq-light {
+  --oq-surface-0: #eeeef1; --oq-surface-1: #ffffff; --oq-surface-2: #ffffff; --oq-surface-3: #ffffff;
+  --oq-ink: #0b0b0d; --oq-ink-2: #5b5b63; --oq-ink-faint: #c9c9cf;
+  --oq-line: #e3e3e8; --oq-line-2: #efeff2;
+  --oq-state: 11 11 13;
+  --oq-shadow-1: 0 1px 2px rgba(20,16,10,.06), 0 0 0 1px rgba(20,16,10,.045);
+  --oq-shadow-2: 0 6px 18px rgba(20,16,10,.10), 0 0 0 1px rgba(20,16,10,.05);
+  --oq-shadow-3: 0 18px 48px rgba(20,16,10,.18), 0 0 0 1px rgba(20,16,10,.06);
+  --oq-shadow-4: 0 32px 80px rgba(16,16,20,.24), 0 0 0 1px rgba(16,16,20,.06);
+  --oq-ok: #137036; --oq-warn: #8f5400; --oq-bad: #c01f25; --oq-info: #0960b5; /* 4.5:1 on surface-0 and -1 */
+  --oq-data-1: #6d5cf0; --oq-data-2: #0a7fe0; --oq-data-3: #0f9483; --oq-data-4: #e0661a; --oq-data-5: #d42a2f; --oq-data-6: #a88400;
+}
+
+/* =====================================================================
+   FAMILIES: an app class picks one. Each sets surfaces, accent, data palette and character.
+   ===================================================================== */
+/* Developer · "Graphite": libraries, PyPI packages, consoles. Neutral, mono-forward, compact. */
+.oq-family-dev.oq-night { --oq-surface-0:#0b0b0d; --oq-surface-1:#151518; --oq-surface-2:#1d1d21; --oq-surface-3:#25252a; --oq-ink:#ededef; --oq-ink-2:#a9a9b1; --oq-line:#2a2a30; --oq-line-2:#202025; --oq-state:237 237 239;
+  --oq-accent:#ededef; --oq-on-accent:#0b0b0d; --oq-ok:#3ccf6e; --oq-warn:#f5a524; --oq-bad:#f2555a; --oq-info:#52a9ff;
+  --oq-data-1:#8b7bff; --oq-data-2:#3aa0ff; --oq-data-3:#2bc3ad; --oq-data-4:#ff8a3d; --oq-data-5:#f2555a; --oq-data-6:#e0b400; }
+.oq-family-dev.oq-light { --oq-surface-0:#eeeef1; --oq-surface-1:#ffffff; --oq-surface-2:#ffffff; --oq-surface-3:#ffffff; --oq-ink:#0b0b0d; --oq-ink-2:#5b5b63; --oq-line:#e3e3e8; --oq-line-2:#efeff2; --oq-state:11 11 13;
+  --oq-accent:#0b0b0d; --oq-on-accent:#ffffff; --oq-ok:#137036; --oq-warn:#8f5400; --oq-bad:#c01f25; --oq-info:#0960b5;
+  --oq-data-1:#6d5cf0; --oq-data-2:#0a7fe0; --oq-data-3:#0f9483; --oq-data-4:#e0661a; --oq-data-5:#d42a2f; --oq-data-6:#a88400; }
+.oq-family-dev { --oq-radius-card: 12px; --oq-target: 34px; --oq-text: 13.5px; --oq-beacon-accent: #3ccf6e; }
+
+/* Travel · "Coast": trips, places, days. Warm sand by day, deep sea by night, sea-teal accent. Kinds carry colour, days never do. */
+.oq-family-travel.oq-light { --oq-surface-0:#f4f0e9; --oq-surface-1:#fffdf9; --oq-surface-2:#ffffff; --oq-surface-3:#ffffff; --oq-ink:#1d1a16; --oq-ink-2:#5f584e; --oq-line:#e7e0d4; --oq-line-2:#f0eadf; --oq-state:29 26 22;
+  --oq-accent:#0b6e69; --oq-on-accent:#ffffff; --oq-ok:#137036; --oq-warn:#8f5400; --oq-bad:#c01f25; --oq-info:#0960b5;
+  --oq-data-1:#3f7a46; --oq-data-2:#c2462b; --oq-data-3:#2f6fbf; --oq-data-4:#9a6700; --oq-data-5:#8a4fa8; --oq-data-6:#7a6a58; }
+.oq-family-travel.oq-night { --oq-surface-0:#0b1214; --oq-surface-1:#121b1e; --oq-surface-2:#182326; --oq-surface-3:#1f2c30; --oq-ink:#e9efee; --oq-ink-2:#9fb0b0; --oq-line:#24312f; --oq-line-2:#1a2527; --oq-state:233 239 238;
+  --oq-accent:#5fd4c8; --oq-on-accent:#06201e; --oq-ok:#3ccf6e; --oq-warn:#f5a524; --oq-bad:#f2555a; --oq-info:#6cb6ff;
+  --oq-data-1:#9fd8a0; --oq-data-2:#ff8a6b; --oq-data-3:#6cb6ff; --oq-data-4:#f2c14e; --oq-data-5:#c79bf2; --oq-data-6:#c9b9a5; }
+.oq-family-travel { --oq-radius-card: 16px; --oq-target: 40px; --oq-text: 14px; --oq-beacon-accent: #5fd4c8; }
+
+/* Kids · "Playground": big, friendly, cheerful. Cream by day, plum by night, tangerine accent, bigger shapes and type. */
+.oq-family-kids.oq-light { --oq-surface-0:#fff6ea; --oq-surface-1:#ffffff; --oq-surface-2:#ffffff; --oq-surface-3:#ffffff; --oq-ink:#2a1d12; --oq-ink-2:#6b5646; --oq-line:#f1e2cf; --oq-line-2:#f8eddf; --oq-state:42 29 18;
+  --oq-accent:#c2410c; --oq-on-accent:#ffffff; --oq-ok:#137036; --oq-warn:#8f5400; --oq-bad:#c01f25; --oq-info:#0960b5;
+  --oq-data-1:#2f80ed; --oq-data-2:#1e8a4c; --oq-data-3:#f2a900; --oq-data-4:#e0457b; --oq-data-5:#8e5be8; --oq-data-6:#f2662f; }
+.oq-family-kids.oq-night { --oq-surface-0:#171221; --oq-surface-1:#211a2d; --oq-surface-2:#2a2238; --oq-surface-3:#332a43; --oq-ink:#f6eefc; --oq-ink-2:#bfb1cc; --oq-line:#3a3049; --oq-line-2:#2c2439; --oq-state:246 238 252;
+  --oq-accent:#ffad66; --oq-on-accent:#2a1405; --oq-ok:#3ccf6e; --oq-warn:#f5a524; --oq-bad:#ff6b70; --oq-info:#7cc0ff;
+  --oq-data-1:#7cc0ff; --oq-data-2:#5fdc8f; --oq-data-3:#ffd25e; --oq-data-4:#ff7fae; --oq-data-5:#b998ff; --oq-data-6:#ff9a6b; }
+.oq-family-kids { --oq-radius-card: 22px; --oq-radius-in: 14px; --oq-target: 48px; --oq-text: 15.5px; --oq-title: 32px; --oq-beacon-accent: #ffad66; }
+
+/* =====================================================================
+   SKINS: a family may offer alternative skins. Same components, different surfaces, colour, type and texture.
+   Root adds oq-skin-<name>; the component restyles per skin live in components.css.
+   ===================================================================== */
+/* Travel · Azulejo: editorial. Paper and tile-blue by day, ink-blue by night, serif display. */
+.oq-family-travel.oq-skin-azulejo.oq-light { --oq-surface-0:#f6f1e7; --oq-surface-1:#fffbf3; --oq-surface-2:#fffdf8; --oq-surface-3:#ffffff; --oq-ink:#1f2433; --oq-ink-2:#5c5a55; --oq-line:#e6dccb; --oq-line-2:#efe7d8; --oq-state:31 36 51;
+  --oq-accent:#1f4f8f; --oq-on-accent:#ffffff; --oq-data-1:#56662a; --oq-data-2:#a9471f; --oq-data-3:#21606a; --oq-data-4:#9a6700; --oq-data-5:#6d3f6b; --oq-data-6:#7a6a58; }
+.oq-family-travel.oq-skin-azulejo.oq-night { --oq-surface-0:#0f1420; --oq-surface-1:#161c2a; --oq-surface-2:#1c2333; --oq-surface-3:#232b3d; --oq-ink:#f1ece2; --oq-ink-2:#a7adbb; --oq-line:#283044; --oq-line-2:#1d2433; --oq-state:241 236 226;
+  --oq-accent:#8fb4ea; --oq-on-accent:#0f1420; --oq-data-1:#bfd08f; --oq-data-2:#f2a27f; --oq-data-3:#8fd0d8; --oq-data-4:#f2c14e; --oq-data-5:#d9a9d5; --oq-data-6:#c9b9a5; }
+.oq-skin-azulejo { --oq-font-display: "Fraunces", Georgia, serif; --oq-radius-card: 10px; --oq-title: 36px; --oq-beacon-accent: #8fb4ea; }
+/* Travel · Golden hour: warm dusk. Peach paper by day, espresso by night, amber accent, softer and rounder. */
+.oq-family-travel.oq-skin-golden.oq-light { --oq-surface-0:#fbf1e6; --oq-surface-1:#fffaf4; --oq-surface-2:#ffffff; --oq-surface-3:#ffffff; --oq-ink:#2b1d14; --oq-ink-2:#6e5a4b; --oq-line:#efdfcd; --oq-line-2:#f6eadc; --oq-state:43 29 20;
+  --oq-accent:#a34a0a; --oq-on-accent:#ffffff; --oq-data-1:#5a6a1f; --oq-data-2:#b6432c; --oq-data-3:#1f6f78; --oq-data-4:#9a6700; --oq-data-5:#6a4fc2; --oq-data-6:#7a6a58; }
+.oq-family-travel.oq-skin-golden.oq-night { --oq-surface-0:#1a1310; --oq-surface-1:#241a15; --oq-surface-2:#2d211b; --oq-surface-3:#372820; --oq-ink:#f7ebe0; --oq-ink-2:#c4ad9c; --oq-line:#3d2d24; --oq-line-2:#2e221c; --oq-state:247 235 224;
+  --oq-accent:#ffb45c; --oq-on-accent:#2a1405; --oq-data-1:#c8d784; --oq-data-2:#ff9475; --oq-data-3:#82d3dc; --oq-data-4:#f2c14e; --oq-data-5:#bba5ff; --oq-data-6:#d9c2a5; }
+.oq-skin-golden { --oq-radius-card: 22px; --oq-title: 34px; --oq-beacon-accent: #ffb45c; }
+/* Kids · Sticker: chunky and tactile. Buttons and tiles sit on a ledge and press down into it. Rounded type. */
+.oq-family-kids.oq-skin-sticker.oq-light { --oq-surface-0:#f7f7f5; --oq-surface-1:#ffffff; --oq-surface-2:#ffffff; --oq-surface-3:#ffffff; --oq-ink:#1f2a30; --oq-ink-2:#5f6b73; --oq-line:#e3e6e8; --oq-line-2:#eef0f1; --oq-state:31 42 48;
+  --oq-accent:#1971c2; --oq-on-accent:#ffffff; --oq-data-1:#f08c00; --oq-data-2:#2b8a3e; --oq-data-3:#fab005; --oq-data-4:#c2255c; --oq-data-5:#7048e8; --oq-data-6:#0c8599; }
+.oq-family-kids.oq-skin-sticker.oq-night { --oq-surface-0:#131f24; --oq-surface-1:#1b2b32; --oq-surface-2:#22343c; --oq-surface-3:#2a3d46; --oq-ink:#f1f7fa; --oq-ink-2:#9fb2bc; --oq-line:#37464f; --oq-line-2:#24353d; --oq-state:241 247 250;
+  --oq-accent:#4fb3ff; --oq-on-accent:#062033; --oq-data-1:#ffa94d; --oq-data-2:#69db7c; --oq-data-3:#ffd43b; --oq-data-4:#f783ac; --oq-data-5:#b197fc; --oq-data-6:#66d9e8; }
+.oq-skin-sticker { --oq-beacon-accent: #4fb3ff; }
+.oq-skin-sticker, .oq-skin-crayon { --oq-font: "Nunito", system-ui, sans-serif; }
+/* Kids · Crayon: soft pastels. Each tile is tinted with its own colour; the hero is a pastel band, not a loud block. */
+.oq-family-kids.oq-skin-crayon.oq-light { --oq-surface-0:#fffbf2; --oq-surface-1:#ffffff; --oq-surface-2:#ffffff; --oq-surface-3:#ffffff; --oq-ink:#2b2320; --oq-ink-2:#6b5d55; --oq-line:#f0e6d6; --oq-line-2:#f7f0e4; --oq-state:43 35 32;
+  --oq-accent:#c2185b; --oq-on-accent:#ffffff; --oq-data-1:#3b82f6; --oq-data-2:#16a34a; --oq-data-3:#eab308; --oq-data-4:#f97316; --oq-data-5:#8b5cf6; --oq-data-6:#06b6d4; }
+.oq-family-kids.oq-skin-crayon.oq-night { --oq-surface-0:#1c1a24; --oq-surface-1:#25222f; --oq-surface-2:#2d2a39; --oq-surface-3:#353144; --oq-ink:#f7f2fb; --oq-ink-2:#bdb3c9; --oq-line:#3a3547; --oq-line-2:#2c2837; --oq-state:247 242 251;
+  --oq-accent:#ff8fb8; --oq-on-accent:#2a0a18; --oq-data-1:#8ab8ff; --oq-data-2:#7ee2a1; --oq-data-3:#ffe066; --oq-data-4:#ffb086; --oq-data-5:#c4aaff; --oq-data-6:#7fdff0; }
+.oq-skin-crayon { --oq-radius-card: 28px; --oq-beacon-accent: #ff8fb8; }
+
+/* ---- one accent per app: fills the one loud button per card and the focus ring, nothing else ---- */
+.oq-night.oq-app-ink   { --oq-accent: #ededef; --oq-on-accent: #0b0b0d; }
+.oq-light.oq-app-ink   { --oq-accent: #0b0b0d; --oq-on-accent: #ffffff; }
+.oq-light.oq-app-teal   { --oq-accent: #0b6e69; --oq-on-accent: #ffffff; } .oq-night.oq-app-teal   { --oq-accent: #4fd1c5; --oq-on-accent: #0b0b0d; }
+.oq-light.oq-app-amber  { --oq-accent: #9a5b00; --oq-on-accent: #ffffff; } .oq-night.oq-app-amber  { --oq-accent: #f5b041; --oq-on-accent: #0b0b0d; }
+.oq-light.oq-app-violet { --oq-accent: #5b4bd6; --oq-on-accent: #ffffff; } .oq-night.oq-app-violet { --oq-accent: #b39dff; --oq-on-accent: #0b0b0d; }
+.oq-light.oq-app-sage   { --oq-accent: #3f6b4a; --oq-on-accent: #ffffff; } .oq-night.oq-app-sage   { --oq-accent: #9cc7a4; --oq-on-accent: #0b0b0d; }
+.oq-light.oq-app-rose   { --oq-accent: #c8243f; --oq-on-accent: #ffffff; } .oq-night.oq-app-rose   { --oq-accent: #ff8fa3; --oq-on-accent: #0b0b0d; }
+/* every pair above passes 4.5:1 for text on the accent and for the accent as text on surface-1 */
+
+/* ---- base patterns ---- */
+.oq-pressable { transition: transform var(--oq-spring-fast-dur) var(--oq-spring-fast); touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+.oq-pressable:active { transform: scale(var(--oq-press-scale)); }
+.oq-badge { font: 500 11px/1 var(--oq-font-mono); padding: 4px 6px; border-radius: var(--oq-radius-xs); border: 1px solid var(--oq-line); color: var(--oq-ink-2); }
+.oq-source { font: 11.5px var(--oq-font-mono); color: var(--oq-ink-2); border-top: 1px solid var(--oq-line-2); }
+
+@media (prefers-reduced-motion: reduce) {
+  .oq-root * { transition-duration: 150ms !important; animation-duration: 150ms !important; }
+  .oq-pressable:active { transform: none; }
+}
+
+/* reduced motion: every transition and animation becomes a short, calm fade, pseudo-elements included */
+@media (prefers-reduced-motion: reduce) {
+  .oq-root *, .oq-root *::before, .oq-root *::after { transition-duration: 150ms !important; transition-timing-function: ease-out !important; animation-duration: 150ms !important; animation-iteration-count: 1 !important; }
+}

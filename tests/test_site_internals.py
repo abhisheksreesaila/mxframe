@@ -85,8 +85,8 @@ def _layer_files(page):
 
 def test_page_is_wired_like_the_others(page):
     html = PAGE.read_text()
-    assert '<html lang="en" data-theme="light">' in html
-    assert 'href="site.css"' in html and 'src="site.js"' in html and '<nav class="side"></nav>' in html
+    assert 'class="oq-root oq-light oq-family-dev oq-top" data-theme="light"' in html
+    assert 'href="site.css"' in html and 'src="site.js"' in html and '<main class="main" id="main">' in html
     assert html.index("<h1") < html.index('class="read"'), "calm first (2026-10-20): the title, then the how-to-read box"
 
 

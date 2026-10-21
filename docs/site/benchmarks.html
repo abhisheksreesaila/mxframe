@@ -1,16 +1,18 @@
 <!doctype html>
-<html lang="en" data-theme="light">
+<html lang="en" class="oq-root oq-light oq-family-dev oq-top" data-theme="light">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Benchmarks: omxcore vs DuckDB vs Polars on TPC-H</title>
 <meta name="description" content="Interactive TPC-H SF1 and SF10 results for omxcore, DuckDB and Polars, per query, with totals, correctness verdicts and random-query shapes.">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="omxqua/src/fonts.css">
+<link rel="stylesheet" href="omxqua/src/tokens.css">
+<link rel="stylesheet" href="omxqua/src/components.css">
 <link rel="stylesheet" href="site.css">
+<script src="omxqua/src/omxqua.js" defer></script>
 <style>
-  .eng { font: 12px var(--font-mono); letter-spacing: .04em; display: inline-flex; align-items: center; gap: 4px; padding: 0 4px; color: var(--text); cursor: pointer; }
-  .eng input { accent-color: var(--accent); margin: 0 4px 0 0; }
+  .eng { font: 12px var(--oq-font-mono); letter-spacing: .04em; display: inline-flex; align-items: center; gap: 4px; padding: 0 4px; color: var(--oq-ink); cursor: pointer; }
+  .eng input { accent-color: var(--oq-accent); margin: 0 4px 0 0; width: 18px; height: 18px; }
   .btns { margin-bottom: 18px; }
   .stat .badge { margin-top: 4px; }
   .rand { display: grid; gap: 22px; grid-template-columns: minmax(0, 1fr); }
@@ -21,9 +23,8 @@
 <script src="site.js"></script>
 </head>
 <body>
-<div class="shell">
-<nav class="side"></nav>
-<main>
+<div class="screen">
+<main class="main" id="main">
 
   <span class="kick">benchmarks · run m2s · v0.6.0</span>
   <h1>TPC-H, query by query</h1>
@@ -38,6 +39,7 @@
       <div class="grid g3" id="totals"><div class="status">loading benchmark files…</div></div>
       <p class="note" style="margin:12px 0 0" id="totals-note"></p>
     </div>
+    <div class="src note">bench/m2s-engine.csv · bench/m2s-engine-shuffled.csv · first_ms summed per engine</div>
   </div>
 
   <h2>Time per query</h2>
@@ -46,8 +48,9 @@
     <div class="card-b">
       <div class="legend" id="legendB"></div>
       <div class="chart" id="chartB"><div class="status">loading benchmark files…</div></div>
-      <details><summary class="label">Data table</summary><table class="t" id="tblB"></table></details>
+      <details><summary class="label">Data table</summary><table class="tbl" id="tblB"></table></details>
     </div>
+    <div class="src note">bench/m2s-engine.csv · bench/m2s-engine-shuffled.csv · first_ms per query</div>
   </div>
   <p class="note">Hover a row for the three times and each result's verdict. A red ring marks a result that does not match the reference (DuckDB's answer is the reference): Polars' Q1 at SF10 is off by about 5% (float32 accumulation), so its time there is for a wrong answer.</p>
 
@@ -57,8 +60,9 @@
     <div class="card-b">
       <div class="legend"><span><i class="sq" style="background:var(--fast)"></i>omxcore faster</span><span><i class="sq" style="background:var(--slow)"></i>DuckDB faster</span></div>
       <div class="chart" id="chartC"><div class="status">loading benchmark files…</div></div>
-      <details><summary class="label">Data table</summary><table class="t" id="tblC"></table></details>
+      <details><summary class="label">Data table</summary><table class="tbl" id="tblC"></table></details>
     </div>
+    <div class="src note">bench/m2s-engine.csv · duckdb first_ms / mx-cpu first_ms</div>
   </div>
   <p class="note">This view always compares omxcore with DuckDB, whichever engines are ticked. A bar to the right of the line is a query omxcore wins; the length is the ratio, not the difference.</p>
 
@@ -69,8 +73,9 @@
     <div class="card-b">
       <div class="legend"><span><i class="sq" style="background:var(--fast)"></i>omxcore faster</span><span><i class="sq" style="background:var(--slow)"></i>DuckDB faster</span></div>
       <div class="rand" id="randoms"><div class="status">loading benchmark files…</div></div>
-      <details><summary class="label">Data table</summary><div style="overflow-x:auto"><table class="t" id="tblR"></table></div></details>
+      <details><summary class="label">Data table</summary><div style="overflow-x:auto"><table class="tbl" id="tblR"></table></div></details>
     </div>
+    <div class="src note">bench/random-sf1-m2s.json · random-sf1-shuffled-m2s.json · random-sf10-m2s.json</div>
   </div>
   <p class="note">The shapes are <code>agg</code> (group by), <code>global</code> (aggregate without grouping), <code>join</code>, <code>distinct</code> (count distinct), <code>select_distinct</code> and <code>topn</code>.</p>
 
@@ -85,7 +90,7 @@
         <li><b>SF1 is noisy.</b> SF1 queries take a few milliseconds, so single figures can move by 10 to 20% between runs. Read SF1 totals more than single queries.</li>
         <li><b>Load, as recorded in the files.</b> The load gate (the load average under the limit for 5 minutes) was checked before each run started. The load1 figures below were sampled during the runs, and they include the benchmark's own worker threads: omxcore and DuckDB use every core, so load1 rises while a query runs. A median of 4.7 or 7.3 is not a sign of other work on the machine.</li>
       </ul>
-      <table class="t" id="loadtbl" style="margin-top:8px"></table>
+      <table class="tbl" id="loadtbl" style="margin-top:8px"></table>
       <p class="note" style="margin:12px 0 0">More on the method: <a href="https://github.com/abhisheksreesaila/omxcore/blob/main/docs/optimizations.md">optimizations.md</a>. The raw files are in <a href="https://github.com/abhisheksreesaila/omxcore/tree/main/docs/bench">docs/bench</a>.</p>
     </div>
   </div>

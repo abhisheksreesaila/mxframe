@@ -1,24 +1,25 @@
 <!doctype html>
-<html lang="en" data-theme="light">
+<html lang="en" class="oq-root oq-light oq-family-dev oq-top" data-theme="light">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>omxcore: a compute engine (CPU and GPU) with persistence to open Parquet files</title>
 <meta name="description" content="omxcore: a compute engine (CPU and GPU) with persistence to open Parquet files, compiled with Mojo. DataFrame and SQL front ends; faster than DuckDB and Polars on the TPC-H SF10 total.">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="omxqua/src/fonts.css">
+<link rel="stylesheet" href="omxqua/src/tokens.css">
+<link rel="stylesheet" href="omxqua/src/components.css">
 <link rel="stylesheet" href="site.css">
+<script src="omxqua/src/omxqua.js" defer></script>
 <script src="site.js"></script>
 </head>
 <body>
-<div class="shell">
-<nav class="side"></nav>
-<main>
+<div class="screen">
+<main class="main" id="main">
 
   <span class="kick">omxcore docs · v0.6.0</span>
-  <h1>The data engine for <span style="color:var(--accent)">the agent era.</span></h1>
+  <h1>The data engine for <span class="tone2">the agent era.</span></h1>
   <p class="lede">SQL on your CPU <em>and</em> your GPU, over the files you already have. Written in Mojo, with no Python inside.</p>
-  <div class="btns cta"><a class="btn on" href="story.html">Read the story</a><a class="btn" href="deck.html">Watch it as slides ▶</a><a class="btn" href="benchmarks.html">See the numbers</a></div>
+  <div class="btns cta"><a class="btn fill" href="story.html">Read the story</a><a class="btn tonal" href="deck.html">Watch it as slides ▶</a><a class="btn tonal" href="benchmarks.html">See the numbers</a></div>
   <div class="read"><b>What you're looking at</b>The front page of the omxcore docs. The numbers below are computed in your browser from the benchmark file they came from (<a href="bench/m2s-engine.csv">m2s-engine.csv</a>). Each card further down is one page of the docs.</div>
 
   <div class="card" style="margin:22px 0">
@@ -27,6 +28,7 @@
       <div class="grid g3" id="totals"><div class="status">loading benchmark files…</div></div>
       <p style="font-size:13.5px;margin:12px 0 0" id="totals-note"></p>
     </div>
+    <div class="src note">bench/m2s-engine.csv · sf = 10 · first_ms summed over the 22 queries</div>
   </div>
 
   <div class="grid" style="grid-template-columns:minmax(0,1.4fr) minmax(0,1fr);align-items:start">
@@ -41,16 +43,18 @@ out = (lf.filter(mx.col(<span class="s">"l_quantity"</span>) &lt; <span class="s
          .agg(mx.col(<span class="s">"l_extendedprice"</span>).sum().alias(<span class="s">"revenue"</span>))
          .sort(<span class="s">"l_returnflag"</span>)
          .compute(device=<span class="s">"cpu"</span>))   <span class="c"># a pyarrow Table</span></pre>
+      <div class="src">pixi run python quickstart.py</div>
     </div>
     <div class="card">
       <div class="card-h">out · TPC-H SF1 lineitem (6M rows)</div>
-      <table class="t">
+      <table class="tbl">
         <tr><th>l_returnflag</th><th class="r">revenue</th></tr>
         <tr><td class="mono">A</td><td class="r num">12,224,287,050</td></tr>
         <tr><td class="mono">N</td><td class="r num">25,204,209,794</td></tr>
         <tr><td class="mono">R</td><td class="r num">12,231,597,084</td></tr>
       </table>
       <p style="font-size:13px;padding:0 16px">Nothing runs until <code>.compute()</code>; then the plan is optimized and executed in one native call.</p>
+      <div class="src note">quickstart.py on lineitem.parquet, TPC-H SF1</div>
     </div>
   </div>
 
@@ -67,7 +71,7 @@ const CARDS = [
   ["how-it-got-fast.html", "How it got fast", "Every optimization from 22.7 s to 3.15 s at SF10, and which wins come from Mojo and which don't.", "img/how-it-got-fast.png"],
 ];
 document.getElementById("pages").innerHTML = CARDS.map(([href, title, what, img]) =>
-  `<a class="card" href="${href}"><img class="thumb" src="${img}" alt="${title} page"><div class="card-b"><b>${title}</b><p style="margin:4px 0 0;font-size:13.5px">${what}</p></div></a>`).join("");
+  `<a class="card" href="${href}"><img class="thumb" src="${img}" alt="${title} page"><div class="card-b"><b>${title}</b><p style="margin:4px 0 0;font-size:13.5px">${what}</p></div><div class="src note">${href}</div></a>`).join("");
 
 const ENGINES = [["mx-cpu", "omxcore", "--mx"], ["duckdb", "DuckDB", "--dk"], ["polars", "Polars", "--pl"]];
 loadCSV("bench/m2s-engine.csv").then((rows) => {
@@ -76,8 +80,8 @@ loadCSV("bench/m2s-engine.csv").then((rows) => {
   const t = Object.fromEntries(ENGINES.map(([e]) => [e, total(e)]));
   const best = Math.min(...Object.values(t));
   document.getElementById("totals").innerHTML = ENGINES.map(([e, name, c]) =>
-    `<div class="card stat"><span class="label"><i style="display:inline-block;width:9px;height:9px;border-radius:50%;background:var(${c});margin-right:6px"></i>${name}</span>` +
-    `<span class="num">${(t[e] / 1000).toFixed(2)} s</span>${t[e] === best ? '<span class="badge ok">fastest total</span>' : ""}</div>`).join("");
+    `<div class="card stat"><span class="label"><i class="dot" style="background:var(${c})"></i>${name}</span>` +
+    `<span class="num">${(t[e] / 1000).toFixed(2)} s</span>${t[e] === best ? '<span class="badge ok"><i></i>fastest total</span>' : ""}</div>`).join("");
   const mx21 = total("mx-cpu", "21"), dk21 = total("duckdb", "21");
   document.getElementById("totals-note").textContent =
     `Q21 carries the lead: without it, DuckDB's total is ${(dk21 / 1000).toFixed(2)} s against omxcore's ${(mx21 / 1000).toFixed(2)} s, and DuckDB is faster on ` +
