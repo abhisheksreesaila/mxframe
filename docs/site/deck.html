@@ -1,109 +1,103 @@
 <!doctype html>
-<html lang="en" data-theme="light">
+<html lang="en" class="oq-root oq-light oq-family-dev" data-theme="light">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>omxcore: the story, as slides</title>
 <meta name="description" content="omxcore in twelve slides: the mission, why Mojo, a query as it runs, CPU or GPU, bigger than memory, the numbers, and why it's built for agents.">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="omxqua/src/fonts.css">
+<link rel="stylesheet" href="omxqua/src/tokens.css">
+<link rel="stylesheet" href="omxqua/src/components.css">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.2.1/dist/reveal.css">
+<script src="omxqua/src/omxqua.js" defer></script>
+<script src="site.js"></script>
 <style>
-  /* Universal Language, Ledger / Graphite (the same tokens as story.html and site.css): opaque tonal surfaces, one
-     soft shadow, pills are tappable, mono badges are status, no glass, blur or gradients. */
-  :root {
-    --page:#eef0f3; --surface:#ffffff; --raised:#f0f2f5; --line:#e1e4e8; --ink:#1b1f24; --body:#3d434c; --sub:#5d6571;
-    --accent:#0e7c86; --on-accent:#ffffff; --good:#1f8a4c; --bad:#c8364c; --dk:#e8833a; --pl:#5b5fc7;
-    --shadow-1:0 1px 2px rgba(16,24,40,.06), 0 1px 3px rgba(16,24,40,.08); --shadow-2:0 4px 16px rgba(16,24,40,.12);
-    --sans:Inter, system-ui, sans-serif; --mono:"JetBrains Mono", ui-monospace, monospace;
-    --spring:cubic-bezier(.2,1.2,.3,1); --spring-slow:cubic-bezier(.16,1,.3,1);
-  }
-  :root[data-theme="dark"] {
-    --page:#161618; --surface:#1d1e21; --raised:#26272b; --line:#2e3034; --ink:#ececee; --body:#c8cad0; --sub:#9a9da6;
-    --accent:#3fb8c2; --on-accent:#0e1214; --good:#3ddc97; --bad:#ff6b6b; --dk:#f5a524; --pl:#b48cff;
-    --shadow-1:0 1px 2px rgba(0,0,0,.4); --shadow-2:0 6px 20px rgba(0,0,0,.45);
-  }
-  html, body, .reveal-viewport { background:var(--page); }
-  .reveal { font-family:var(--sans); font-size:30px; color:var(--body); }
-  .reveal .slides { text-align:left; }
-  .reveal h1, .reveal h2, .reveal h3 { font-family:var(--sans); color:var(--ink); text-transform:none; letter-spacing:-.03em; line-height:1.08; margin:0 0 24px; }
-  .reveal h1 { font-size:96px; font-weight:700; }
-  .reveal h2 { font-size:60px; font-weight:700; }
-  .reveal h3 { font-size:32px; font-weight:600; letter-spacing:-.01em; }
-  .reveal h1 span, .reveal h2 span { color:var(--accent); }
-  .reveal p { margin:0 0 18px; line-height:1.5; }
-  .reveal a { color:var(--accent); }
-  .eyebrow { font:600 18px var(--mono); letter-spacing:.14em; text-transform:uppercase; color:var(--accent); margin-bottom:22px; }
-  .lede { font-size:36px; color:var(--body); max-width:1100px; line-height:1.45; }
-  .mono { font-family:var(--mono); font-variant-numeric:tabular-nums; }
-  .note { font:18px/1.6 var(--mono); color:var(--sub); }
-  .badge { display:inline-block; font:600 16px var(--mono); padding:3px 9px; border-radius:4px; border:1px solid var(--line); background:var(--raised); color:var(--sub); vertical-align:middle; }
-  .badge.today { color:var(--good); } .badge.next { color:var(--dk); }
-  .card { background:var(--surface); border:1px solid var(--line); border-radius:14px; box-shadow:var(--shadow-1); padding:26px 30px; }
-  .src { font:16px var(--mono); color:var(--sub); border-top:1px solid var(--line); margin:18px -30px -26px; padding:12px 30px; }
-  .row { display:grid; gap:24px; } .r2 { grid-template-columns:1fr 1fr; } .r3 { grid-template-columns:1fr 1fr 1fr; }
-  .big { font:600 34px/1.3 var(--sans); color:var(--ink); margin-bottom:10px; letter-spacing:-.01em; }
-  .pill { display:inline-block; padding:14px 28px; border-radius:999px; font:600 24px var(--sans); text-decoration:none; border:1px solid var(--line); background:var(--surface); color:var(--ink) !important; margin-right:12px; }
-  .pill.loud { background:var(--accent); border-color:var(--accent); color:var(--on-accent) !important; }
+  /* The slides on omxqua: family dev, light by default, night when chosen (site.js keeps the choice shared across the pages).
+     Every colour, radius and size is an --oq-* token; the 1600 x 900 stage scales the type up. Motion follows the budget:
+     new things settle (fade and a 12 px rise, no bounce); bars grow once and numbers count up once; reduced motion is still. */
+  html, body, .reveal-viewport { background: var(--oq-surface-0); }
+  body { margin: 0; }
+  .reveal { font-family: var(--oq-font); font-size: 30px; color: var(--oq-ink-2); }
+  .reveal .slides { text-align: left; }
+  .reveal h1, .reveal h2, .reveal h3 { font-family: var(--oq-font-display); color: var(--oq-ink); text-transform: none; letter-spacing: -.045em; line-height: 1; margin: 0 0 24px; }
+  .reveal h1 { font-size: 112px; font-weight: 800; letter-spacing: -.055em; text-wrap: balance; }
+  .reveal h2 { font-size: 64px; font-weight: 800; }
+  .reveal h3 { font-size: 32px; font-weight: 600; letter-spacing: -.01em; }
+  .reveal h1 span, .reveal h2 span { color: var(--oq-ink-2); }
+  .reveal h2 span.badge { color: var(--oq-info); }
+  .reveal p { margin: 0 0 18px; line-height: 1.5; }
+  .reveal a { color: var(--oq-ink); text-decoration-color: var(--oq-ink-2); text-underline-offset: 4px; }
+  .reveal a.btn { text-decoration: none; }
+  .eyebrow { font: 500 18px var(--oq-font-mono); letter-spacing: .14em; text-transform: uppercase; color: var(--oq-ink-2); margin-bottom: 22px; }
+  .lede { font-size: 36px; color: var(--oq-ink-2); max-width: 1100px; line-height: 1.45; }
+  .mono { font-family: var(--oq-font-mono); font-variant-numeric: tabular-nums; }
+  .note { font: 18px/1.6 var(--oq-font-mono); color: var(--oq-ink-2); }
+  .reveal .badge { font-size: 16px; padding: 6px 10px; vertical-align: middle; }
+  .reveal .card { padding: 26px 30px; }
+  .reveal .card .src { font-size: 16px; margin: 18px -30px -26px; padding: 12px 30px; }
+  .cols { display: grid; gap: 24px; } .r2 { grid-template-columns: 1fr 1fr; } .r3 { grid-template-columns: 1fr 1fr 1fr; }
+  .big { font: 600 34px/1.3 var(--oq-font); color: var(--oq-ink); margin-bottom: 10px; letter-spacing: -.02em; }
+  .reveal .btn { --h: 64px; font-size: 24px; padding: 0 32px; margin-right: 12px; }
 
-  /* fragments settle in with a spring */
-  .reveal .slides section .fragment { transition:opacity .5s var(--spring-slow), transform .6s var(--spring-slow); }
-  .reveal .slides section .fragment.rise { transform:translateY(18px); } .reveal .slides section .fragment.rise.visible { transform:none; }
+  /* fragments settle in: fade and a 12 px rise, decelerating, no bounce */
+  .reveal .slides section .fragment { transition: opacity .28s var(--oq-ease-in), transform .28s var(--oq-ease-in); }
+  .reveal .slides section .fragment.rise { transform: translateY(12px); } .reveal .slides section .fragment.rise.visible { transform: none; }
 
-  /* code: a dark card, our own colours */
-  .reveal pre { box-sizing:border-box; width:100%; margin:0; box-shadow:var(--shadow-2); border-radius:14px; font-size:24px; background:#111316; padding:22px 28px; }
-  .reveal pre code, .reveal pre code.hljs { background:transparent; color:#d7dae0; padding:0; font-family:var(--mono); line-height:1.6; max-height:none; overflow:visible; }
-  .reveal .hljs-ln-numbers { color:#5f6672; padding-right:18px !important; user-select:none; }
-  .reveal pre code td, .reveal pre code tr { background:transparent; border:0; }
-  .hljs-keyword, .hljs-built_in { color:#7fd4db; } .hljs-string { color:#c3e88d; } .hljs-number { color:#f5c27a; }
-  .hljs-comment { color:#8b919c; } .hljs-attr { color:#f5c27a; } .hljs-literal { color:#f5c27a; }
-  .reveal .hljs.has-highlights tr:not(.highlight-line) { opacity:.3; }
-  .term { box-sizing:border-box; background:#111316; color:#d7dae0; border-radius:14px; padding:26px 30px; font:22px/1.6 var(--mono); box-shadow:var(--shadow-2); white-space:pre-wrap; min-height:420px; }
-  .term .p { color:#7fd4db; } .term .c { color:#8b919c; } .term .s { color:#c3e88d; } .term .k { color:#f5c27a; }
-  .caret { display:inline-block; width:.6em; background:#7fd4db; animation:blink 1s steps(1) infinite; }
-  @keyframes blink { 50% { opacity:0; } }
+  /* code: an omxqua surface, token colours */
+  .reveal pre { box-sizing: border-box; width: 100%; margin: 0; box-shadow: var(--oq-shadow-2); border-radius: var(--oq-radius-card); font-size: 24px; background: var(--oq-surface-1); padding: 22px 28px; }
+  .reveal pre code, .reveal pre code.hljs { background: transparent; color: var(--oq-ink); padding: 0; font-family: var(--oq-font-mono); line-height: 1.6; max-height: none; overflow: visible; }
+  .reveal .hljs-ln-numbers { color: var(--oq-ink-2); padding-right: 18px !important; user-select: none; }
+  .reveal pre code td, .reveal pre code tr { background: transparent; border: 0; }
+  .hljs-keyword, .hljs-built_in { color: var(--oq-data-1); } .hljs-string { color: var(--oq-ok); } .hljs-number { color: var(--oq-warn); }
+  .hljs-comment { color: var(--oq-ink-2); } .hljs-attr, .hljs-literal { color: var(--oq-info); }
+  .reveal .hljs.has-highlights tr:not(.highlight-line) { opacity: .3; }
+  .term { box-sizing: border-box; background: var(--oq-surface-1); color: var(--oq-ink); border-radius: var(--oq-radius-card); padding: 26px 30px; font: 22px/1.6 var(--oq-font-mono); box-shadow: var(--oq-shadow-2); white-space: pre-wrap; min-height: 420px; }
+  .term .p { color: var(--oq-ink-2); } .term .c { color: var(--oq-ink-2); } .term .s { color: var(--oq-ok); } .term .k { color: var(--oq-data-1); }
+  .caret { display: inline-block; width: .6em; background: var(--oq-ink); animation: blink 1s steps(1) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
 
   /* the stack (why Mojo) */
-  .stack { display:flex; flex-direction:column; gap:12px; }
-  .layer { display:flex; justify-content:space-between; align-items:center; padding:16px 22px; border-radius:12px; background:var(--surface); border:1px solid var(--line); box-shadow:var(--shadow-1); font-size:26px; color:var(--ink); }
-  .layer .lang { font:600 18px var(--mono); padding:3px 10px; border-radius:4px; }
-  .lang.mojo { background:color-mix(in srgb, var(--accent) 16%, var(--surface)); color:var(--accent); }
-  .lang.cpp { background:color-mix(in srgb, var(--dk) 16%, var(--surface)); color:var(--dk); }
-  .lang.py { background:color-mix(in srgb, var(--pl) 16%, var(--surface)); color:var(--pl); }
+  .stack { display: flex; flex-direction: column; gap: 12px; }
+  .layer { display: flex; justify-content: space-between; align-items: center; padding: 16px 22px; border-radius: var(--oq-radius-card); background: var(--oq-surface-1); box-shadow: var(--oq-shadow-1); font-size: 26px; color: var(--oq-ink); }
+  .layer .lang { font: 500 18px var(--oq-font-mono); padding: 5px 10px; border-radius: var(--oq-radius-xs); border: 1px solid var(--oq-line); color: var(--oq-ink-2); display: inline-flex; align-items: center; gap: 8px; }
+  .lang::before { content: ""; width: 10px; height: 10px; border-radius: 50%; background: var(--c); }
+  .lang.mojo { --c: var(--oq-accent); } .lang.cpp { --c: var(--oq-data-4); } .lang.py { --c: var(--oq-data-1); }
 
-  /* bars that grow when their slide arrives */
-  .bars { display:flex; flex-direction:column; gap:22px; margin-top:20px; }
-  .bar { display:grid; grid-template-columns:200px 1fr 170px; align-items:center; gap:20px; font-size:26px; }
-  .bar .name { color:var(--ink); font-weight:600; }
-  .bar .track { height:34px; background:var(--raised); border-radius:8px; overflow:hidden; }
-  .bar .fill { height:100%; width:0; border-radius:8px; transition:width 1.4s var(--spring-slow); }
-  .present .bar .fill { width:var(--w); }
-  .bar .val { font:600 28px var(--mono); color:var(--ink); text-align:right; }
-  .fill.mx { background:var(--accent); } .fill.dk { background:var(--dk); } .fill.pl { background:var(--pl); }
+  /* bars that grow once when their slide arrives */
+  .bars { display: flex; flex-direction: column; gap: 22px; margin-top: 20px; }
+  .bar { display: grid; grid-template-columns: 200px 1fr 170px; align-items: center; gap: 20px; font-size: 26px; }
+  .bar .name { color: var(--oq-ink); font-weight: 600; }
+  .bar .track { height: 34px; background: var(--oq-surface-1); box-shadow: var(--oq-shadow-1); border-radius: 8px; overflow: hidden; }
+  .bar .fill { height: 100%; width: 0; border-radius: 8px; transition: width 1.4s var(--oq-ease-in); }
+  .present .bar .fill { width: var(--w); }
+  .bar .val { font: 600 28px var(--oq-font-mono); color: var(--oq-ink); text-align: right; }
+  .fill.mx { background: var(--oq-accent); } .fill.dk { background: var(--oq-data-4); } .fill.pl { background: var(--oq-data-1); }
 
   /* bigger than memory */
-  .file { position:relative; height:120px; border-radius:14px; background:var(--raised); border:1px dashed color-mix(in srgb, var(--sub) 60%, transparent); }
-  .ram { position:absolute; left:0; top:0; bottom:0; width:4.5%; background:var(--accent); border-radius:14px 0 0 14px; }
-  .present .ram { animation:stream 3.2s var(--spring-slow) .4s infinite; }
-  @keyframes stream { from { left:0; } to { left:95.5%; } }
+  .file { position: relative; height: 120px; border-radius: var(--oq-radius-card); background: var(--oq-surface-1); box-shadow: var(--oq-shadow-1); border: 1px dashed var(--oq-ink-2); }
+  .ram { position: absolute; left: 0; top: 0; bottom: 0; width: 4.5%; background: var(--oq-accent); border-radius: var(--oq-radius-card) 0 0 var(--oq-radius-card); }
+  .present .ram { animation: stream 3.2s var(--oq-ease-in) .4s infinite; }
+  @keyframes stream { from { left: 0; } to { left: 95.5%; } }
 
-  .num { font:600 120px/1 var(--mono); color:var(--ink); letter-spacing:-.04em; }
-  .num small { font-size:44px; color:var(--accent); margin-left:8px; }
-  .shot { border-radius:14px; overflow:hidden; box-shadow:var(--shadow-2); border:1px solid var(--line); }
-  .shot img { display:block; width:100%; margin:0; }
+  .num { font: 600 120px/1 var(--oq-font-mono); color: var(--oq-ink); letter-spacing: -.04em; }
+  .num small { font-size: 44px; color: var(--oq-ink-2); margin-left: 8px; }
+  .shot { border-radius: var(--oq-radius-card); overflow: hidden; box-shadow: var(--oq-shadow-2); }
+  .shot img { display: block; width: 100%; margin: 0; }
 
-  .reveal .progress { color:var(--accent); height:4px; }
-  .reveal .controls { color:var(--accent); }
-  .reveal .slide-number { right:auto; left:24px; bottom:14px; background:transparent; color:var(--sub); font:16px var(--mono); } .reveal .slide-number a { color:var(--sub); text-decoration:none; }
-  .home { position:fixed; top:18px; left:24px; z-index:30; font:700 20px var(--sans); color:var(--ink); text-decoration:none; }
-  .home b { color:var(--accent); }
-  .theme { position:fixed; top:14px; right:24px; z-index:30; border:1px solid var(--line); background:var(--surface); color:var(--ink); border-radius:999px; padding:6px 14px; font:500 15px var(--sans); cursor:pointer; }
-  @media (prefers-reduced-motion: reduce) { .bar .fill, .reveal .slides section .fragment { transition:none; } .present .ram { animation:none; } .caret { animation:none; } }
+  .reveal .progress { color: var(--oq-ink); height: 4px; }
+  .reveal .controls { color: var(--oq-ink); }
+  .reveal .slide-number { right: auto; left: 24px; bottom: 14px; background: transparent; color: var(--oq-ink-2); font: 16px var(--oq-font-mono); } .reveal .slide-number a { color: var(--oq-ink-2); text-decoration: none; }
+  /* the two islands: the brand and the theme choice, solid surface-2 with the one shadow */
+  .dk-brand { position: fixed; top: 14px; left: 16px; z-index: 30; height: 44px; padding: 0 16px 0 8px; border-radius: 999px; background: var(--oq-surface-2); box-shadow: var(--oq-shadow-2);
+    display: flex; align-items: center; gap: 10px; font: 650 15px var(--oq-font-display); letter-spacing: -.02em; color: var(--oq-ink); text-decoration: none; }
+  .dk-brand .mark { width: 30px; height: 30px; border-radius: 50%; font-size: 13px; }
+  .dk-theme { position: fixed; top: 14px; right: 16px; z-index: 30; background: var(--oq-surface-2); box-shadow: var(--oq-shadow-2); }
+  @media (prefers-reduced-motion: reduce) { .bar .fill, .reveal .slides section .fragment { transition: none; } .present .ram { animation: none; } .caret { animation: none; } }
 </style>
 </head>
 <body>
-<a class="home" href="index.html"><b>omx</b>core</a>
-<button class="theme" id="theme" type="button" aria-label="Switch light and night">Night</button>
+<a class="dk-brand" href="index.html"><span class="mark">ox</span>omxcore</a>
+<button class="btn text dk-theme" id="theme-btn" type="button" aria-label="Switch light and night" aria-pressed="false"></button>
 
 <div class="reveal"><div class="slides">
 
@@ -120,7 +114,7 @@
 <section>
   <div class="eyebrow">The problem</div>
   <h2>Data tools were built for a person at a keyboard.</h2>
-  <div class="row r3" style="margin-top:40px">
+  <div class="cols r3" style="margin-top:40px">
     <div class="card fragment rise"><div class="big">Your GPU sits idle.</div><p>Most laptops and workstations have one. Analytics engines run on the CPU and leave it unused.</p></div>
     <div class="card fragment rise"><div class="big">Your data is in files.</div><p>CSV and Parquet. Most tools want you to import them first, into their own format.</p></div>
     <div class="card fragment rise"><div class="big">Agents need trust.</div><p>An agent can't squint at a result. It needs exact answers, and errors it can fix in one round.</p></div>
@@ -131,7 +125,7 @@
 <section>
   <div class="eyebrow">The mission</div>
   <h2>One engine apps and agents <span>stand on.</span></h2>
-  <div class="row r3" style="margin-top:40px">
+  <div class="cols r3" style="margin-top:40px">
     <div class="fragment rise"><div class="big">Your files stay yours.</div><p>Point it at a CSV or a Parquet file and ask. No import, no new format.</p></div>
     <div class="fragment rise"><div class="big">Your hardware, all of it.</div><p>CPU or GPU, chosen per query, with the reason.</p></div>
     <div class="fragment rise"><div class="big">Answers you can trust.</div><p>Exact decimals, a note for every decision, errors with a hint.</p></div>
@@ -143,7 +137,7 @@
 <section>
   <div class="eyebrow">The differentiator</div>
   <h2>Written in Mojo, <span>top to bottom.</span></h2>
-  <div class="row r2" style="margin-top:30px;align-items:start">
+  <div class="cols r2" style="margin-top:30px;align-items:start">
     <div>
       <h3>A typical GPU data stack</h3>
       <div class="stack">
@@ -204,7 +198,7 @@ LIMIT 3
     group: dense, 1 key region 4 = 4 slots<br>
     columns read: region, qty, revenue (3 of 5)<br>
     order: sorted 4 groups by 1 key (stable radix passes)
-    <div class="src">every result carries notes · EXPLAIN shows each planner decision</div>
+    <div class="src note">every result carries notes · EXPLAIN shows each planner decision</div>
   </div>
 </section>
 
@@ -212,18 +206,18 @@ LIMIT 3
 <section>
   <div class="eyebrow">CPU or GPU</div>
   <h2>AUTO picks the faster device, <span>and says why.</span></h2>
-  <div class="row r2" style="margin-top:30px;align-items:center">
+  <div class="cols r2" style="margin-top:30px;align-items:center">
     <div>
       <p class="fragment rise">It prices the query on the CPU, and on the GPU with the cost of copying the data there.</p>
       <p class="fragment rise">Whichever is faster wins, and the reason is part of the answer.</p>
       <p class="fragment rise note">Tuned on your machine, not ours.</p>
     </div>
     <div class="card mono fragment rise" style="font-size:22px;line-height:1.75">
-      <div style="font-size:34px;color:var(--ink)"><span style="color:var(--accent)">●</span> auto → cpu</div>
+      <div style="font-size:34px;color:var(--oq-ink)"><span style="color:var(--oq-ink)">●</span> auto → cpu</div>
       reason: cpu faster (copies over the link cost more)<br>
       estimated CPU plan &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;33.5 ms<br>
       estimated GPU plan, copies in 638 ms
-      <div class="src">a 60M-row group-by · auto-mode.html replays every rule</div>
+      <div class="src note">a 60M-row group-by · auto-mode.html replays every rule</div>
     </div>
   </div>
 </section>
@@ -236,7 +230,7 @@ LIMIT 3
   <div style="margin-top:50px">
     <div class="note" style="margin-bottom:10px">the file · 1.6 GB</div>
     <div class="file"><div class="ram"></div></div>
-    <div class="note" style="margin-top:10px"><span style="color:var(--accent)">■</span> what's in memory at any moment · 72 MB</div>
+    <div class="note" style="margin-top:10px"><span style="color:var(--oq-ink)">■</span> what's in memory at any moment · 72 MB</div>
   </div>
 </section>
 
@@ -250,7 +244,7 @@ LIMIT 3
     <div class="bar"><span class="name">Polars</span><div class="track"><div class="fill pl" style="--w:100%"></div></div><span class="val" data-count="14.40">14.40 s</span></div>
   </div>
   <p class="note" style="margin-top:30px">0.6.0 release run · query time only · every answer equal to DuckDB's</p>
-  <div class="card fragment rise" style="margin-top:20px"><p style="margin:0"><b style="color:var(--ink)">And honestly:</b> one query (Q21) carries the lead. Without it DuckDB's total is lower, and DuckDB is still faster on several join-heavy queries. Every gap is <a href="engine.html">written down</a>.</p></div>
+  <div class="card fragment rise" style="margin-top:20px"><p style="margin:0"><b style="color:var(--oq-ink)">And honestly:</b> one query (Q21) carries the lead. Without it DuckDB's total is lower, and DuckDB is still faster on several join-heavy queries. Every gap is <a href="engine.html">written down</a>.</p></div>
 </section>
 
 <!-- 9 -->
@@ -258,14 +252,14 @@ LIMIT 3
   <div class="eyebrow">Built for agents</div>
   <h2>An engine that <span>speaks JSON.</span></h2>
   <div class="term" id="term" aria-label="An agent querying a CSV file with mx"></div>
-  <p class="note" style="margin-top:16px">a real session · <span class="badge today">works today</span> one binary, starts in 12 ms, no Python</p>
+  <p class="note" style="margin-top:16px">a real session · <span class="badge ok"><i></i>works today</span> one binary, starts in 12 ms, no Python</p>
 </section>
 
 <!-- 10 -->
 <section>
   <div class="eyebrow">Coming soon</div>
-  <h2>The agent toolkit. <span class="badge next" style="font-size:22px">next · after 0.7.0</span></h2>
-  <div class="row r2" style="margin-top:30px">
+  <h2>The agent toolkit. <span class="badge info" style="font-size:22px"><i></i>next · after 0.7.0</span></h2>
+  <div class="cols r2" style="margin-top:30px">
     <div class="card fragment rise"><div class="big">MCP server</div><p><code>sql</code>, <code>explain</code>, <code>schema</code>, <code>search</code> as tools for any agent.</p></div>
     <div class="card fragment rise"><div class="big">Vector search on the GPU</div><p>Embeddings beside the data, nearest neighbours with SQL filters, in one query.</p></div>
     <div class="card fragment rise"><div class="big">Agent search, classify</div><p>Keyword, vector and SQL in one ranked call. Label millions of rows, batched.</p></div>
@@ -286,7 +280,7 @@ LIMIT 3
   <div class="eyebrow">Read on</div>
   <h1 style="font-size:80px">omxcore</h1>
   <p class="lede">The data engine for the agent era.</p>
-  <p style="margin-top:40px"><a class="pill loud" href="story.html">Read the story</a><a class="pill" href="index.html">The docs</a><a class="pill" href="https://github.com/abhisheksreesaila/omxcore">GitHub</a></p>
+  <p style="margin-top:40px"><a class="btn fill lg" href="story.html">Read the story</a><a class="btn tonal lg" href="index.html">The docs</a><a class="btn tonal lg" href="https://github.com/abhisheksreesaila/omxcore">GitHub</a></p>
   <p class="note" style="margin-top:30px">Apache-2.0 · built in Mojo by one founder and a team of AI agents, 2026</p>
 </section>
 
@@ -296,18 +290,14 @@ LIMIT 3
 <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.2.1/plugin/highlight/highlight.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.2.1/plugin/notes/notes.js"></script>
 <script>
-  // light / night: the same choice as the story and the docs (localStorage "mx-theme")
-  const root = document.documentElement, btn = document.getElementById("theme");
-  const saved = localStorage.getItem("mx-theme"); if (saved) root.dataset.theme = saved;
-  const label = () => { btn.textContent = root.dataset.theme === "dark" ? "Light" : "Night"; };
-  btn.onclick = () => { root.dataset.theme = root.dataset.theme === "dark" ? "light" : "dark"; localStorage.setItem("mx-theme", root.dataset.theme); label(); };
-  label();
+  // light / night: site.js applies the same choice as the story and the docs (localStorage "mx-theme") and owns the toggle
+  syncThemeButton(); document.getElementById("theme-btn").onclick = toggleTheme;
 
   const still = matchMedia("(prefers-reduced-motion: reduce)").matches;
   Reveal.initialize({
     hash: true, controls: true, progress: true, slideNumber: "c/t", center: true, width: 1600, height: 900, margin: 0.06,
-    transition: still ? "none" : "slide", backgroundTransition: "none", autoAnimateDuration: 0.8,
-    autoAnimateEasing: "cubic-bezier(.16,1,.3,1)", plugins: [RevealHighlight, RevealNotes],
+    transition: still ? "none" : "fade", backgroundTransition: "none", autoAnimateDuration: 0.8,
+    autoAnimateEasing: "cubic-bezier(.2,0,0,1)", plugins: [RevealHighlight, RevealNotes],
   });
 
   // numbers count up when their slide arrives
