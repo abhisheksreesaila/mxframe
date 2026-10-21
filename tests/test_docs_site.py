@@ -152,3 +152,14 @@ def test_no_page_defines_its_own_colour(path):
     assert not COLOUR.findall(code), f"{path.name}: {COLOUR.findall(code)}"
     for banned in ("gradient(", "backdrop-filter", "blur("):
         assert banned not in code, f"{path.name}: {banned}"
+
+
+def test_every_link_that_looks_like_a_button_springs():
+    """omxqua.js squashes `button, a.cta, a.more, [data-press], ...` on press; a link styled as a button or a card is none
+    of those, so it must carry data-press or it doesn't spring (owner, 2026-10-20: "the buttons aren't bouncy")."""
+    pages = [*PAGES, SITE / "site.js"]
+    for page in pages:
+        for tag in re.findall(r"<a\b[^>]*>", page.read_text()):
+            cls = re.search(r'class="([^"]*)"', tag)
+            if cls and {"btn", "card", "pill", "dk-brand"} & set(cls.group(1).split()):
+                assert "data-press" in tag, f"{page.name}: {tag}"

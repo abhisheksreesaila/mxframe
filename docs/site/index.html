@@ -19,7 +19,7 @@
   <span class="kick">omxcore docs · v0.6.0</span>
   <h1>The data engine for <span class="tone2">the agent era.</span></h1>
   <p class="lede">SQL on your CPU <em>and</em> your GPU, over the files you already have. Written in Mojo, with no Python inside.</p>
-  <div class="btns cta"><a class="btn fill" href="story.html">Read the story</a><a class="btn tonal" href="deck.html">Watch it as slides ▶</a><a class="btn tonal" href="benchmarks.html">See the numbers</a></div>
+  <div class="btns cta"><a data-press class="btn fill" href="story.html">Read the story</a><a data-press class="btn tonal" href="deck.html">Watch it as slides ▶</a><a data-press class="btn tonal" href="benchmarks.html">See the numbers</a></div>
   <div class="read"><b>What you're looking at</b>The front page of the omxcore docs. The numbers below are computed in your browser from the benchmark file they came from (<a href="bench/m2s-engine.csv">m2s-engine.csv</a>). Each card further down is one page of the docs.</div>
 
   <div class="card" style="margin:22px 0">
@@ -71,7 +71,7 @@ const CARDS = [
   ["how-it-got-fast.html", "How it got fast", "Every optimization from 22.7 s to 3.15 s at SF10, and which wins come from Mojo and which don't.", "img/how-it-got-fast.png"],
 ];
 document.getElementById("pages").innerHTML = CARDS.map(([href, title, what, img]) =>
-  `<a class="card" href="${href}"><img class="thumb" src="${img}" alt="${title} page"><div class="card-b"><b>${title}</b><p style="margin:4px 0 0;font-size:13.5px">${what}</p></div><div class="src note">${href}</div></a>`).join("");
+  `<a data-press class="card" href="${href}"><img class="thumb" src="${img}" alt="${title} page"><div class="card-b"><b>${title}</b><p style="margin:4px 0 0;font-size:13.5px">${what}</p></div><div class="src note">${href}</div></a>`).join("");
 
 const ENGINES = [["mx-cpu", "omxcore", "--mx"], ["duckdb", "DuckDB", "--dk"], ["polars", "Polars", "--pl"]];
 loadCSV("bench/m2s-engine.csv").then((rows) => {
